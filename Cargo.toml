@@ -12,6 +12,9 @@ serde_json = "1"
 tower-http = { version = "0.5", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Shared OpenTelemetry + tracing setup (one init() for all services).
+fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.1.0" }
 # TODO(real crypto/storage): add `jsonwebtoken` (verify Supabase JWT via JWKS +
 # mint our own), `argon2` or `sha2` (hash API key secrets), `reqwest` (fetch
 # Supabase JWKS), and `sqlx`/Supabase Postgres for the keys/orgs store. Stubbed
