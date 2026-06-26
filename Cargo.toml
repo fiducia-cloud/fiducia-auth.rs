@@ -1,0 +1,18 @@
+[package]
+name = "fiducia-auth"
+version = "0.1.0"
+edition = "2021"
+description = "Auth server for fiducia.cloud — verifies Supabase dashboard sessions, issues/validates B2B API keys, and mints short-lived JWTs so the hot path never calls auth."
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.5", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# TODO(real crypto/storage): add `jsonwebtoken` (verify Supabase JWT via JWKS +
+# mint our own), `argon2` or `sha2` (hash API key secrets), `reqwest` (fetch
+# Supabase JWKS), and `sqlx`/Supabase Postgres for the keys/orgs store. Stubbed
+# here to keep the skeleton dependency-light and compiling.
