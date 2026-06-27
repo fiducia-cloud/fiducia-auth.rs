@@ -85,31 +85,47 @@ impl KeyStore {
         }
     }
 
-    // TODO(security): replace with a CSPRNG (getrandom/rand). These are NOT
-    // suitable for production secrets.
-    fn gen_id(&self) -> String {
-        let mut c = self.counter.lock().unwrap();
-        *c += 1;
-        format!("{:012x}", now_ms().wrapping_add(*c))
-    }
-    fn gen_secret(&self) -> String {
-        format!("{:024x}", now_ms().wrapping_mul(2654435761))
-    }
 }
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
-/// TODO(security): replace with argon2id (or at least SHA-256). This placeholder
-/// is deterministic only so the skeleton round-trips — it is NOT secure.
-fn hash_secret(secret: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in secret.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+/// `n` cryptographically-random bytes from the OS CSPRNG, lower-hex encoded.
+/// Panics only if the OS has no entropy source — a fatal, fail-closed condition
+/// (we must never hand out a guessable secret).
+fn random_hex(n_bytes: usize) -> String {
+    let mut buf = vec![0u8; n_bytes];
+    getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
+    to_hex(&buf)
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
     }
-    format!("stubhash:{h:016x}")
+    s
+}
+
+/// Public, non-secret key identifier (64 random bits → 16 hex chars). Used to
+/// look the record up before the constant-time secret check.
+fn gen_id() -> String {
+    random_hex(8)
+}
+
+/// The secret half of an API key: 256 bits of CSPRNG entropy.
+fn gen_secret() -> String {
+    random_hex(32)
+}
+
+/// SHA-256 of the secret half (hex). High-entropy random secrets make a slow
+/// password KDF unnecessary; introspection still compares hashes in constant
+/// time. The raw secret is never stored.
+fn hash_secret(secret: &str) -> String {
+    let digest = Sha256::digest(secret.as_bytes());
+    format!("sha256:{}", to_hex(&digest))
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
