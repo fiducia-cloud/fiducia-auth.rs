@@ -200,3 +200,24 @@ async fn exchange_token(State(s): State<Arc<AppState>>, Json(body): Json<TokenBo
     let jwt = token::mint_token(&org, &intro.scopes, 900); // 15 min
     Json(json!({ "token": jwt, "token_type": "Bearer", "expires_in": 900 })).into_response()
 }
+
+#[cfg(test)]
+mod interface_contract_tests {
+    use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
+
+    #[test]
+    fn generated_interfaces_are_importable() {
+        let request = LockAcquireManyRequest {
+            keys: vec!["orders/42".to_string(), "inventory/sku-7".to_string()],
+            holder: Some("worker-a".to_string()),
+            ttl_ms: Some(30_000),
+            wait: Some(false),
+        };
+
+        assert_eq!(request.keys.len(), 2);
+        assert!(matches!(
+            ProposeErrorReason::NotLeader,
+            ProposeErrorReason::NotLeader
+        ));
+    }
+}
