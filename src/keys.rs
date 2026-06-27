@@ -23,11 +23,19 @@ pub struct KeyStore {
 
 impl KeyStore {
     pub fn new() -> Self {
-        KeyStore { keys: Mutex::new(HashMap::new()) }
+        KeyStore {
+            keys: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Create a key for an org. Returns the **raw key (shown once)** + its meta.
-    pub fn create(&self, org_id: OrgId, name: String, scopes: Vec<String>, env: String) -> (String, ApiKeyMeta) {
+    pub fn create(
+        &self,
+        org_id: OrgId,
+        name: String,
+        scopes: Vec<String>,
+        env: String,
+    ) -> (String, ApiKeyMeta) {
         let key_id = gen_id();
         let secret = gen_secret();
         let raw = format!("fdc_{env}_{key_id}.{secret}");
@@ -49,7 +57,10 @@ impl KeyStore {
 
     /// List an org's keys (masked — never returns secrets).
     pub fn list(&self, org_id: &str) -> Vec<ApiKeyMeta> {
-        self.keys.lock().unwrap().values()
+        self.keys
+            .lock()
+            .unwrap()
+            .values()
             .filter(|r| r.org_id == org_id)
             .map(ApiKeyMeta::from)
             .collect()
@@ -59,7 +70,10 @@ impl KeyStore {
     pub fn revoke(&self, org_id: &str, key_id: &str) -> bool {
         let mut keys = self.keys.lock().unwrap();
         match keys.get_mut(key_id) {
-            Some(r) if r.org_id == org_id => { r.revoked = true; true }
+            Some(r) if r.org_id == org_id => {
+                r.revoked = true;
+                true
+            }
             _ => false,
         }
     }
@@ -67,8 +81,12 @@ impl KeyStore {
     /// Validate a raw API key → org + scopes. Called by the edge/LB (and cached).
     pub fn introspect(&self, raw: &str) -> Introspection {
         // Parse `fdc_<env>_<key_id>.<secret>`.
-        let Some((left, secret)) = raw.split_once('.') else { return Introspection::invalid() };
-        let Some(key_id) = left.rsplit('_').next() else { return Introspection::invalid() };
+        let Some((left, secret)) = raw.split_once('.') else {
+            return Introspection::invalid();
+        };
+        let Some(key_id) = left.rsplit('_').next() else {
+            return Introspection::invalid();
+        };
 
         let mut keys = self.keys.lock().unwrap();
         match keys.get_mut(key_id) {
@@ -87,7 +105,10 @@ impl KeyStore {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// `n` cryptographically-random bytes from the OS CSPRNG, lower-hex encoded.
@@ -175,7 +196,12 @@ mod tests {
     #[test]
     fn introspect_round_trips_a_created_key() {
         let s = store();
-        let (raw, meta) = s.create("org_1".into(), "ci".into(), vec!["kv:read".into()], "live".into());
+        let (raw, meta) = s.create(
+            "org_1".into(),
+            "ci".into(),
+            vec!["kv:read".into()],
+            "live".into(),
+        );
         assert!(raw.starts_with("fdc_live_"));
 
         let intro = s.introspect(&raw);

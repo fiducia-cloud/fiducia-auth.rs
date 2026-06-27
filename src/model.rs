@@ -25,7 +25,12 @@ pub struct Introspection {
 
 impl Introspection {
     pub fn invalid() -> Self {
-        Introspection { valid: false, org_id: None, key_id: None, scopes: vec![] }
+        Introspection {
+            valid: false,
+            org_id: None,
+            key_id: None,
+            scopes: vec![],
+        }
     }
 }
 
