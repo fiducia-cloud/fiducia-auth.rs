@@ -31,12 +31,22 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
-use tower_http::trace::TraceLayer;
+use std::time::Duration;
+use tower_http::{
+    catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 
 use keys::KeyStore;
 use model::{CreateKeyBody, IntrospectBody, TokenBody, UserCtx};
 
 const SERVICE: &str = "fiducia-auth";
+
+/// Reject any request whose handler runs longer than this (slow-loris / hung
+/// upstream protection). Auth work is sub-millisecond.
+const REQUEST_TIMEOUT_SECS: u64 = 15;
+/// Cap request bodies; auth payloads are tiny JSON.
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 struct AppState {
     keys: KeyStore,
