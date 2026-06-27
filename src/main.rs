@@ -31,12 +31,22 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
-use tower_http::trace::TraceLayer;
+use std::time::Duration;
+use tower_http::{
+    catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 
 use keys::KeyStore;
 use model::{CreateKeyBody, IntrospectBody, TokenBody, UserCtx};
 
 const SERVICE: &str = "fiducia-auth";
+
+/// Reject any request whose handler runs longer than this (slow-loris / hung
+/// upstream protection). Auth work is sub-millisecond.
+const REQUEST_TIMEOUT_SECS: u64 = 15;
+/// Cap request bodies; auth payloads are tiny JSON.
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 struct AppState {
     keys: KeyStore,
@@ -58,7 +68,12 @@ async fn main() {
         .route("/v1/introspect", post(introspect))
         .route("/v1/token", post(exchange_token))
         .with_state(state)
-        .layer(TraceLayer::new_for_http());
+        // Hardening stack (outermost last): catch handler panics → 500 instead
+        // of dropping the connection, bound request time, and cap body size.
+        .layer(TraceLayer::new_for_http())
+        .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(CatchPanicLayer::new());
 
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8097);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
