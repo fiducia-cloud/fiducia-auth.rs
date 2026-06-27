@@ -52,10 +52,14 @@ validation/caching and attaches a verified identity inward.
 
 - Only a **hash** of the key secret is stored (`TODO`: argon2id); the raw key is
   returned exactly once at creation.
-- Keys are scoped to an **org**; dashboard ops require a Supabase session whose
-  user belongs to that org.
-- Source of truth: **Supabase** for users/orgs; API keys in Supabase Postgres
-  (`TODO`: `sqlx`). "Syncs with Supabase" = reads identity/membership from it.
+- Keys are scoped to an **org** and may be narrowed to a **project**; dashboard
+  ops require a Supabase session whose user has the right org/project role.
+- Source of truth: **Supabase** for login identity; Fiducia's Supabase Postgres
+  schema stores orgs, projects, RBAC membership, hashed API keys, optional mTLS
+  client certificates, and audit logs (`TODO`: `sqlx`).
+- API-key introspection returns `{org, project?, scopes}` for the edge/LB to
+  cache. Serious B2B deployments can require both the API key and a registered
+  client certificate fingerprint.
 
 ## Layout
 
