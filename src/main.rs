@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(health))
         .route("/.well-known/jwks.json", get(jwks))
         // Dashboard plane (requires a Supabase session JWT).
+        .route("/v1/me", get(me))
         .route("/v1/keys", post(create_key).get(list_keys))
         .route("/v1/keys/:key_id", axum::routing::delete(revoke_key))
         // Data plane (called by the edge/LB; should be internal-only / mTLS).
@@ -119,6 +120,14 @@ fn unauthorized(msg: &str) -> Response {
 }
 
 // --- dashboard handlers ---
+
+/// `GET /v1/me` — return the Supabase-authenticated dashboard identity.
+async fn me(headers: HeaderMap) -> Response {
+    match require_user(&headers).await {
+        Ok(user) => Json(json!({ "user": user })).into_response(),
+        Err(e) => e,
+    }
+}
 
 /// `POST /v1/keys` — create an API key for one of the caller's orgs. The raw key
 /// is returned **once**.
@@ -190,4 +199,25 @@ async fn exchange_token(State(s): State<Arc<AppState>>, Json(body): Json<TokenBo
     let org = intro.org_id.unwrap_or_default();
     let jwt = token::mint_token(&org, &intro.scopes, 900); // 15 min
     Json(json!({ "token": jwt, "token_type": "Bearer", "expires_in": 900 })).into_response()
+}
+
+#[cfg(test)]
+mod interface_contract_tests {
+    use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
+
+    #[test]
+    fn generated_interfaces_are_importable() {
+        let request = LockAcquireManyRequest {
+            keys: vec!["orders/42".to_string(), "inventory/sku-7".to_string()],
+            holder: Some("worker-a".to_string()),
+            ttl_ms: Some(30_000),
+            wait: Some(false),
+        };
+
+        assert_eq!(request.keys.len(), 2);
+        assert!(matches!(
+            ProposeErrorReason::NotLeader,
+            ProposeErrorReason::NotLeader
+        ));
+    }
 }
