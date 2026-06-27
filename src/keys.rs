@@ -28,8 +28,8 @@ impl KeyStore {
 
     /// Create a key for an org. Returns the **raw key (shown once)** + its meta.
     pub fn create(&self, org_id: OrgId, name: String, scopes: Vec<String>, env: String) -> (String, ApiKeyMeta) {
-        let key_id = self.gen_id();
-        let secret = self.gen_secret();
+        let key_id = gen_id();
+        let secret = gen_secret();
         let raw = format!("fdc_{env}_{key_id}.{secret}");
         let rec = ApiKeyRecord {
             key_id: key_id.clone(),
