@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use crate::model::{ApiKeyMeta, ApiKeyRecord, Introspection, OrgId};
@@ -37,8 +36,8 @@ impl KeyStore {
         scopes: Vec<String>,
         env: String,
     ) -> (String, ApiKeyMeta) {
-        let key_id = self.gen_id();
-        let secret = self.gen_secret();
+        let key_id = gen_id();
+        let secret = gen_secret();
         let raw = format!("fdc_{env}_{key_id}.{secret}");
         let rec = ApiKeyRecord {
             key_id: key_id.clone(),
@@ -103,14 +102,6 @@ impl KeyStore {
             _ => Introspection::invalid(),
         }
     }
-
-    fn gen_id(&self) -> String {
-        random_hex(12)
-    }
-
-    fn gen_secret(&self) -> String {
-        random_hex(32)
-    }
 }
 
 fn now_ms() -> u64 {
@@ -120,25 +111,41 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// `n` cryptographically-random bytes from the OS CSPRNG, lower-hex encoded.
+/// Panics only if the OS has no entropy source — a fatal, fail-closed condition
+/// (we must never hand out a guessable secret).
+fn random_hex(n_bytes: usize) -> String {
+    let mut buf = vec![0u8; n_bytes];
+    getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
+    to_hex(&buf)
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    s
+}
+
+/// Public, non-secret key identifier (64 random bits → 16 hex chars). Used to
+/// look the record up before the constant-time secret check.
+fn gen_id() -> String {
+    random_hex(8)
+}
+
+/// The secret half of an API key: 256 bits of CSPRNG entropy.
+fn gen_secret() -> String {
+    random_hex(32)
+}
+
+/// SHA-256 of the secret half (hex). High-entropy random secrets make a slow
+/// password KDF unnecessary; introspection still compares hashes in constant
+/// time. The raw secret is never stored.
 fn hash_secret(secret: &str) -> String {
     let digest = Sha256::digest(secret.as_bytes());
-    format!("sha256:{}", hex_encode(&digest))
-}
-
-fn random_hex(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    OsRng.fill_bytes(&mut buf);
-    hex_encode(&buf)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
+    format!("sha256:{}", to_hex(&digest))
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -157,63 +164,78 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn org() -> OrgId {
-        "org_test".to_string()
+    fn store() -> KeyStore {
+        KeyStore::new()
     }
 
     #[test]
-    fn generated_keys_are_unique_and_masked_in_metadata() {
-        let store = KeyStore::new();
-        let (first_raw, first_meta) = store.create(
-            org(),
-            "first".to_string(),
-            vec!["kv:read".to_string()],
-            "test".to_string(),
-        );
-        let (second_raw, second_meta) = store.create(
-            org(),
-            "second".to_string(),
-            vec!["kv:write".to_string()],
-            "test".to_string(),
-        );
+    fn secrets_are_high_entropy_and_unique() {
+        // 256-bit secret → 64 hex chars; 64-bit id → 16 hex chars.
+        let s = gen_secret();
+        assert_eq!(s.len(), 64, "secret must be 32 random bytes");
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(gen_id().len(), 16);
 
-        assert_ne!(first_raw, second_raw);
-        assert_ne!(first_meta.key_id, second_meta.key_id);
-        assert!(first_raw.starts_with("fdc_test_"));
-        assert!(!serde_json::to_string(&first_meta).unwrap().contains('.'));
+        // No timestamp determinism: a batch of secrets must all differ.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(seen.insert(gen_secret()), "duplicate secret from CSPRNG");
+        }
     }
 
     #[test]
-    fn introspection_accepts_only_the_original_secret() {
-        let store = KeyStore::new();
-        let (raw, meta) = store.create(
-            org(),
-            "service".to_string(),
-            vec!["locks:write".to_string()],
-            "live".to_string(),
-        );
-
-        let valid = store.introspect(&raw);
-        assert!(valid.valid);
-        assert_eq!(valid.key_id.as_deref(), Some(meta.key_id.as_str()));
-
-        let tampered = format!("{raw}00");
-        assert!(!store.introspect(&tampered).valid);
+    fn hash_is_sha256_and_hides_the_secret() {
+        let h = hash_secret("super-secret");
+        assert!(h.starts_with("sha256:"));
+        assert!(!h.contains("super-secret"));
+        // Deterministic for a fixed input (so introspect can re-derive + compare).
+        assert_eq!(h, hash_secret("super-secret"));
+        assert_ne!(h, hash_secret("super-secreu"));
     }
 
     #[test]
-    fn stored_secret_hash_uses_sha256_prefix() {
-        let store = KeyStore::new();
-        let (_raw, meta) = store.create(
-            org(),
-            "service".to_string(),
-            vec!["locks:write".to_string()],
-            "live".to_string(),
+    fn introspect_round_trips_a_created_key() {
+        let s = store();
+        let (raw, meta) = s.create(
+            "org_1".into(),
+            "ci".into(),
+            vec!["kv:read".into()],
+            "live".into(),
         );
-        let keys = store.keys.lock().unwrap();
-        let record = keys.get(&meta.key_id).expect("created record");
+        assert!(raw.starts_with("fdc_live_"));
 
-        assert!(record.secret_hash.starts_with("sha256:"));
-        assert_eq!(record.secret_hash.len(), "sha256:".len() + 64);
+        let intro = s.introspect(&raw);
+        assert!(intro.valid);
+        assert_eq!(intro.org_id.as_deref(), Some("org_1"));
+        assert_eq!(intro.key_id.as_deref(), Some(meta.key_id.as_str()));
+        assert_eq!(intro.scopes, vec!["kv:read".to_string()]);
+    }
+
+    #[test]
+    fn introspect_rejects_tampered_secret_and_revoked_keys() {
+        let s = store();
+        let (raw, meta) = s.create("org_1".into(), "ci".into(), vec![], "live".into());
+
+        // Flip the last char of the secret → must be rejected.
+        let mut bad = raw.clone();
+        let last = bad.pop().unwrap();
+        bad.push(if last == 'a' { 'b' } else { 'a' });
+        assert!(!s.introspect(&bad).valid, "tampered secret must be invalid");
+
+        // Garbage / malformed inputs never panic and are invalid.
+        assert!(!s.introspect("not-a-key").valid);
+        assert!(!s.introspect("fdc_live_deadbeef").valid); // no '.secret'
+
+        // Revoked keys stop introspecting.
+        assert!(s.revoke("org_1", &meta.key_id));
+        assert!(!s.introspect(&raw).valid, "revoked key must be invalid");
+    }
+
+    #[test]
+    fn revoke_is_scoped_to_the_owning_org() {
+        let s = store();
+        let (_raw, meta) = s.create("org_1".into(), "k".into(), vec![], "live".into());
+        // A different org cannot revoke it.
+        assert!(!s.revoke("org_2", &meta.key_id));
     }
 }

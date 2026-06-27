@@ -9,15 +9,18 @@ axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rand = "0.8"
-sha2 = "0.10"
-tower-http = { version = "0.5", features = ["trace"] }
+tower-http = { version = "0.5", features = ["trace", "timeout", "limit", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# API-key crypto. Secrets come from the OS CSPRNG (`getrandom`); only their
+# SHA-256 is ever stored. High-entropy random secrets don't need a slow password
+# KDF, and hashes are constant-time compared on introspect.
+getrandom = "0.2"
+sha2 = "0.10"
 
 # Shared OpenTelemetry + tracing setup (one init() for all services).
 fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.1.0" }
 # TODO(real crypto/storage): add `jsonwebtoken` (verify Supabase JWT via JWKS +
-# mint our own), `argon2` or `sha2` (hash API key secrets), `reqwest` (fetch
-# Supabase JWKS), and `sqlx`/Supabase Postgres for the keys/orgs store. Stubbed
-# here to keep the skeleton dependency-light and compiling.
+# mint our own), `reqwest` (fetch Supabase JWKS), and `sqlx`/Supabase Postgres
+# for the keys/orgs store. Stubbed here to keep the skeleton dependency-light.
