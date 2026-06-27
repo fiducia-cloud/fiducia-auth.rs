@@ -84,7 +84,6 @@ impl KeyStore {
             _ => Introspection::invalid(),
         }
     }
-
 }
 
 fn now_ms() -> u64 {
