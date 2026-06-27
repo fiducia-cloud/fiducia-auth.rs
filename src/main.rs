@@ -43,10 +43,12 @@ struct AppState {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
-    let state = Arc::new(AppState { keys: KeyStore::new() });
+    let state = Arc::new(AppState {
+        keys: KeyStore::new(),
+    });
 
     let app = Router::new()
         .route("/healthz", get(health))
@@ -60,11 +62,15 @@ async fn main() {
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
-    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8097);
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8097);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("{SERVICE} listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 async fn health() -> Json<Value> {
@@ -90,7 +96,11 @@ async fn require_user(headers: &HeaderMap) -> Result<UserCtx, Response> {
 }
 
 fn unauthorized(msg: &str) -> Response {
-    (axum::http::StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized", "detail": msg }))).into_response()
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "unauthorized", "detail": msg })),
+    )
+        .into_response()
 }
 
 // --- dashboard handlers ---
@@ -102,11 +112,18 @@ async fn create_key(
     headers: HeaderMap,
     Json(body): Json<CreateKeyBody>,
 ) -> Response {
-    let user = match require_user(&headers).await { Ok(u) => u, Err(e) => return e };
+    let user = match require_user(&headers).await {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
     // TODO: take org from request + check `user.orgs` contains it. Skeleton uses
     // the user's first org.
     let Some(org) = user.orgs.first().cloned() else {
-        return (axum::http::StatusCode::FORBIDDEN, Json(json!({ "error": "no_org" }))).into_response();
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(json!({ "error": "no_org" })),
+        )
+            .into_response();
     };
     let env = body.env.unwrap_or_else(|| "live".to_string());
     let (raw, meta) = s.keys.create(org, body.name, body.scopes, env);
@@ -116,7 +133,10 @@ async fn create_key(
 
 /// `GET /v1/keys` — list the caller org's keys (masked).
 async fn list_keys(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let user = match require_user(&headers).await { Ok(u) => u, Err(e) => return e };
+    let user = match require_user(&headers).await {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
     let org = user.orgs.first().cloned().unwrap_or_default();
     Json(json!({ "keys": s.keys.list(&org) })).into_response()
 }
@@ -127,7 +147,10 @@ async fn revoke_key(
     headers: HeaderMap,
     Path(key_id): Path<String>,
 ) -> Response {
-    let user = match require_user(&headers).await { Ok(u) => u, Err(e) => return e };
+    let user = match require_user(&headers).await {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
     let org = user.orgs.first().cloned().unwrap_or_default();
     Json(json!({ "revoked": s.keys.revoke(&org, &key_id) })).into_response()
 }
@@ -136,7 +159,10 @@ async fn revoke_key(
 
 /// `POST /v1/introspect` — validate an API key → org + scopes. The edge/LB caches
 /// this. TODO: protect this endpoint (mTLS / shared secret); it's internal-only.
-async fn introspect(State(s): State<Arc<AppState>>, Json(body): Json<IntrospectBody>) -> Json<Value> {
+async fn introspect(
+    State(s): State<Arc<AppState>>,
+    Json(body): Json<IntrospectBody>,
+) -> Json<Value> {
     Json(json!(s.keys.introspect(&body.api_key)))
 }
 
