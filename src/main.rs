@@ -64,6 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(health))
         .route("/.well-known/jwks.json", get(jwks))
         // Dashboard plane (requires a Supabase session JWT).
+        .route("/v1/me", get(me))
         .route("/v1/keys", post(create_key).get(list_keys))
         .route("/v1/keys/:key_id", axum::routing::delete(revoke_key))
         // Data plane (called by the edge/LB; should be internal-only / mTLS).
@@ -119,6 +120,14 @@ fn unauthorized(msg: &str) -> Response {
 }
 
 // --- dashboard handlers ---
+
+/// `GET /v1/me` — return the Supabase-authenticated dashboard identity.
+async fn me(headers: HeaderMap) -> Response {
+    match require_user(&headers).await {
+        Ok(user) => Json(json!({ "user": user })).into_response(),
+        Err(e) => e,
+    }
+}
 
 /// `POST /v1/keys` — create an API key for one of the caller's orgs. The raw key
 /// is returned **once**.

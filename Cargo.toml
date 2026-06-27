@@ -21,6 +21,12 @@ sha2 = "0.10"
 
 # Shared OpenTelemetry + tracing setup (one init() for all services).
 fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.1.0" }
-# TODO(real crypto/storage): add `jsonwebtoken` (verify Supabase JWT via JWKS +
-# mint our own), `reqwest` (fetch Supabase JWKS), and `sqlx`/Supabase Postgres
-# for the keys/orgs store. Stubbed here to keep the skeleton dependency-light.
+
+# Supabase Auth verification. Supabase exposes asymmetric signing keys via JWKS;
+# if a project still uses shared-secret JWT signing, we fall back to the Auth
+# user endpoint with the publishable key.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# TODO(real storage/JWT minting): add `sqlx`/Supabase Postgres for the keys/orgs
+# store and sign fiducia-issued short-lived JWTs with asymmetric keys.

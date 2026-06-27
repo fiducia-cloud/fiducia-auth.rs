@@ -2,15 +2,15 @@
 
 The auth server for [fiducia.cloud](https://fiducia.cloud). It authenticates two
 very different callers — and **neither hits Supabase (or the DB) on the hot
-path**. This repository is a **skeleton**: routing + the API-key store are real
-(in-memory); Supabase JWT verification, real hashing/JWT signing, and Postgres
-are stubbed with `TODO`s.
+path**. Routing, Supabase Auth verification, and the API-key store are real
+(the key store is currently in-memory); fiducia-issued JWT signing and Postgres
+storage remain `TODO`s.
 
 ## Two planes, two credentials
 
 | Plane | Who | Credential | Verified how |
 |-------|-----|-----------|--------------|
-| Dashboard | B2B humans | Supabase session **JWT** | **offline** signature check via Supabase JWKS (cached) — Supabase hit only at login/refresh |
+| Dashboard | B2B humans | Supabase session **JWT** | **offline** signature check via Supabase JWKS (cached), with `/auth/v1/user` fallback for shared-secret projects |
 | Data API | their machines | static **API key** `fdc_live_<id>.<secret>` | edge/LB calls `introspect` **once** and caches it (short TTL) |
 
 ```
@@ -24,7 +24,8 @@ client → Authorization: Bearer fdc_live_… → edge/LB ──► POST /v1/int
 ### Why it never calls auth per request
 
 - **Supabase JWTs are signed** → verify the signature locally with the cached
-  JWKS. No Supabase call per request.
+  JWKS when asymmetric signing keys are enabled. Projects still using
+  shared-secret signing fall back to Supabase's Auth user endpoint.
 - **API keys** → the edge/LB caches `introspect` results for a short TTL, so the
   steady state is a local decision. Revocation lag = the TTL.
 - Optional: `POST /v1/token` **exchanges** a key for a short-lived JWT that any
@@ -38,6 +39,7 @@ validation/caching and attaches a verified identity inward.
 
 | Route | Caller | Purpose |
 |-------|--------|---------|
+| `GET /v1/me` | dashboard (Supabase JWT) | return the authenticated Supabase user context |
 | `POST /v1/keys` | dashboard (Supabase JWT) | create a key (raw shown **once**) |
 | `GET /v1/keys` | dashboard | list keys (masked) |
 | `DELETE /v1/keys/{id}` | dashboard | revoke |
@@ -72,7 +74,15 @@ cargo run    # :8097 (override PORT)
 curl localhost:8097/healthz
 ```
 
-Env (real build): `SUPABASE_URL`, `SUPABASE_JWKS_URL`, `DATABASE_URL`, JWT signing key.
+Env:
+
+- `SUPABASE_URL` or `SUPABASE_PROJECT_REF`
+- `SUPABASE_PUBLISHABLE_KEY` for the `/auth/v1/user` fallback
+- `SUPABASE_AUTH_ISSUER`, optional override for `{SUPABASE_URL}/auth/v1`
+- `SUPABASE_AUTH_JWKS_URL`, optional override for the JWKS endpoint
+- `SUPABASE_AUTH_AUDIENCE`, defaults to `authenticated`
+- `SUPABASE_AUTH_ALLOW_REMOTE_USERINFO`, defaults to `true`
+- `FIDUCIA_DEFAULT_ORG_ID`, used until org membership moves into Supabase Postgres
 
 ## Related
 
