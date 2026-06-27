@@ -138,3 +138,78 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     }
     diff == 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> KeyStore {
+        KeyStore::new()
+    }
+
+    #[test]
+    fn secrets_are_high_entropy_and_unique() {
+        // 256-bit secret → 64 hex chars; 64-bit id → 16 hex chars.
+        let s = gen_secret();
+        assert_eq!(s.len(), 64, "secret must be 32 random bytes");
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(gen_id().len(), 16);
+
+        // No timestamp determinism: a batch of secrets must all differ.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(seen.insert(gen_secret()), "duplicate secret from CSPRNG");
+        }
+    }
+
+    #[test]
+    fn hash_is_sha256_and_hides_the_secret() {
+        let h = hash_secret("super-secret");
+        assert!(h.starts_with("sha256:"));
+        assert!(!h.contains("super-secret"));
+        // Deterministic for a fixed input (so introspect can re-derive + compare).
+        assert_eq!(h, hash_secret("super-secret"));
+        assert_ne!(h, hash_secret("super-secreu"));
+    }
+
+    #[test]
+    fn introspect_round_trips_a_created_key() {
+        let s = store();
+        let (raw, meta) = s.create("org_1".into(), "ci".into(), vec!["kv:read".into()], "live".into());
+        assert!(raw.starts_with("fdc_live_"));
+
+        let intro = s.introspect(&raw);
+        assert!(intro.valid);
+        assert_eq!(intro.org_id.as_deref(), Some("org_1"));
+        assert_eq!(intro.key_id.as_deref(), Some(meta.key_id.as_str()));
+        assert_eq!(intro.scopes, vec!["kv:read".to_string()]);
+    }
+
+    #[test]
+    fn introspect_rejects_tampered_secret_and_revoked_keys() {
+        let s = store();
+        let (raw, meta) = s.create("org_1".into(), "ci".into(), vec![], "live".into());
+
+        // Flip the last char of the secret → must be rejected.
+        let mut bad = raw.clone();
+        let last = bad.pop().unwrap();
+        bad.push(if last == 'a' { 'b' } else { 'a' });
+        assert!(!s.introspect(&bad).valid, "tampered secret must be invalid");
+
+        // Garbage / malformed inputs never panic and are invalid.
+        assert!(!s.introspect("not-a-key").valid);
+        assert!(!s.introspect("fdc_live_deadbeef").valid); // no '.secret'
+
+        // Revoked keys stop introspecting.
+        assert!(s.revoke("org_1", &meta.key_id));
+        assert!(!s.introspect(&raw).valid, "revoked key must be invalid");
+    }
+
+    #[test]
+    fn revoke_is_scoped_to_the_owning_org() {
+        let s = store();
+        let (_raw, meta) = s.create("org_1".into(), "k".into(), vec![], "live".into());
+        // A different org cannot revoke it.
+        assert!(!s.revoke("org_2", &meta.key_id));
+    }
+}
