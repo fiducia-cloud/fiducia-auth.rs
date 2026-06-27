@@ -212,6 +212,25 @@ mod tests {
     }
 
     #[test]
+    fn introspection_is_wire_compatible_with_the_shared_interface() {
+        // The edge/LB cache the introspection result as
+        // `fiducia_interfaces::Introspection`. Pin that auth emits exactly that
+        // shape, for both a valid key and the invalid sentinel.
+        let s = store();
+        let (raw, _) = s.create("org_1".into(), "ci".into(), vec!["kv:read".into()], "live".into());
+
+        for intro in [s.introspect(&raw), Introspection::invalid()] {
+            let json = serde_json::to_value(&intro).unwrap();
+            let shared: fiducia_interfaces::Introspection =
+                serde_json::from_value(json).unwrap();
+            assert_eq!(shared.valid, intro.valid);
+            assert_eq!(shared.org_id, intro.org_id);
+            assert_eq!(shared.key_id, intro.key_id);
+            assert_eq!(shared.scopes, intro.scopes);
+        }
+    }
+
+    #[test]
     fn introspect_rejects_tampered_secret_and_revoked_keys() {
         let s = store();
         let (raw, meta) = s.create("org_1".into(), "ci".into(), vec![], "live".into());
