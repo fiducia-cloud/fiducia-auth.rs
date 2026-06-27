@@ -11,18 +11,19 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 use crate::model::{ApiKeyMeta, ApiKeyRecord, Introspection, OrgId};
 
 /// In-memory key store. TODO: back with Supabase Postgres (`sqlx`), keyed by
 /// `key_id`, with the org-membership join.
 pub struct KeyStore {
     keys: Mutex<HashMap<String, ApiKeyRecord>>, // key_id -> record
-    counter: Mutex<u64>,
 }
 
 impl KeyStore {
     pub fn new() -> Self {
-        KeyStore { keys: Mutex::new(HashMap::new()), counter: Mutex::new(0) }
+        KeyStore { keys: Mutex::new(HashMap::new()) }
     }
 
     /// Create a key for an org. Returns the **raw key (shown once)** + its meta.
