@@ -138,6 +138,34 @@ async fn me(headers: HeaderMap) -> Response {
     }
 }
 
+/// `GET /v1/orgs/:org_id` — read org metadata from the in-cluster cache synced
+/// from Supabase (the system of record). Never a live Supabase call.
+async fn get_org(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(org_id): Path<String>,
+) -> Response {
+    let user = match require_user(&headers).await {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
+    if !user.orgs.iter().any(|o| o == &org_id) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(json!({ "error": "forbidden_org", "org_id": org_id })),
+        )
+            .into_response();
+    }
+    match s.orgs.get(&org_id).await {
+        Some(org) => Json(json!({ "org_id": org_id, "org": org, "source": "synced-cache" })).into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({ "error": "not_found", "org_id": org_id })),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /v1/keys` — create an API key for one of the caller's orgs. The raw key
 /// is returned **once**.
 async fn create_key(
