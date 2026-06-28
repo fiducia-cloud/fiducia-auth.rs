@@ -163,7 +163,7 @@ async fn list_keys(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respon
         Err(e) => return e,
     };
     let org = user.orgs.first().cloned().unwrap_or_default();
-    Json(json!({ "keys": s.keys.list(&org) })).into_response()
+    Json(json!({ "keys": s.keys.list(&org).await })).into_response()
 }
 
 /// `DELETE /v1/keys/{key_id}` — revoke a key the caller's org owns.
