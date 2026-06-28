@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use once_cell::sync::Lazy;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
 use p256::SecretKey;
 use serde::{Deserialize, Serialize};
