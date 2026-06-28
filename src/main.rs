@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
     let state = Arc::new(AppState {
-        keys: KeyStore::new(),
+        keys: KeyStore::from_env(),
     });
 
     let app = Router::new()
