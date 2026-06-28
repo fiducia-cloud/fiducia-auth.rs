@@ -11,9 +11,10 @@
 //!     result (short TTL), so steady state makes no auth call. Optionally the key
 //!     is exchanged once for a short-lived JWT verified offline (see `token.rs`).
 //!
-//! This is a **skeleton**: routing + the key store are real (in-memory);
-//! Supabase JWT verification, real crypto/hashing, JWT signing, and Postgres are
-//! stubbed with `TODO`s.
+//! Routing, the key store (in-memory, SHA-256 hashed secrets), offline Supabase
+//! JWT verification (cached JWKS, see `supabase.rs`), and ES256 JWT signing (see
+//! `token.rs`) are all implemented. Durable Postgres-backed persistence is the
+//! remaining future item; the in-memory store is authoritative until then.
 
 mod keys;
 mod model;
