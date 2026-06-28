@@ -177,7 +177,7 @@ async fn revoke_key(
         Err(e) => return e,
     };
     let org = user.orgs.first().cloned().unwrap_or_default();
-    Json(json!({ "revoked": s.keys.revoke(&org, &key_id) })).into_response()
+    Json(json!({ "revoked": s.keys.revoke(&org, &key_id).await })).into_response()
 }
 
 // --- data-plane handlers (edge/LB) ---
