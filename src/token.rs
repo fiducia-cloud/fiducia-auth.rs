@@ -215,9 +215,21 @@ mod tests {
 
     #[test]
     fn expired_token_is_rejected() {
+        // Build a token that expired 2 min ago — beyond the verifier's default
+        // 60s clock-skew leeway — and confirm it's rejected.
         let s = signer();
-        let token = mint_with(&s, &"org_a".to_string(), &[], 0); // exp now
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        let now = now_secs();
+        let claims = Claims {
+            sub: "org_a".to_string(),
+            org_id: "org_a".to_string(),
+            scopes: vec![],
+            iss: ISSUER.to_string(),
+            iat: now.saturating_sub(200),
+            exp: now.saturating_sub(120),
+        };
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(s.kid.clone());
+        let token = encode(&header, &claims, &s.encoding).expect("sign");
         assert!(verify_with(&s, &token).is_none());
     }
 }
