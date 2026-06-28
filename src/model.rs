@@ -87,6 +87,10 @@ pub struct CreateKeyBody {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub env: Option<String>, // "live" | "test"
+    /// Which of the caller's orgs to create the key under. When omitted, the
+    /// caller's first org is used. Must be an org the caller belongs to.
+    #[serde(default)]
+    pub org: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
