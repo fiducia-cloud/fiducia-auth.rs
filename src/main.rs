@@ -141,14 +141,29 @@ async fn create_key(
         Ok(u) => u,
         Err(e) => return e,
     };
-    // TODO: take org from request + check `user.orgs` contains it. Skeleton uses
-    // the user's first org.
-    let Some(org) = user.orgs.first().cloned() else {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            Json(json!({ "error": "no_org" })),
-        )
-            .into_response();
+    // Pick the target org: if the request names one, the caller must belong to
+    // it; otherwise default to their first org.
+    let org = match body.org.clone() {
+        Some(requested) => {
+            if !user.orgs.iter().any(|o| o == &requested) {
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "not_a_member", "org": requested })),
+                )
+                    .into_response();
+            }
+            requested
+        }
+        None => match user.orgs.first().cloned() {
+            Some(org) => org,
+            None => {
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "no_org" })),
+                )
+                    .into_response();
+            }
+        },
     };
     let env = body.env.unwrap_or_else(|| "live".to_string());
     let (raw, meta) = s.keys.create(org, body.name, body.scopes, env).await;
