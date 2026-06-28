@@ -11,9 +11,10 @@
 //!     result (short TTL), so steady state makes no auth call. Optionally the key
 //!     is exchanged once for a short-lived JWT verified offline (see `token.rs`).
 //!
-//! This is a **skeleton**: routing + the key store are real (in-memory);
-//! Supabase JWT verification, real crypto/hashing, JWT signing, and Postgres are
-//! stubbed with `TODO`s.
+//! Routing, the key store (in-memory, SHA-256 hashed secrets), offline Supabase
+//! JWT verification (cached JWKS, see `supabase.rs`), and ES256 JWT signing (see
+//! `token.rs`) are all implemented. Durable Postgres-backed persistence is the
+//! remaining future item; the in-memory store is authoritative until then.
 
 mod keys;
 mod model;
@@ -141,14 +142,29 @@ async fn create_key(
         Ok(u) => u,
         Err(e) => return e,
     };
-    // TODO: take org from request + check `user.orgs` contains it. Skeleton uses
-    // the user's first org.
-    let Some(org) = user.orgs.first().cloned() else {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            Json(json!({ "error": "no_org" })),
-        )
-            .into_response();
+    // Pick the target org: if the request names one, the caller must belong to
+    // it; otherwise default to their first org.
+    let org = match body.org.clone() {
+        Some(requested) => {
+            if !user.orgs.iter().any(|o| o == &requested) {
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "not_a_member", "org": requested })),
+                )
+                    .into_response();
+            }
+            requested
+        }
+        None => match user.orgs.first().cloned() {
+            Some(org) => org,
+            None => {
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "no_org" })),
+                )
+                    .into_response();
+            }
+        },
     };
     let env = body.env.unwrap_or_else(|| "live".to_string());
     let (raw, meta) = s.keys.create(org, body.name, body.scopes, env).await;
@@ -183,12 +199,46 @@ async fn revoke_key(
 // --- data-plane handlers (edge/LB) ---
 
 /// `POST /v1/introspect` — validate an API key → org + scopes. The edge/LB caches
-/// this. TODO: protect this endpoint (mTLS / shared secret); it's internal-only.
+/// this. Internal-only: when `FIDUCIA_INTROSPECT_SECRET` is set, callers must
+/// present it in `x-internal-secret` (a lightweight shared-secret guard until
+/// mTLS terminates in front of this service).
 async fn introspect(
     State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<IntrospectBody>,
-) -> Json<Value> {
-    Json(json!(s.keys.introspect(&body.api_key).await))
+) -> Response {
+    if !internal_secret_ok(&headers) {
+        return unauthorized("introspect is internal-only");
+    }
+    Json(json!(s.keys.introspect(&body.api_key).await)).into_response()
+}
+
+/// Guard for internal-only endpoints. Open when no secret is configured (dev),
+/// otherwise requires a constant-time match on `x-internal-secret`.
+fn internal_secret_ok(headers: &HeaderMap) -> bool {
+    let Ok(expected) = std::env::var("FIDUCIA_INTROSPECT_SECRET") else {
+        return true; // not configured → no guard (dev/local)
+    };
+    if expected.is_empty() {
+        return true;
+    }
+    let presented = headers
+        .get("x-internal-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    constant_time_eq(presented.as_bytes(), expected.as_bytes())
+}
+
+/// Length-independent byte comparison, to avoid leaking the secret via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// `POST /v1/token` — exchange an API key for a short-lived JWT (offline-verifiable).
