@@ -11,20 +11,14 @@
 //!     result (short TTL), so steady state makes no auth call. Optionally the key
 //!     is exchanged once for a short-lived JWT verified offline (see `token.rs`).
 //!
-<<<<<<< HEAD
-//! Routing, the key store (in-memory, SHA-256 hashed secrets), offline Supabase
-//! JWT verification (cached JWKS, see `supabase.rs`), and ES256 JWT signing (see
-//! `token.rs`) are all implemented. Durable Postgres-backed persistence is the
-//! remaining future item; the in-memory store is authoritative until then.
-=======
 //! Routing, Supabase JWT verification, API-key crypto/hashing, JWT signing, and
 //! fiducia-KV-backed API-key persistence are implemented.
->>>>>>> origin/main
 
 mod keys;
 mod model;
 mod store;
 mod supabase;
+mod sync;
 mod token;
 
 use std::net::SocketAddr;
@@ -147,38 +141,12 @@ async fn create_key(
         Ok(u) => u,
         Err(e) => return e,
     };
-<<<<<<< HEAD
-    // Pick the target org: if the request names one, the caller must belong to
-    // it; otherwise default to their first org.
-    let org = match body.org.clone() {
-        Some(requested) => {
-            if !user.orgs.iter().any(|o| o == &requested) {
-                return (
-                    axum::http::StatusCode::FORBIDDEN,
-                    Json(json!({ "error": "not_a_member", "org": requested })),
-                )
-                    .into_response();
-            }
-            requested
-        }
-        None => match user.orgs.first().cloned() {
-            Some(org) => org,
-            None => {
-                return (
-                    axum::http::StatusCode::FORBIDDEN,
-                    Json(json!({ "error": "no_org" })),
-                )
-                    .into_response();
-            }
-        },
-=======
     let Some(org) = body.org_id.clone().or_else(|| user.orgs.first().cloned()) else {
         return (
             axum::http::StatusCode::FORBIDDEN,
             Json(json!({ "error": "no_org" })),
         )
             .into_response();
->>>>>>> origin/main
     };
     if !user.orgs.iter().any(|allowed| allowed == &org) {
         return (
@@ -220,58 +188,17 @@ async fn revoke_key(
 // --- data-plane handlers (edge/LB) ---
 
 /// `POST /v1/introspect` — validate an API key → org + scopes. The edge/LB caches
-<<<<<<< HEAD
-/// this. Internal-only: when `FIDUCIA_INTROSPECT_SECRET` is set, callers must
-/// present it in `x-internal-secret` (a lightweight shared-secret guard until
-/// mTLS terminates in front of this service).
-=======
 /// this. Set `FIDUCIA_INTROSPECT_SECRET` to require `x-server-auth` on this
 /// internal endpoint.
->>>>>>> origin/main
 async fn introspect(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<IntrospectBody>,
 ) -> Response {
-<<<<<<< HEAD
-    if !internal_secret_ok(&headers) {
-        return unauthorized("introspect is internal-only");
-    }
-    Json(json!(s.keys.introspect(&body.api_key).await)).into_response()
-}
-
-/// Guard for internal-only endpoints. Open when no secret is configured (dev),
-/// otherwise requires a constant-time match on `x-internal-secret`.
-fn internal_secret_ok(headers: &HeaderMap) -> bool {
-    let Ok(expected) = std::env::var("FIDUCIA_INTROSPECT_SECRET") else {
-        return true; // not configured → no guard (dev/local)
-    };
-    if expected.is_empty() {
-        return true;
-    }
-    let presented = headers
-        .get("x-internal-secret")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    constant_time_eq(presented.as_bytes(), expected.as_bytes())
-}
-
-/// Length-independent byte comparison, to avoid leaking the secret via timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-=======
     if !internal_secret_authorized(&headers) {
         return unauthorized("missing or invalid internal auth");
     }
     Json(json!(s.keys.introspect(&body.api_key).await)).into_response()
->>>>>>> origin/main
 }
 
 /// `POST /v1/token` — exchange an API key for a short-lived JWT (offline-verifiable).
