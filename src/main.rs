@@ -11,10 +11,15 @@
 //!     result (short TTL), so steady state makes no auth call. Optionally the key
 //!     is exchanged once for a short-lived JWT verified offline (see `token.rs`).
 //!
+<<<<<<< HEAD
 //! Routing, the key store (in-memory, SHA-256 hashed secrets), offline Supabase
 //! JWT verification (cached JWKS, see `supabase.rs`), and ES256 JWT signing (see
 //! `token.rs`) are all implemented. Durable Postgres-backed persistence is the
 //! remaining future item; the in-memory store is authoritative until then.
+=======
+//! Routing, Supabase JWT verification, API-key crypto/hashing, JWT signing, and
+//! fiducia-KV-backed API-key persistence are implemented.
+>>>>>>> origin/main
 
 mod keys;
 mod model;
@@ -142,6 +147,7 @@ async fn create_key(
         Ok(u) => u,
         Err(e) => return e,
     };
+<<<<<<< HEAD
     // Pick the target org: if the request names one, the caller must belong to
     // it; otherwise default to their first org.
     let org = match body.org.clone() {
@@ -165,7 +171,22 @@ async fn create_key(
                     .into_response();
             }
         },
+=======
+    let Some(org) = body.org_id.clone().or_else(|| user.orgs.first().cloned()) else {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(json!({ "error": "no_org" })),
+        )
+            .into_response();
+>>>>>>> origin/main
     };
+    if !user.orgs.iter().any(|allowed| allowed == &org) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(json!({ "error": "forbidden_org", "org_id": org })),
+        )
+            .into_response();
+    }
     let env = body.env.unwrap_or_else(|| "live".to_string());
     let (raw, meta) = s.keys.create(org, body.name, body.scopes, env).await;
     // The only time the raw key is ever returned.
@@ -199,14 +220,20 @@ async fn revoke_key(
 // --- data-plane handlers (edge/LB) ---
 
 /// `POST /v1/introspect` — validate an API key → org + scopes. The edge/LB caches
+<<<<<<< HEAD
 /// this. Internal-only: when `FIDUCIA_INTROSPECT_SECRET` is set, callers must
 /// present it in `x-internal-secret` (a lightweight shared-secret guard until
 /// mTLS terminates in front of this service).
+=======
+/// this. Set `FIDUCIA_INTROSPECT_SECRET` to require `x-server-auth` on this
+/// internal endpoint.
+>>>>>>> origin/main
 async fn introspect(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<IntrospectBody>,
 ) -> Response {
+<<<<<<< HEAD
     if !internal_secret_ok(&headers) {
         return unauthorized("introspect is internal-only");
     }
@@ -239,6 +266,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+=======
+    if !internal_secret_authorized(&headers) {
+        return unauthorized("missing or invalid internal auth");
+    }
+    Json(json!(s.keys.introspect(&body.api_key).await)).into_response()
+>>>>>>> origin/main
 }
 
 /// `POST /v1/token` — exchange an API key for a short-lived JWT (offline-verifiable).
@@ -248,8 +281,22 @@ async fn exchange_token(State(s): State<Arc<AppState>>, Json(body): Json<TokenBo
         return unauthorized("invalid api key");
     }
     let org = intro.org_id.unwrap_or_default();
-    let jwt = token::mint_token(&org, &intro.scopes, 900); // 15 min
+    let jwt = token::mint_token(&org, &intro.scopes, 900);
     Json(json!({ "token": jwt, "token_type": "Bearer", "expires_in": 900 })).into_response()
+}
+
+fn internal_secret_authorized(headers: &HeaderMap) -> bool {
+    let Some(expected) = std::env::var("FIDUCIA_INTROSPECT_SECRET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return true;
+    };
+    headers
+        .get("x-server-auth")
+        .and_then(|value| value.to_str().ok())
+        .map(|provided| provided == expected)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

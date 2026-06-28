@@ -1,4 +1,4 @@
-//! Auth domain types (skeleton).
+//! Auth domain types.
 
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +83,8 @@ impl From<&ApiKeyRecord> for ApiKeyMeta {
 #[derive(Debug, Deserialize)]
 pub struct CreateKeyBody {
     pub name: String,
+    #[serde(default)]
+    pub org_id: Option<OrgId>,
     #[serde(default)]
     pub scopes: Vec<String>,
     #[serde(default)]
