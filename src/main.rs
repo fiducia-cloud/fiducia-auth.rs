@@ -193,7 +193,7 @@ async fn introspect(
 
 /// `POST /v1/token` — exchange an API key for a short-lived JWT (offline-verifiable).
 async fn exchange_token(State(s): State<Arc<AppState>>, Json(body): Json<TokenBody>) -> Response {
-    let intro = s.keys.introspect(&body.api_key);
+    let intro = s.keys.introspect(&body.api_key).await;
     if !intro.valid {
         return unauthorized("invalid api key");
     }
