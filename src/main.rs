@@ -279,6 +279,19 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+mod constant_time_tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn matches_only_on_exact_equality() {
+        assert!(constant_time_eq(b"s3cret-value", b"s3cret-value"));
+        assert!(!constant_time_eq(b"s3cret-value", b"s3cret-walue"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cret-value")); // length mismatch
+        assert!(constant_time_eq(b"", b""));
+    }
+}
+
+#[cfg(test)]
 mod interface_contract_tests {
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 
