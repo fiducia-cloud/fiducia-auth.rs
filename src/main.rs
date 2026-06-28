@@ -188,7 +188,7 @@ async fn introspect(
     State(s): State<Arc<AppState>>,
     Json(body): Json<IntrospectBody>,
 ) -> Json<Value> {
-    Json(json!(s.keys.introspect(&body.api_key)))
+    Json(json!(s.keys.introspect(&body.api_key).await))
 }
 
 /// `POST /v1/token` — exchange an API key for a short-lived JWT (offline-verifiable).
