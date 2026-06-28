@@ -198,12 +198,46 @@ async fn revoke_key(
 // --- data-plane handlers (edge/LB) ---
 
 /// `POST /v1/introspect` — validate an API key → org + scopes. The edge/LB caches
-/// this. TODO: protect this endpoint (mTLS / shared secret); it's internal-only.
+/// this. Internal-only: when `FIDUCIA_INTROSPECT_SECRET` is set, callers must
+/// present it in `x-internal-secret` (a lightweight shared-secret guard until
+/// mTLS terminates in front of this service).
 async fn introspect(
     State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<IntrospectBody>,
-) -> Json<Value> {
-    Json(json!(s.keys.introspect(&body.api_key).await))
+) -> Response {
+    if !internal_secret_ok(&headers) {
+        return unauthorized("introspect is internal-only");
+    }
+    Json(json!(s.keys.introspect(&body.api_key).await)).into_response()
+}
+
+/// Guard for internal-only endpoints. Open when no secret is configured (dev),
+/// otherwise requires a constant-time match on `x-internal-secret`.
+fn internal_secret_ok(headers: &HeaderMap) -> bool {
+    let Ok(expected) = std::env::var("FIDUCIA_INTROSPECT_SECRET") else {
+        return true; // not configured → no guard (dev/local)
+    };
+    if expected.is_empty() {
+        return true;
+    }
+    let presented = headers
+        .get("x-internal-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    constant_time_eq(presented.as_bytes(), expected.as_bytes())
+}
+
+/// Length-independent byte comparison, to avoid leaking the secret via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// `POST /v1/token` — exchange an API key for a short-lived JWT (offline-verifiable).
