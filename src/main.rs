@@ -51,14 +51,21 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 
 struct AppState {
     keys: KeyStore,
+    orgs: Arc<sync::OrgCache>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
+    // Supabase is the durable system of record; sync org/plan data into a fast
+    // in-cluster cache so the hot path never calls it. No-op without Supabase env.
+    let orgs = Arc::new(sync::OrgCache::default());
+    sync::spawn(orgs.clone());
+
     let state = Arc::new(AppState {
         keys: KeyStore::from_env(),
+        orgs,
     });
 
     let app = Router::new()
@@ -68,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/me", get(me))
         .route("/v1/keys", post(create_key).get(list_keys))
         .route("/v1/keys/:key_id", axum::routing::delete(revoke_key))
+        .route("/v1/orgs/:org_id", get(get_org))
         // Data plane (called by the edge/LB; should be internal-only / mTLS).
         .route("/v1/introspect", post(introspect))
         .route("/v1/token", post(exchange_token))
