@@ -29,8 +29,15 @@ fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
 # Supabase Auth verification. Supabase exposes asymmetric signing keys via JWKS;
 # if a project still uses shared-secret JWT signing, we fall back to the Auth
 # user endpoint with the publishable key.
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# TODO(real storage/JWT minting): add `sqlx`/Supabase Postgres for the keys/orgs
-# store and sign fiducia-issued short-lived JWTs with asymmetric keys.
+# fiducia-issued JWTs are signed with ES256 (ECDSA P-256). `p256` lets us load a
+# PKCS#8 signing key (shared across replicas via a k8s secret) and derive the
+# public JWK (x/y) we publish at /.well-known/jwks.json for offline verification.
+p256 = { version = "0.13", features = ["pkcs8", "pem", "ecdsa"] }
+base64 = "0.22"
+once_cell = "1"
+
+# TODO(storage): back the keys/orgs store with fiducia KV (API keys) + a Supabase
+# sync into a local cache (orgs/plans) so the hot path never calls Supabase.
