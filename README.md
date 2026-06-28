@@ -3,8 +3,8 @@
 The auth server for [fiducia.cloud](https://fiducia.cloud). It authenticates two
 very different callers — and **neither hits Supabase (or the DB) on the hot
 path**. Routing, Supabase Auth verification, and the API-key store are real
-(the key store is currently in-memory); fiducia-issued JWT signing and Postgres
-storage remain `TODO`s.
+and file-backed; fiducia-issued JWT signing is env-backed. Supabase remains the
+source of truth for human identity and org membership.
 
 ## Two planes, two credentials
 
@@ -28,9 +28,10 @@ client → Authorization: Bearer fdc_live_… → edge/LB ──► POST /v1/int
   shared-secret signing fall back to Supabase's Auth user endpoint.
 - **API keys** → the edge/LB caches `introspect` results for a short TTL, so the
   steady state is a local decision. Revocation lag = the TTL.
-- Optional: `POST /v1/token` **exchanges** a key for a short-lived JWT that any
-  component verifies **offline** via `/.well-known/jwks.json` — zero auth calls
-  on the hot path; revocation via short `exp` (+ optional denylist).
+- Optional: `POST /v1/token` **exchanges** a key for a short-lived JWT signed by
+  `fiducia-auth`; any component verifies it **offline** via
+  `/.well-known/jwks.json` — zero auth calls on the hot path; revocation via
+  short `exp` (+ optional denylist).
 
 Clients keep sending a **simple static API key** (best B2B DX); the edge does the
 validation/caching and attaches a verified identity inward.
@@ -50,13 +51,16 @@ validation/caching and attaches a verified identity inward.
 
 ## Storage & secrets
 
-- Only a **hash** of the key secret is stored (`TODO`: argon2id); the raw key is
-  returned exactly once at creation.
+- Only a **hash** of the key secret is stored; the raw key is returned exactly
+  once at creation. Secrets are 256-bit random values, so SHA-256 plus
+  constant-time comparison is sufficient for introspection.
 - Keys are scoped to an **org** and may be narrowed to a **project**; dashboard
   ops require a Supabase session whose user has the right org/project role.
-- Source of truth: **Supabase** for login identity; Fiducia's Supabase Postgres
-  schema stores orgs, projects, RBAC membership, hashed API keys, optional mTLS
-  client certificates, and audit logs (`TODO`: `sqlx`).
+- API keys persist in a JSON store selected by `FIDUCIA_AUTH_STORE_PATH` or
+  `FIDUCIA_AUTH_STORE_DIR`; otherwise it defaults under the local data dir.
+- Source of truth: **Supabase** for human login identity and org membership.
+  `fiducia-auth` materializes the hot API-key state locally so edge/LB calls
+  stay private and fast.
 - API-key introspection returns `{org, project?, scopes}` for the edge/LB to
   cache. Serious B2B deployments can require both the API key and a registered
   client certificate fingerprint.
@@ -87,6 +91,11 @@ Env:
 - `SUPABASE_AUTH_AUDIENCE`, defaults to `authenticated`
 - `SUPABASE_AUTH_ALLOW_REMOTE_USERINFO`, defaults to `true`
 - `FIDUCIA_DEFAULT_ORG_ID`, used until org membership moves into Supabase Postgres
+- `FIDUCIA_AUTH_STORE_PATH` or `FIDUCIA_AUTH_STORE_DIR`, optional API-key store location
+- `FIDUCIA_JWT_PRIVATE_KEY_PEM`, required for `POST /v1/token`
+- `FIDUCIA_JWT_PUBLIC_JWK`, published by `/.well-known/jwks.json`
+- `FIDUCIA_JWT_ALG`, one of `RS256` or `ES256` (default `RS256`)
+- `FIDUCIA_JWT_KID`, `FIDUCIA_JWT_ISSUER`, `FIDUCIA_JWT_AUDIENCE`
 
 ## Related
 

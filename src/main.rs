@@ -11,9 +11,8 @@
 //!     result (short TTL), so steady state makes no auth call. Optionally the key
 //!     is exchanged once for a short-lived JWT verified offline (see `token.rs`).
 //!
-//! This is a **skeleton**: routing + the key store are real (in-memory);
-//! Supabase JWT verification, real crypto/hashing, JWT signing, and Postgres are
-//! stubbed with `TODO`s.
+//! Routing, Supabase JWT verification, API-key crypto/hashing, JWT signing, and
+//! file-backed API-key persistence are implemented.
 
 mod keys;
 mod model;
@@ -140,19 +139,32 @@ async fn create_key(
         Ok(u) => u,
         Err(e) => return e,
     };
-    // TODO: take org from request + check `user.orgs` contains it. Skeleton uses
-    // the user's first org.
-    let Some(org) = user.orgs.first().cloned() else {
+    let Some(org) = body.org_id.clone().or_else(|| user.orgs.first().cloned()) else {
         return (
             axum::http::StatusCode::FORBIDDEN,
             Json(json!({ "error": "no_org" })),
         )
             .into_response();
     };
+    if !user.orgs.iter().any(|allowed| allowed == &org) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(json!({ "error": "forbidden_org", "org_id": org })),
+        )
+            .into_response();
+    }
     let env = body.env.unwrap_or_else(|| "live".to_string());
-    let (raw, meta) = s.keys.create(org, body.name, body.scopes, env);
-    // The only time the raw key is ever returned.
-    Json(json!({ "api_key": raw, "key": meta })).into_response()
+    match s.keys.create(org, body.name, body.scopes, env) {
+        Ok((raw, meta)) => {
+            // The only time the raw key is ever returned.
+            Json(json!({ "api_key": raw, "key": meta })).into_response()
+        }
+        Err(err) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "key_store_unavailable", "detail": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /v1/keys` — list the caller org's keys (masked).
@@ -176,18 +188,30 @@ async fn revoke_key(
         Err(e) => return e,
     };
     let org = user.orgs.first().cloned().unwrap_or_default();
-    Json(json!({ "revoked": s.keys.revoke(&org, &key_id) })).into_response()
+    match s.keys.revoke(&org, &key_id) {
+        Ok(revoked) => Json(json!({ "revoked": revoked })).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "key_store_unavailable", "detail": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 // --- data-plane handlers (edge/LB) ---
 
 /// `POST /v1/introspect` — validate an API key → org + scopes. The edge/LB caches
-/// this. TODO: protect this endpoint (mTLS / shared secret); it's internal-only.
+/// this. Set `FIDUCIA_INTROSPECT_SECRET` to require `x-server-auth` on this
+/// internal endpoint.
 async fn introspect(
     State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<IntrospectBody>,
-) -> Json<Value> {
-    Json(json!(s.keys.introspect(&body.api_key)))
+) -> Response {
+    if !internal_secret_authorized(&headers) {
+        return unauthorized("missing or invalid internal auth");
+    }
+    Json(json!(s.keys.introspect(&body.api_key))).into_response()
 }
 
 /// `POST /v1/token` — exchange an API key for a short-lived JWT (offline-verifiable).
@@ -197,8 +221,30 @@ async fn exchange_token(State(s): State<Arc<AppState>>, Json(body): Json<TokenBo
         return unauthorized("invalid api key");
     }
     let org = intro.org_id.unwrap_or_default();
-    let jwt = token::mint_token(&org, &intro.scopes, 900); // 15 min
-    Json(json!({ "token": jwt, "token_type": "Bearer", "expires_in": 900 })).into_response()
+    match token::mint_token(&org, &intro.scopes, 900) {
+        Ok(jwt) => {
+            Json(json!({ "token": jwt, "token_type": "Bearer", "expires_in": 900 })).into_response()
+        }
+        Err(err) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "token_signing_unavailable", "detail": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+fn internal_secret_authorized(headers: &HeaderMap) -> bool {
+    let Some(expected) = std::env::var("FIDUCIA_INTROSPECT_SECRET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return true;
+    };
+    headers
+        .get("x-server-auth")
+        .and_then(|value| value.to_str().ok())
+        .map(|provided| provided == expected)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
