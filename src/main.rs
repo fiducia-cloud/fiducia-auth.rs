@@ -17,6 +17,7 @@
 
 mod keys;
 mod model;
+mod store;
 mod supabase;
 mod token;
 
@@ -57,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
     let state = Arc::new(AppState {
-        keys: KeyStore::new(),
+        keys: KeyStore::from_env(),
     });
 
     let app = Router::new()
@@ -150,7 +151,7 @@ async fn create_key(
             .into_response();
     };
     let env = body.env.unwrap_or_else(|| "live".to_string());
-    let (raw, meta) = s.keys.create(org, body.name, body.scopes, env);
+    let (raw, meta) = s.keys.create(org, body.name, body.scopes, env).await;
     // The only time the raw key is ever returned.
     Json(json!({ "api_key": raw, "key": meta })).into_response()
 }
@@ -162,7 +163,7 @@ async fn list_keys(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respon
         Err(e) => return e,
     };
     let org = user.orgs.first().cloned().unwrap_or_default();
-    Json(json!({ "keys": s.keys.list(&org) })).into_response()
+    Json(json!({ "keys": s.keys.list(&org).await })).into_response()
 }
 
 /// `DELETE /v1/keys/{key_id}` — revoke a key the caller's org owns.
@@ -176,7 +177,7 @@ async fn revoke_key(
         Err(e) => return e,
     };
     let org = user.orgs.first().cloned().unwrap_or_default();
-    Json(json!({ "revoked": s.keys.revoke(&org, &key_id) })).into_response()
+    Json(json!({ "revoked": s.keys.revoke(&org, &key_id).await })).into_response()
 }
 
 // --- data-plane handlers (edge/LB) ---
@@ -187,12 +188,12 @@ async fn introspect(
     State(s): State<Arc<AppState>>,
     Json(body): Json<IntrospectBody>,
 ) -> Json<Value> {
-    Json(json!(s.keys.introspect(&body.api_key)))
+    Json(json!(s.keys.introspect(&body.api_key).await))
 }
 
 /// `POST /v1/token` — exchange an API key for a short-lived JWT (offline-verifiable).
 async fn exchange_token(State(s): State<Arc<AppState>>, Json(body): Json<TokenBody>) -> Response {
-    let intro = s.keys.introspect(&body.api_key);
+    let intro = s.keys.introspect(&body.api_key).await;
     if !intro.valid {
         return unauthorized("invalid api key");
     }
