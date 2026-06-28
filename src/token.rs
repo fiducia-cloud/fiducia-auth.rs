@@ -4,7 +4,7 @@
 //! the opaque API key on every request, a client (or the edge) **exchanges** it
 //! once for a short-lived **signed JWT** carrying `{org_id, scopes, exp}`. Every
 //! fiducia component (edge, LB, nodes) then verifies that JWT **offline** with the
-//! public key served at `/.well-known/jwks.json` — no call back to auth.
+//! public key served at `/.well-known/jwks.json` - no call back to auth.
 //!
 //! Revocation is handled by keeping `exp` short (minutes) + an optional denylist
 //! for emergencies. Long-lived B2B keys use cached introspection instead; both
@@ -51,7 +51,7 @@ static SIGNER: Lazy<Signer> = Lazy::new(Signer::load);
 impl Signer {
     /// Load the signing key from `FIDUCIA_JWT_SIGNING_KEY` (PKCS#8 EC P-256 PEM,
     /// shared across replicas via a k8s secret). With no env key we generate an
-    /// EPHEMERAL one — fine for a single dev pod, but multi-replica MUST share a
+    /// EPHEMERAL one - fine for a single dev pod, but multi-replica MUST share a
     /// key or each pod publishes a different JWKS and cross-pod verification fails.
     fn load() -> Self {
         let secret = match std::env::var("FIDUCIA_JWT_SIGNING_KEY") {
@@ -59,7 +59,7 @@ impl Signer {
                 .expect("FIDUCIA_JWT_SIGNING_KEY must be a PKCS#8 EC (P-256) private key PEM"),
             _ => {
                 tracing::warn!(
-                    "FIDUCIA_JWT_SIGNING_KEY not set — generating an EPHEMERAL ES256 key (OK for a single dev pod; provide a shared key for multi-replica)"
+                    "FIDUCIA_JWT_SIGNING_KEY not set - generating an EPHEMERAL ES256 key (OK for a single dev pod; provide a shared key for multi-replica)"
                 );
                 generate_secret()
             }
@@ -215,8 +215,8 @@ mod tests {
 
     #[test]
     fn expired_token_is_rejected() {
-        // Build a token that expired 2 min ago — beyond the verifier's default
-        // 60s clock-skew leeway — and confirm it's rejected.
+        // Build a token that expired 2 min ago - beyond the verifier's default
+        // 60s clock-skew leeway - and confirm it's rejected.
         let s = signer();
         let now = now_secs();
         let claims = Claims {

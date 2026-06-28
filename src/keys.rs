@@ -1,4 +1,4 @@
-//! API keys + introspection — the **data** plane.
+//! API keys + introspection - the **data** plane.
 //!
 //! B2B *machines* authenticate to the coordination API with a static API key
 //! (`Authorization: Bearer fdc_live_<id>.<secret>`). We store only a **hash** of
@@ -6,8 +6,8 @@
 //!
 //! Storage is **cache-aside**: durable records live in fiducia's own KV (see
 //! `store.rs`) and an in-memory hot cache fronts it, so the steady-state
-//! [`introspect`](KeyStore::introspect) — the call the edge/LB make (and cache
-//! again, with a short TTL) — is a local map lookup, never a round trip, and
+//! [`introspect`](KeyStore::introspect) - the call the edge/LB make (and cache
+//! again, with a short TTL) - is a local map lookup, never a round trip, and
 //! never Supabase.
 
 use std::collections::HashMap;
@@ -28,7 +28,7 @@ pub struct KeyStore {
 }
 
 impl KeyStore {
-    /// In-memory only (no durable KV) — dev / tests.
+    /// In-memory only (no durable KV) - dev / tests.
     pub fn new() -> Self {
         KeyStore {
             cache: Mutex::new(HashMap::new()),
@@ -69,15 +69,18 @@ impl KeyStore {
         let meta: ApiKeyMeta = (&rec).into();
         if let Some(kv) = &self.kv {
             let stored: StoredKey = (&rec).into();
-            kv.put(&key_path(&key_id), &serde_json::to_value(&stored).unwrap_or_default())
-                .await;
+            kv.put(
+                &key_path(&key_id),
+                &serde_json::to_value(&stored).unwrap_or_default(),
+            )
+            .await;
             self.index_add(kv, &org_id, &key_id).await;
         }
         self.cache.lock().unwrap().insert(key_id, rec);
         (raw, meta)
     }
 
-    /// List an org's keys (masked — never returns secrets).
+    /// List an org's keys (masked - never returns secrets).
     pub async fn list(&self, org_id: &str) -> Vec<ApiKeyMeta> {
         if let Some(kv) = &self.kv {
             let mut out = Vec::new();
@@ -106,8 +109,11 @@ impl KeyStore {
                 if rec.org_id == org_id {
                     rec.revoked = true;
                     let stored: StoredKey = (&rec).into();
-                    kv.put(&key_path(key_id), &serde_json::to_value(&stored).unwrap_or_default())
-                        .await;
+                    kv.put(
+                        &key_path(key_id),
+                        &serde_json::to_value(&stored).unwrap_or_default(),
+                    )
+                    .await;
                     self.cache.lock().unwrap().insert(key_id.to_string(), rec);
                     return true;
                 }
@@ -124,7 +130,7 @@ impl KeyStore {
         }
     }
 
-    /// Validate a raw API key → org + scopes. Called by the edge/LB (and cached).
+    /// Validate a raw API key -> org + scopes. Called by the edge/LB (and cached).
     /// Hot path: an in-memory cache hit avoids any KV round trip.
     pub async fn introspect(&self, raw: &str) -> Introspection {
         // Parse `fdc_<env>_<key_id>.<secret>`.
@@ -149,7 +155,11 @@ impl KeyStore {
     }
 
     fn introspect_cached(&self, key_id: &str, secret: &str) -> Option<Introspection> {
-        self.cache.lock().unwrap().get(key_id).map(|rec| verify(rec, secret))
+        self.cache
+            .lock()
+            .unwrap()
+            .get(key_id)
+            .map(|rec| verify(rec, secret))
     }
 
     async fn load(&self, kv: &KvClient, key_id: &str) -> Option<ApiKeyRecord> {
@@ -210,7 +220,7 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Public, non-secret key identifier (64 random bits → 16 hex chars).
+/// Public, non-secret key identifier (64 random bits -> 16 hex chars).
 fn gen_id() -> String {
     random_hex(8)
 }
@@ -272,7 +282,12 @@ mod tests {
     async fn introspect_round_trips_a_created_key() {
         let s = store();
         let (raw, meta) = s
-            .create("org_1".into(), "ci".into(), vec!["kv:read".into()], "live".into())
+            .create(
+                "org_1".into(),
+                "ci".into(),
+                vec!["kv:read".into()],
+                "live".into(),
+            )
             .await;
         assert!(raw.starts_with("fdc_live_"));
 
@@ -287,13 +302,17 @@ mod tests {
     async fn introspection_is_wire_compatible_with_the_shared_interface() {
         let s = store();
         let (raw, _) = s
-            .create("org_1".into(), "ci".into(), vec!["kv:read".into()], "live".into())
+            .create(
+                "org_1".into(),
+                "ci".into(),
+                vec!["kv:read".into()],
+                "live".into(),
+            )
             .await;
 
         for intro in [s.introspect(&raw).await, Introspection::invalid()] {
             let json = serde_json::to_value(&intro).unwrap();
-            let shared: fiducia_interfaces::Introspection =
-                serde_json::from_value(json).unwrap();
+            let shared: fiducia_interfaces::Introspection = serde_json::from_value(json).unwrap();
             assert_eq!(shared.valid, intro.valid);
             assert_eq!(shared.org_id, intro.org_id);
             assert_eq!(shared.key_id, intro.key_id);
@@ -311,13 +330,19 @@ mod tests {
         let mut bad = raw.clone();
         let last = bad.pop().unwrap();
         bad.push(if last == 'a' { 'b' } else { 'a' });
-        assert!(!s.introspect(&bad).await.valid, "tampered secret must be invalid");
+        assert!(
+            !s.introspect(&bad).await.valid,
+            "tampered secret must be invalid"
+        );
 
         assert!(!s.introspect("not-a-key").await.valid);
         assert!(!s.introspect("fdc_live_deadbeef").await.valid); // no '.secret'
 
         assert!(s.revoke("org_1", &meta.key_id).await);
-        assert!(!s.introspect(&raw).await.valid, "revoked key must be invalid");
+        assert!(
+            !s.introspect(&raw).await.valid,
+            "revoked key must be invalid"
+        );
     }
 
     #[tokio::test]
