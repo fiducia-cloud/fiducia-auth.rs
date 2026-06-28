@@ -32,5 +32,12 @@ fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# API keys persist to a JSON store. Set FIDUCIA_AUTH_STORE_PATH or
-# FIDUCIA_AUTH_STORE_DIR to choose the location.
+# fiducia-issued JWTs are signed with ES256 (ECDSA P-256). `p256` lets us load a
+# PKCS#8 signing key (shared across replicas via a k8s secret) and derive the
+# public JWK (x/y) we publish at /.well-known/jwks.json for offline verification.
+p256 = { version = "0.13", features = ["pkcs8", "pem", "ecdsa"] }
+base64 = "0.22"
+once_cell = "1"
+
+# TODO(storage): back the keys/orgs store with fiducia KV (API keys) + a Supabase
+# sync into a local cache (orgs/plans) so the hot path never calls Supabase.

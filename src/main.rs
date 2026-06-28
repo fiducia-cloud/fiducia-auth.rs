@@ -12,10 +12,11 @@
 //!     is exchanged once for a short-lived JWT verified offline (see `token.rs`).
 //!
 //! Routing, Supabase JWT verification, API-key crypto/hashing, JWT signing, and
-//! file-backed API-key persistence are implemented.
+//! fiducia-KV-backed API-key persistence are implemented.
 
 mod keys;
 mod model;
+mod store;
 mod supabase;
 mod token;
 
@@ -56,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
     let state = Arc::new(AppState {
-        keys: KeyStore::new(),
+        keys: KeyStore::from_env(),
     });
 
     let app = Router::new()
@@ -154,17 +155,9 @@ async fn create_key(
             .into_response();
     }
     let env = body.env.unwrap_or_else(|| "live".to_string());
-    match s.keys.create(org, body.name, body.scopes, env) {
-        Ok((raw, meta)) => {
-            // The only time the raw key is ever returned.
-            Json(json!({ "api_key": raw, "key": meta })).into_response()
-        }
-        Err(err) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "key_store_unavailable", "detail": err.to_string() })),
-        )
-            .into_response(),
-    }
+    let (raw, meta) = s.keys.create(org, body.name, body.scopes, env).await;
+    // The only time the raw key is ever returned.
+    Json(json!({ "api_key": raw, "key": meta })).into_response()
 }
 
 /// `GET /v1/keys` — list the caller org's keys (masked).
@@ -174,7 +167,7 @@ async fn list_keys(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respon
         Err(e) => return e,
     };
     let org = user.orgs.first().cloned().unwrap_or_default();
-    Json(json!({ "keys": s.keys.list(&org) })).into_response()
+    Json(json!({ "keys": s.keys.list(&org).await })).into_response()
 }
 
 /// `DELETE /v1/keys/{key_id}` — revoke a key the caller's org owns.
@@ -188,14 +181,7 @@ async fn revoke_key(
         Err(e) => return e,
     };
     let org = user.orgs.first().cloned().unwrap_or_default();
-    match s.keys.revoke(&org, &key_id) {
-        Ok(revoked) => Json(json!({ "revoked": revoked })).into_response(),
-        Err(err) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "key_store_unavailable", "detail": err.to_string() })),
-        )
-            .into_response(),
-    }
+    Json(json!({ "revoked": s.keys.revoke(&org, &key_id).await })).into_response()
 }
 
 // --- data-plane handlers (edge/LB) ---
@@ -211,26 +197,18 @@ async fn introspect(
     if !internal_secret_authorized(&headers) {
         return unauthorized("missing or invalid internal auth");
     }
-    Json(json!(s.keys.introspect(&body.api_key))).into_response()
+    Json(json!(s.keys.introspect(&body.api_key).await)).into_response()
 }
 
 /// `POST /v1/token` — exchange an API key for a short-lived JWT (offline-verifiable).
 async fn exchange_token(State(s): State<Arc<AppState>>, Json(body): Json<TokenBody>) -> Response {
-    let intro = s.keys.introspect(&body.api_key);
+    let intro = s.keys.introspect(&body.api_key).await;
     if !intro.valid {
         return unauthorized("invalid api key");
     }
     let org = intro.org_id.unwrap_or_default();
-    match token::mint_token(&org, &intro.scopes, 900) {
-        Ok(jwt) => {
-            Json(json!({ "token": jwt, "token_type": "Bearer", "expires_in": 900 })).into_response()
-        }
-        Err(err) => (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "token_signing_unavailable", "detail": err.to_string() })),
-        )
-            .into_response(),
-    }
+    let jwt = token::mint_token(&org, &intro.scopes, 900);
+    Json(json!({ "token": jwt, "token_type": "Bearer", "expires_in": 900 })).into_response()
 }
 
 fn internal_secret_authorized(headers: &HeaderMap) -> bool {
