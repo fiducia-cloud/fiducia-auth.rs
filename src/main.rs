@@ -151,7 +151,7 @@ async fn create_key(
             .into_response();
     };
     let env = body.env.unwrap_or_else(|| "live".to_string());
-    let (raw, meta) = s.keys.create(org, body.name, body.scopes, env);
+    let (raw, meta) = s.keys.create(org, body.name, body.scopes, env).await;
     // The only time the raw key is ever returned.
     Json(json!({ "api_key": raw, "key": meta })).into_response()
 }
