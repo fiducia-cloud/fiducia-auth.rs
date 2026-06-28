@@ -258,8 +258,24 @@ fn internal_secret_authorized(headers: &HeaderMap) -> bool {
     headers
         .get("x-server-auth")
         .and_then(|value| value.to_str().ok())
-        .map(|provided| provided == expected)
+        .map(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
+}
+
+/// Compare two byte strings in time independent of how many leading bytes match,
+/// so an attacker probing `x-server-auth` can't recover the shared introspection
+/// secret one byte at a time. (The API-key path already does this in `keys.rs`;
+/// this closes the same gap on the internal server-to-server secret.) The length
+/// short-circuit leaks only the secret's length, not its contents.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
