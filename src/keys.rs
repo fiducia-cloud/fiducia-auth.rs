@@ -28,7 +28,8 @@ pub struct KeyStore {
 }
 
 impl KeyStore {
-    /// In-memory only (no durable KV) - dev / tests.
+    /// In-memory only (no durable KV) - tests.
+    #[cfg(test)]
     pub fn new() -> Self {
         KeyStore {
             cache: Mutex::new(HashMap::new()),

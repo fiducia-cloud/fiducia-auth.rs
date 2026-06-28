@@ -13,10 +13,14 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+#[cfg(test)]
+use jsonwebtoken::{decode, DecodingKey, Validation};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use once_cell::sync::Lazy;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
-use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey, LineEnding};
+#[cfg(test)]
+use p256::pkcs8::EncodePublicKey;
+use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use p256::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -41,6 +45,7 @@ pub struct Claims {
 /// Process-wide ES256 signer, loaded once.
 struct Signer {
     encoding: EncodingKey,
+    #[cfg(test)]
     decoding: DecodingKey,
     jwk: Value,
     kid: String,
@@ -74,10 +79,13 @@ impl Signer {
         let encoding = EncodingKey::from_ec_pem(pkcs8.as_bytes()).expect("ES256 encoding key");
 
         let pubkey = secret.public_key();
-        let spki = pubkey
-            .to_public_key_pem(LineEnding::LF)
-            .expect("encode public key to SPKI PEM");
-        let decoding = DecodingKey::from_ec_pem(spki.as_bytes()).expect("ES256 decoding key");
+        #[cfg(test)]
+        let decoding = {
+            let spki = pubkey
+                .to_public_key_pem(LineEnding::LF)
+                .expect("encode public key to SPKI PEM");
+            DecodingKey::from_ec_pem(spki.as_bytes()).expect("ES256 decoding key")
+        };
 
         // Public JWK (uncompressed point -> x/y) for /.well-known/jwks.json.
         let point = pubkey.to_encoded_point(false); // 0x04 || x || y
@@ -102,6 +110,7 @@ impl Signer {
 
         Signer {
             encoding,
+            #[cfg(test)]
             decoding,
             jwk,
             kid,
@@ -134,12 +143,7 @@ pub fn jwks() -> Value {
     json!({ "keys": [SIGNER.jwk.clone()] })
 }
 
-/// Verify a fiducia-issued token offline (used by tests; the edge/LB carry their
-/// own copy of this check, fed by the published JWKS).
-pub fn verify_token(token: &str) -> Option<Claims> {
-    verify_with(&SIGNER, token)
-}
-
+#[cfg(test)]
 fn verify_with(signer: &Signer, token: &str) -> Option<Claims> {
     let mut validation = Validation::new(Algorithm::ES256);
     validation.set_issuer(&[ISSUER]);

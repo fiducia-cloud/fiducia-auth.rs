@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -41,6 +41,23 @@ use keys::KeyStore;
 use model::{CreateKeyBody, IntrospectBody, TokenBody, UserCtx};
 
 const SERVICE: &str = "fiducia-auth";
+const ALLOWED_API_KEY_SCOPES: &[&str] = &[
+    "requests:read",
+    "requests:write",
+    "locks:read",
+    "locks:write",
+    "kv:read",
+    "kv:write",
+    "services:read",
+    "services:write",
+    "elections:read",
+    "elections:write",
+    "cron:read",
+    "cron:write",
+    "rate-limit:read",
+    "rate-limit:write",
+    "admin:read",
+];
 
 /// Reject any request whose handler runs longer than this (slow-loris / hung
 /// upstream protection). Auth work is sub-millisecond.
@@ -113,10 +130,55 @@ async fn require_user(headers: &HeaderMap) -> Result<UserCtx, Response> {
 
 fn unauthorized(msg: &str) -> Response {
     (
-        axum::http::StatusCode::UNAUTHORIZED,
+        StatusCode::UNAUTHORIZED,
         Json(json!({ "error": "unauthorized", "detail": msg })),
     )
         .into_response()
+}
+
+struct KeyCreateInput {
+    name: String,
+    scopes: Vec<String>,
+    env: String,
+}
+
+fn validated_key_create_input(body: CreateKeyBody) -> Result<KeyCreateInput, &'static str> {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err("name_required");
+    }
+
+    let env = body
+        .env
+        .unwrap_or_else(|| "live".to_string())
+        .trim()
+        .to_string();
+    if !matches!(env.as_str(), "live" | "test") {
+        return Err("invalid_environment");
+    }
+
+    let mut scopes = Vec::new();
+    for scope in body.scopes {
+        let scope = scope.trim().to_string();
+        if scope.is_empty() {
+            continue;
+        }
+        if !ALLOWED_API_KEY_SCOPES.contains(&scope.as_str()) {
+            return Err("invalid_scope");
+        }
+        if !scopes.iter().any(|existing| existing == &scope) {
+            scopes.push(scope);
+        }
+    }
+    if scopes.is_empty() {
+        scopes.push("requests:write".to_string());
+    }
+
+    Ok(KeyCreateInput { name, scopes, env })
+}
+
+fn bad_key_request(error: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
 }
 
 // --- dashboard handlers ---
@@ -149,13 +211,19 @@ async fn create_key(
     };
     if !user.orgs.iter().any(|allowed| allowed == &org) {
         return (
-            axum::http::StatusCode::FORBIDDEN,
+            StatusCode::FORBIDDEN,
             Json(json!({ "error": "forbidden_org", "org_id": org })),
         )
             .into_response();
     }
-    let env = body.env.unwrap_or_else(|| "live".to_string());
-    let (raw, meta) = s.keys.create(org, body.name, body.scopes, env).await;
+    let input = match validated_key_create_input(body) {
+        Ok(input) => input,
+        Err(error) => return bad_key_request(error),
+    };
+    let (raw, meta) = s
+        .keys
+        .create(org, input.name, input.scopes, input.env)
+        .await;
     // The only time the raw key is ever returned.
     Json(json!({ "api_key": raw, "key": meta })).into_response()
 }
@@ -227,6 +295,7 @@ fn internal_secret_authorized(headers: &HeaderMap) -> bool {
 
 #[cfg(test)]
 mod interface_contract_tests {
+    use super::{validated_key_create_input, CreateKeyBody};
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 
     #[test]
@@ -243,5 +312,59 @@ mod interface_contract_tests {
             ProposeErrorReason::NotLeader,
             ProposeErrorReason::NotLeader
         ));
+    }
+
+    #[test]
+    fn key_creation_defaults_and_dedupes_scopes() {
+        let input = validated_key_create_input(CreateKeyBody {
+            name: " production ".to_string(),
+            org_id: None,
+            scopes: vec![
+                " kv:read ".to_string(),
+                "kv:read".to_string(),
+                "".to_string(),
+            ],
+            env: None,
+        })
+        .expect("valid input");
+
+        assert_eq!(input.name, "production");
+        assert_eq!(input.env, "live");
+        assert_eq!(input.scopes, vec!["kv:read".to_string()]);
+
+        let defaulted = validated_key_create_input(CreateKeyBody {
+            name: "worker".to_string(),
+            org_id: None,
+            scopes: vec![],
+            env: Some("test".to_string()),
+        })
+        .expect("valid input");
+        assert_eq!(defaulted.scopes, vec!["requests:write".to_string()]);
+        assert_eq!(defaulted.env, "test");
+    }
+
+    #[test]
+    fn key_creation_rejects_bad_name_env_and_scope() {
+        assert!(validated_key_create_input(CreateKeyBody {
+            name: " ".to_string(),
+            org_id: None,
+            scopes: vec!["kv:read".to_string()],
+            env: None,
+        })
+        .is_err());
+        assert!(validated_key_create_input(CreateKeyBody {
+            name: "worker".to_string(),
+            org_id: None,
+            scopes: vec!["kv:read".to_string()],
+            env: Some("prod".to_string()),
+        })
+        .is_err());
+        assert!(validated_key_create_input(CreateKeyBody {
+            name: "worker".to_string(),
+            org_id: None,
+            scopes: vec!["*".to_string()],
+            env: None,
+        })
+        .is_err());
     }
 }
