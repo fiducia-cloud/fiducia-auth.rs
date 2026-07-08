@@ -525,4 +525,48 @@ mod tests {
             Err(VerifyError::UnexpectedRole(Some(role))) if role == "service_role"
         ));
     }
+
+    #[test]
+    fn normalize_url_trims_spaces_and_trailing_slashes() {
+        assert_eq!(
+            normalize_url("  https://example.supabase.co///  "),
+            "https://example.supabase.co"
+        );
+    }
+
+    #[test]
+    fn symmetric_jwt_algorithms_are_not_accepted_for_offline_jwks() {
+        assert!(!is_asymmetric_algorithm(Algorithm::HS256));
+        assert!(is_asymmetric_algorithm(Algorithm::RS256));
+        assert!(is_asymmetric_algorithm(Algorithm::EdDSA));
+    }
+
+    #[test]
+    fn push_org_ignores_empty_and_duplicate_orgs() {
+        let mut orgs = vec!["org_a".to_string()];
+
+        push_org(&mut orgs, " ");
+        push_org(&mut orgs, "org_a");
+        push_org(&mut orgs, " org_b ");
+
+        assert_eq!(orgs, vec!["org_a".to_string(), "org_b".to_string()]);
+    }
+
+    #[test]
+    fn remote_user_must_match_supabase_audience() {
+        let config = SupabaseConfig::for_project("ruxctrzdvugxztbjcpoi");
+        let user = SupabaseUser {
+            id: "user_1".to_string(),
+            aud: Some("service_role".to_string()),
+            email: Some("user@example.com".to_string()),
+            role: Some(DEFAULT_AUDIENCE.to_string()),
+            app_metadata: None,
+            user_metadata: None,
+        };
+
+        assert!(matches!(
+            user_ctx_from_remote_user(user, &config),
+            Err(VerifyError::UnexpectedAudience(Some(aud))) if aud == "service_role"
+        ));
+    }
 }

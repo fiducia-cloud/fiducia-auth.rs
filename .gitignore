@@ -9,3 +9,6 @@
 
 # Scratch / git worktrees (tmp/worktrees/*)
 tmp/
+
+# Local cargo target probe cache
+.cargo-target-check/
