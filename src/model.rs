@@ -54,6 +54,8 @@ pub struct ApiKeyRecord {
     pub revoked: bool,
     /// "live" or "test".
     pub env: String,
+    /// When true, mutating calls with this key must carry an `Idempotency-Key`.
+    pub require_idempotency: bool,
 }
 
 /// Public (maskable) view of a key for the dashboard list.
