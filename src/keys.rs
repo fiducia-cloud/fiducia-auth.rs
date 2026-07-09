@@ -66,6 +66,9 @@ impl KeyStore {
             last_used_ms: None,
             revoked: false,
             env,
+            // Opt-in: keys minted directly here default to not requiring a key.
+            // The customer-facing default lives with the backend key config.
+            require_idempotency: false,
         };
         let meta: ApiKeyMeta = (&rec).into();
         if let Some(kv) = &self.kv {
