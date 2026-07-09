@@ -21,6 +21,9 @@ pub struct Introspection {
     pub org_id: Option<OrgId>,
     pub key_id: Option<String>,
     pub scopes: Vec<String>,
+    /// When true, the edge/LB must reject mutating calls made with this key that
+    /// omit an `Idempotency-Key` header. Defaults false so the control is opt-in.
+    pub require_idempotency: bool,
 }
 
 impl Introspection {
@@ -30,6 +33,7 @@ impl Introspection {
             org_id: None,
             key_id: None,
             scopes: vec![],
+            require_idempotency: false,
         }
     }
 }
