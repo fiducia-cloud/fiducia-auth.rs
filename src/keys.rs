@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -20,11 +20,39 @@ use sha2::{Digest, Sha256};
 use crate::model::{ApiKeyMeta, ApiKeyRecord, Introspection, OrgId};
 use crate::store::{key_path, org_index_path, KvClient, StoredKey};
 
+/// Default hot-cache TTL: how long a cached introspection result may be served
+/// before it must be re-read from the authoritative KV. Bounds how long a
+/// *revocation issued on another replica* can go unseen here (see [`KeyStore`]).
+const DEFAULT_KEY_CACHE_TTL_MS: u64 = 30_000;
+
+/// A cached key record plus when it was cached, so entries can expire (TTL).
+struct CacheEntry {
+    record: ApiKeyRecord,
+    inserted: Instant,
+}
+
+impl CacheEntry {
+    fn now(record: ApiKeyRecord) -> Self {
+        CacheEntry {
+            record,
+            inserted: Instant::now(),
+        }
+    }
+}
+
 /// Cache-aside key store: an in-memory hot cache fronts durable fiducia KV. With
 /// no `FIDUCIA_KV_URL` configured it is purely in-memory (dev / tests).
+///
+/// Cache entries carry a **TTL** (`FIDUCIA_KEY_CACHE_TTL_MS`, default
+/// [`DEFAULT_KEY_CACHE_TTL_MS`]). A hit within the TTL short-circuits (the hot
+/// path, no round trip); an entry older than the TTL is a MISS, so `introspect`
+/// re-reads the authoritative KV and picks up revocations propagated from other
+/// replicas — without this, replica B would serve `valid:true` for a key revoked
+/// via replica A until it restarted.
 pub struct KeyStore {
-    cache: Mutex<HashMap<String, ApiKeyRecord>>, // key_id -> record
+    cache: Mutex<HashMap<String, CacheEntry>>, // key_id -> (record, inserted)
     kv: Option<KvClient>,
+    ttl: Duration,
 }
 
 impl KeyStore {
@@ -34,6 +62,17 @@ impl KeyStore {
         KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: None,
+            ttl: Duration::from_millis(DEFAULT_KEY_CACHE_TTL_MS),
+        }
+    }
+
+    /// In-memory only with an explicit cache TTL - tests.
+    #[cfg(test)]
+    pub fn with_ttl(ttl: Duration) -> Self {
+        KeyStore {
+            cache: Mutex::new(HashMap::new()),
+            kv: None,
+            ttl,
         }
     }
 
@@ -42,6 +81,7 @@ impl KeyStore {
         KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: KvClient::from_env(),
+            ttl: key_cache_ttl_from_env(),
         }
     }
 
