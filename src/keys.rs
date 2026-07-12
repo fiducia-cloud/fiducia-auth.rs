@@ -66,6 +66,9 @@ impl KeyStore {
             last_used_ms: None,
             revoked: false,
             env,
+            // Opt-in: keys minted directly here default to not requiring a key.
+            // The customer-facing default lives with the backend key config.
+            require_idempotency: false,
         };
         let meta: ApiKeyMeta = (&rec).into();
         if let Some(kv) = &self.kv {
@@ -192,6 +195,7 @@ fn verify(rec: &ApiKeyRecord, secret: &str) -> Introspection {
             org_id: Some(rec.org_id.clone()),
             key_id: Some(rec.key_id.clone()),
             scopes: rec.scopes.clone(),
+            require_idempotency: rec.require_idempotency,
         }
     } else {
         Introspection::invalid()
