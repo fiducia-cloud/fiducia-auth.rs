@@ -85,6 +85,18 @@ impl KeyStore {
         }
     }
 
+    /// Backdate a cached entry's insertion time so it reads as `age` old, to
+    /// exercise TTL expiry deterministically without sleeping.
+    #[cfg(test)]
+    fn test_age_entry(&self, key_id: &str, age: Duration) {
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(e) = cache.get_mut(key_id) {
+            e.inserted = Instant::now()
+                .checked_sub(age)
+                .expect("age within Instant range");
+        }
+    }
+
     /// Create a key for an org. Returns the **raw key (shown once)** + its meta.
     pub async fn create(
         &self,
