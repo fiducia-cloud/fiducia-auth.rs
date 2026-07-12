@@ -141,6 +141,7 @@ impl KeyStore {
             .lock()
             .unwrap()
             .values()
+            .map(|e| &e.record)
             .filter(|r| r.org_id == org_id)
             .map(ApiKeyMeta::from)
             .collect()
