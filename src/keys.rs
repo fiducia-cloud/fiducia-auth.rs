@@ -159,7 +159,10 @@ impl KeyStore {
                         &serde_json::to_value(&stored).unwrap_or_default(),
                     )
                     .await;
-                    self.cache.lock().unwrap().insert(key_id.to_string(), rec);
+                    self.cache
+                        .lock()
+                        .unwrap()
+                        .insert(key_id.to_string(), CacheEntry::now(rec));
                     return true;
                 }
             }
@@ -167,8 +170,9 @@ impl KeyStore {
         }
         let mut cache = self.cache.lock().unwrap();
         match cache.get_mut(key_id) {
-            Some(r) if r.org_id == org_id => {
-                r.revoked = true;
+            Some(e) if e.record.org_id == org_id => {
+                e.record.revoked = true;
+                e.inserted = Instant::now();
                 true
             }
             _ => false,
