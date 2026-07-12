@@ -438,6 +438,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_cache_ttl_is_the_safe_default() {
+        assert_eq!(
+            store().ttl,
+            Duration::from_millis(DEFAULT_KEY_CACHE_TTL_MS),
+            "unset FIDUCIA_KEY_CACHE_TTL_MS must fall back to the safe default"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cache_entry_past_its_ttl_is_a_miss_and_triggers_a_reread() {
+        // Tiny TTL so an aged entry is unambiguously stale.
+        let s = KeyStore::with_ttl(Duration::from_millis(50));
+        let (raw, meta) = s
+            .create("org_1".into(), "ci".into(), vec![], "live".into())
+            .await;
+        let key_id = meta.key_id.as_str();
+
+        // Split `fdc_<env>_<key_id>.<secret>` back into its pieces.
+        let (_left, secret) = raw.split_once('.').unwrap();
+
+        // Fresh: a hit within the TTL short-circuits (authoritative, still valid).
+        assert!(
+            s.introspect_cached(key_id, secret).is_some(),
+            "a fresh entry must short-circuit the hot path"
+        );
+
+        // Age the entry beyond the TTL: the cache layer now reports a MISS, which
+        // is what forces `introspect` to re-read the authoritative KV (and thus
+        // observe revocations propagated from another replica).
+        s.test_age_entry(key_id, Duration::from_millis(500));
+        assert!(
+            s.introspect_cached(key_id, secret).is_none(),
+            "an entry past its TTL must be a MISS so KV is re-read"
+        );
+
+        // No durable KV here, so `introspect` still honors the (only) local record
+        // rather than spuriously 401-ing a valid key — existing behavior preserved.
+        assert!(
+            s.introspect(&raw).await.valid,
+            "with no KV to re-read, a stale-but-valid key must stay valid"
+        );
+        // ...and the successful path re-stamped the entry, so it's fresh again.
+        assert!(s.introspect_cached(key_id, secret).is_some());
+    }
+
     #[tokio::test]
     async fn revoke_is_scoped_to_the_owning_org() {
         let s = store();
