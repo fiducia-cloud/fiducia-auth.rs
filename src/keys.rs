@@ -120,7 +120,7 @@ impl KeyStore {
             .await;
             self.index_add(kv, &org_id, &key_id).await;
         }
-        self.cache.lock().unwrap().insert(key_id, rec);
+        self.cache.lock().unwrap().insert(key_id, CacheEntry::now(rec));
         (raw, meta)
     }
 
