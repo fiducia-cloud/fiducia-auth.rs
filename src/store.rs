@@ -32,6 +32,10 @@ pub struct StoredKey {
     pub last_used_ms: Option<u64>,
     pub revoked: bool,
     pub env: String,
+    /// When true, the edge/LB rejects keyless mutating calls. `#[serde(default)]`
+    /// so records persisted before this field parse as `false` (opt-in control).
+    #[serde(default)]
+    pub require_idempotency: bool,
 }
 
 impl From<&ApiKeyRecord> for StoredKey {
@@ -46,6 +50,7 @@ impl From<&ApiKeyRecord> for StoredKey {
             last_used_ms: r.last_used_ms,
             revoked: r.revoked,
             env: r.env.clone(),
+            require_idempotency: r.require_idempotency,
         }
     }
 }
@@ -62,6 +67,7 @@ impl From<&StoredKey> for ApiKeyRecord {
             last_used_ms: s.last_used_ms,
             revoked: s.revoked,
             env: s.env.clone(),
+            require_idempotency: s.require_idempotency,
         }
     }
 }
