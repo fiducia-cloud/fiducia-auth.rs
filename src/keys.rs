@@ -190,25 +190,46 @@ impl KeyStore {
             return Introspection::invalid();
         };
 
+        // Hot path: a *fresh* cache hit (within the TTL) short-circuits with no
+        // round trip.
         if let Some(intro) = self.introspect_cached(key_id, secret) {
             return intro;
         }
+        // Miss, or an entry past its TTL: re-read the authoritative KV so a
+        // revocation issued on another replica is seen within the TTL, then
+        // refresh the entry.
         if let Some(kv) = &self.kv {
             if let Some(rec) = self.load(kv, key_id).await {
                 let intro = verify(&rec, secret);
-                self.cache.lock().unwrap().insert(key_id.to_string(), rec);
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .insert(key_id.to_string(), CacheEntry::now(rec));
                 return intro;
             }
         }
-        Introspection::invalid()
-    }
-
-    fn introspect_cached(&self, key_id: &str, secret: &str) -> Option<Introspection> {
+        // No durable KV to re-read (dev / single-process), or the KV no longer
+        // holds it: the local cache is the only source of truth, so honor a
+        // still-present entry even past its TTL rather than spuriously rejecting
+        // it. (Revocation still sets `revoked` on that entry, so it stays 401.)
         self.cache
             .lock()
             .unwrap()
             .get(key_id)
-            .map(|rec| verify(rec, secret))
+            .map(|e| verify(&e.record, secret))
+            .unwrap_or_else(Introspection::invalid)
+    }
+
+    /// Fresh cache hit only. An entry older than `ttl` is treated as a MISS
+    /// (returns `None`) so the caller re-reads the authoritative KV — this is how
+    /// a revocation from another replica propagates here within the TTL.
+    fn introspect_cached(&self, key_id: &str, secret: &str) -> Option<Introspection> {
+        let cache = self.cache.lock().unwrap();
+        let entry = cache.get(key_id)?;
+        if entry.inserted.elapsed() >= self.ttl {
+            return None;
+        }
+        Some(verify(&entry.record, secret))
     }
 
     async fn load(&self, kv: &KvClient, key_id: &str) -> Option<ApiKeyRecord> {
