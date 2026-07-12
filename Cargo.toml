@@ -1,3 +1,4 @@
+# Crate manifest: package metadata and dependencies for the fiducia-auth server.
 [package]
 name = "fiducia-auth"
 version = "0.1.0"
