@@ -268,6 +268,16 @@ fn verify(rec: &ApiKeyRecord, secret: &str) -> Introspection {
     }
 }
 
+/// Hot-cache TTL from `FIDUCIA_KEY_CACHE_TTL_MS` (milliseconds), defaulting to
+/// [`DEFAULT_KEY_CACHE_TTL_MS`] when unset or unparseable.
+fn key_cache_ttl_from_env() -> Duration {
+    let ms = std::env::var("FIDUCIA_KEY_CACHE_TTL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_KEY_CACHE_TTL_MS);
+    Duration::from_millis(ms)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
