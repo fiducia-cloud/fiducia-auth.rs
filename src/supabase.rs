@@ -229,10 +229,9 @@ fn user_ctx_from_remote_user(
     Ok(UserCtx {
         user_id: user.id,
         email: user.email,
-        orgs: orgs_from_metadata(
-            &[user.app_metadata.as_ref(), user.user_metadata.as_ref()],
-            config,
-        ),
+        // Only admin-controlled `app_metadata` — never user-writable
+        // `user_metadata` — may grant org membership (see the note above).
+        orgs: orgs_from_metadata(&[user.app_metadata.as_ref()], config),
     })
 }
 
