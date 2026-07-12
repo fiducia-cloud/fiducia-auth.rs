@@ -196,10 +196,11 @@ fn user_ctx_from_claims(
     Ok(UserCtx {
         user_id: claims.sub,
         email: claims.email,
-        orgs: orgs_from_metadata(
-            &[claims.app_metadata.as_ref(), claims.user_metadata.as_ref()],
-            config,
-        ),
+        // Org membership MUST come only from `app_metadata` (admin-controlled).
+        // `user_metadata` (raw_user_meta_data) is writable by the authenticated
+        // user via `auth.updateUser({ data })`, so trusting it for org claims
+        // would let any user assign themselves into a victim org (tenant takeover).
+        orgs: orgs_from_metadata(&[claims.app_metadata.as_ref()], config),
     })
 }
 
