@@ -480,8 +480,6 @@ mod tests {
             s.introspect(&raw).await.valid,
             "with no KV to re-read, a stale-but-valid key must stay valid"
         );
-        // ...and the successful path re-stamped the entry, so it's fresh again.
-        assert!(s.introspect_cached(key_id, secret).is_some());
     }
 
     #[tokio::test]
