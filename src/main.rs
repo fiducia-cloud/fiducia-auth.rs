@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -35,11 +35,11 @@ use axum::{
 use serde_json::{json, Value};
 use std::time::Duration;
 use tower_http::{
-    catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
-    trace::TraceLayer,
+    catch_panic::CatchPanicLayer, cors::CorsLayer, limit::RequestBodyLimitLayer,
+    timeout::TimeoutLayer, trace::TraceLayer,
 };
 
-use keys::KeyStore;
+use keys::{KeyStore, MutationIdentity};
 use model::{CreateKeyBody, IntrospectBody, TokenBody, UserCtx};
 use store::StoreError;
 
@@ -86,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let introspect_secret = required_env("FIDUCIA_INTROSPECT_SECRET")?;
     let rotation_overlap_seconds = rotation_overlap_seconds_from_env()?;
     let keys = KeyStore::from_env().map_err(std::io::Error::other)?;
+    let customer_origin = customer_origin_from_env()?;
 
     // Supabase is the durable system of record; complete one initial sync before
     // accepting traffic so an empty cache cannot impersonate real org state.
@@ -124,7 +125,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CatchPanicLayer::new());
+        .layer(CatchPanicLayer::new())
+        // The customer portal is independently hosted. Permit only its exact
+        // configured origin to call browser-facing auth routes; this is never a
+        // wildcard and does not enable credentialed cookies.
+        .layer(customer_cors_layer(customer_origin));
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -295,6 +300,45 @@ fn required_env(name: &str) -> Result<String, std::io::Error> {
         .ok_or_else(|| std::io::Error::other(format!("{name} must be configured")))
 }
 
+fn customer_origin_from_env() -> Result<HeaderValue, std::io::Error> {
+    customer_origin_from(std::env::var("FIDUCIA_CUSTOMER_ORIGIN").ok().as_deref())
+}
+
+fn customer_origin_from(value: Option<&str>) -> Result<HeaderValue, std::io::Error> {
+    let configured = value.unwrap_or("https://app.fiducia.cloud").trim();
+    let parsed = reqwest::Url::parse(configured).map_err(|_| {
+        std::io::Error::other("FIDUCIA_CUSTOMER_ORIGIN must be an absolute HTTP(S) origin")
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(std::io::Error::other(
+            "FIDUCIA_CUSTOMER_ORIGIN must contain only an HTTP(S) scheme, host, and optional port",
+        ));
+    }
+    let origin = parsed.origin().ascii_serialization();
+    HeaderValue::from_str(&origin).map_err(|_| {
+        std::io::Error::other("FIDUCIA_CUSTOMER_ORIGIN is not a valid HTTP Origin header")
+    })
+}
+
+fn customer_cors_layer(origin: HeaderValue) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(origin)
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("idempotency-key"),
+            HeaderName::from_static("x-fiducia-org-id"),
+        ])
+}
+
 // --- dashboard handlers ---
 
 /// `GET /v1/me` — return the Supabase-authenticated dashboard identity.
@@ -361,8 +405,7 @@ async fn create_key(
     let (raw, meta) = match s
         .keys
         .create(
-            &user.user_id,
-            &idempotency_key,
+            MutationIdentity::new(&user.user_id, &idempotency_key),
             org,
             input.name,
             input.scopes,
@@ -576,10 +619,74 @@ mod constant_time_tests {
 }
 
 #[cfg(test)]
+mod cors_tests {
+    use super::{customer_cors_layer, customer_origin_from};
+    use axum::{
+        body::Body,
+        http::{header, Method, Request, StatusCode},
+        routing::get,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        Router::new()
+            .route("/v1/me", get(|| async { StatusCode::OK }))
+            .layer(customer_cors_layer(
+                customer_origin_from(Some("https://app.fiducia.cloud")).unwrap(),
+            ))
+    }
+
+    #[tokio::test]
+    async fn customer_origin_preflight_is_allowed_exactly() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/v1/me")
+                    .header(header::ORIGIN, "https://app.fiducia.cloud")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&"https://app.fiducia.cloud".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn sibling_origin_never_receives_itself_as_an_allowed_origin() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/me")
+                    .header(header::ORIGIN, "https://admin.fiducia.cloud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let allowed = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap();
+        assert_eq!(allowed, "https://app.fiducia.cloud");
+        assert_ne!(allowed, "https://admin.fiducia.cloud");
+    }
+}
+
+#[cfg(test)]
 mod interface_contract_tests {
     use super::{
-        rotation_overlap_seconds_from, select_user_org, validated_key_create_input, CreateKeyBody,
-        UserCtx,
+        customer_origin_from, rotation_overlap_seconds_from, select_user_org,
+        validated_key_create_input, CreateKeyBody, UserCtx,
     };
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 
@@ -712,5 +819,32 @@ mod interface_contract_tests {
         assert_eq!(rotation_overlap_seconds_from(Some("120")).unwrap(), 120);
         assert!(rotation_overlap_seconds_from(Some("0")).is_err());
         assert!(rotation_overlap_seconds_from(Some("not-a-number")).is_err());
+    }
+
+    #[test]
+    fn customer_cors_origin_is_exact_and_normalized() {
+        assert_eq!(
+            customer_origin_from(None).unwrap().to_str().unwrap(),
+            "https://app.fiducia.cloud"
+        );
+        assert_eq!(
+            customer_origin_from(Some("http://127.0.0.1:4173/"))
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "http://127.0.0.1:4173"
+        );
+        for invalid in [
+            "*",
+            "null",
+            "ftp://app.fiducia.cloud",
+            "https://app.fiducia.cloud/path",
+            "https://app.fiducia.cloud?query=1",
+        ] {
+            assert!(
+                customer_origin_from(Some(invalid)).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 }

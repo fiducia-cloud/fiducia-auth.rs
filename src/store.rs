@@ -118,6 +118,8 @@ pub enum StoreError {
     MissingInternalSecret,
     #[error("FIDUCIA_KEY_IDEMPOTENCY_SECRET must be set")]
     MissingIdempotencySecret,
+    #[error("FIDUCIA_KEY_IDEMPOTENCY_SECRET must contain at least 32 bytes and no whitespace")]
+    WeakIdempotencySecret,
     #[error("FIDUCIA_KV_ORG_ID must be non-empty and contain no whitespace or control characters")]
     InvalidStorageOrg,
     #[error("fiducia KV request failed: {0}")]

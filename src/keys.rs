@@ -47,6 +47,21 @@ pub struct KeyStore {
     idempotency_secret: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+pub struct MutationIdentity<'a> {
+    pub actor_id: &'a str,
+    pub idempotency_key: &'a str,
+}
+
+impl<'a> MutationIdentity<'a> {
+    pub fn new(actor_id: &'a str, idempotency_key: &'a str) -> Self {
+        Self {
+            actor_id,
+            idempotency_key,
+        }
+    }
+}
+
 impl KeyStore {
     /// In-memory only (no durable KV) - tests.
     #[cfg(test)]
@@ -60,28 +75,33 @@ impl KeyStore {
 
     /// Construct the production store. Durable KV is mandatory.
     pub fn from_env() -> Result<Self, StoreError> {
-        let idempotency_secret = std::env::var("FIDUCIA_KEY_IDEMPOTENCY_SECRET")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(StoreError::MissingIdempotencySecret)?;
+        let idempotency_secret = validated_idempotency_secret(
+            std::env::var("FIDUCIA_KEY_IDEMPOTENCY_SECRET")
+                .ok()
+                .as_deref(),
+        )?;
         Ok(KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: Some(KvClient::from_env()?),
-            idempotency_secret: idempotency_secret.into_bytes(),
+            idempotency_secret,
         })
     }
 
-    /// Create a key for an org. Returns the **raw key (shown once)** + its meta.
+    /// Create a key for an org. Returns the raw key to the original request and
+    /// exact idempotent retries, without persisting the raw value.
     pub async fn create(
         &self,
-        actor_id: &str,
-        idempotency_key: &str,
+        mutation: MutationIdentity<'_>,
         org_id: OrgId,
         name: String,
         scopes: Vec<String>,
         env: String,
         require_idempotency: bool,
     ) -> Result<(String, ApiKeyMeta), StoreError> {
+        let MutationIdentity {
+            actor_id,
+            idempotency_key,
+        } = mutation;
         let create_idempotency_hash =
             self.derive_idempotency("create-marker", &[actor_id, &org_id, idempotency_key]);
         let key_id = self
@@ -123,6 +143,10 @@ impl KeyStore {
                     .insert(key_id, CacheEntry::now(existing));
                 return Ok((raw, meta));
             }
+            // The org index is part of the credential's committed identity.
+            // Introspection requires this membership, so a failure here leaves
+            // the just-written record unusable. Retrying the same idempotency
+            // key repairs the index and replays the same one-time secret.
             self.index_add(kv, &org_id, &key_id).await?;
         } else {
             let cache = self.cache.lock().unwrap();
@@ -314,7 +338,19 @@ impl KeyStore {
         // state. This prevents per-replica stale acceptance after rotation.
         if let Some(kv) = &self.kv {
             if let Some(rec) = self.load(kv, key_id).await? {
-                let intro = verify(&rec, env, secret);
+                // Fail closed if create persisted the record but could not
+                // commit its org index. This prevents a valid-but-unlisted
+                // credential after a partial multi-key KV write.
+                let indexed = self
+                    .index_get(kv, &rec.org_id)
+                    .await?
+                    .iter()
+                    .any(|indexed_id| indexed_id == key_id);
+                let intro = if indexed {
+                    verify(&rec, env, secret)
+                } else {
+                    Introspection::invalid()
+                };
                 self.cache
                     .lock()
                     .unwrap()
@@ -405,6 +441,16 @@ impl KeyStore {
         }
         to_hex(&mac.finalize().into_bytes())
     }
+}
+
+fn validated_idempotency_secret(value: Option<&str>) -> Result<Vec<u8>, StoreError> {
+    let value = value
+        .filter(|candidate| !candidate.is_empty())
+        .ok_or(StoreError::MissingIdempotencySecret)?;
+    if value.len() < 32 || value.chars().any(char::is_whitespace) {
+        return Err(StoreError::WeakIdempotencySecret);
+    }
+    Ok(value.as_bytes().to_vec())
 }
 
 fn same_create_request(existing: &ApiKeyRecord, requested: &ApiKeyRecord) -> bool {
@@ -524,7 +570,12 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+    use axum::{
+        extract::{Query, State},
+        http::StatusCode,
+        routing::get,
+        Json, Router,
+    };
     use serde_json::Value;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -585,8 +636,45 @@ mod tests {
         StatusCode::SERVICE_UNAVAILABLE
     }
 
+    async fn mock_unindexed_key(
+        State(stored): State<StoredKey>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        if query.get("key") == Some(&key_path(&stored.key_id)) {
+            return Json(json!({
+                "found": true,
+                "entry": {
+                    "value": serde_json::to_string(&stored).unwrap(),
+                    "mod_revision": 1,
+                    "expires_at_ms": null
+                }
+            }));
+        }
+        Json(json!({ "found": false }))
+    }
+
     fn store() -> KeyStore {
         KeyStore::new()
+    }
+
+    #[test]
+    fn credential_derivation_secret_is_strong_and_unambiguous() {
+        assert!(matches!(
+            validated_idempotency_secret(None),
+            Err(StoreError::MissingIdempotencySecret)
+        ));
+        assert!(matches!(
+            validated_idempotency_secret(Some("too-short")),
+            Err(StoreError::WeakIdempotencySecret)
+        ));
+        assert!(matches!(
+            validated_idempotency_secret(Some("0123456789abcdef0123456789abcde ")),
+            Err(StoreError::WeakIdempotencySecret)
+        ));
+        assert_eq!(
+            validated_idempotency_secret(Some("0123456789abcdef0123456789abcdef")).unwrap(),
+            b"0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]
@@ -637,8 +725,7 @@ mod tests {
         let s = store();
         let (raw, meta) = s
             .create(
-                "user_1",
-                "create-1",
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
                 "ci".into(),
                 vec!["kv:read".into()],
@@ -665,8 +752,7 @@ mod tests {
         let s = store();
         let first = s
             .create(
-                "user_1",
-                "create-retry",
+                MutationIdentity::new("user_1", "create-retry"),
                 "org_1".into(),
                 "worker".into(),
                 vec!["kv:read".into()],
@@ -677,8 +763,7 @@ mod tests {
             .unwrap();
         let replay = s
             .create(
-                "user_1",
-                "create-retry",
+                MutationIdentity::new("user_1", "create-retry"),
                 "org_1".into(),
                 "worker".into(),
                 vec!["kv:read".into()],
@@ -694,8 +779,7 @@ mod tests {
 
         let conflict = s
             .create(
-                "user_1",
-                "create-retry",
+                MutationIdentity::new("user_1", "create-retry"),
                 "org_1".into(),
                 "changed".into(),
                 vec!["kv:read".into()],
@@ -711,8 +795,7 @@ mod tests {
         let s = store();
         let (raw, _) = s
             .create(
-                "user_1",
-                "create-1",
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
                 "ci".into(),
                 vec!["kv:read".into()],
@@ -737,8 +820,7 @@ mod tests {
         let s = store();
         let (raw, _) = s
             .create(
-                "user_1",
-                "create-1",
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
                 "legacy".into(),
                 vec!["admin:read".into(), "kv:read".into()],
@@ -758,8 +840,7 @@ mod tests {
         let s = store();
         let (raw, meta) = s
             .create(
-                "user_1",
-                "create-1",
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
                 "ci".into(),
                 vec![],
@@ -831,12 +912,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_introspection_rejects_a_record_missing_from_its_org_index() {
+        let key_id = "0123456789abcdef";
+        let secret = "a".repeat(64);
+        let stored = StoredKey {
+            key_id: key_id.to_string(),
+            org_id: "org_1".to_string(),
+            name: "unindexed".to_string(),
+            secret_hash: hash_secret(&secret),
+            create_idempotency_hash: "create-marker".to_string(),
+            last_rotation_idempotency_hash: None,
+            scopes: vec!["kv:read".to_string()],
+            created_ms: 1,
+            last_used_ms: None,
+            revoked: false,
+            version: 1,
+            env: "live".to_string(),
+            require_idempotency: true,
+        };
+        let app = Router::new()
+            .route("/v1/kv", get(mock_unindexed_key))
+            .with_state(stored);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let store = KeyStore {
+            cache: Mutex::new(HashMap::new()),
+            kv: Some(KvClient::for_test(format!("http://{address}"))),
+            idempotency_secret: b"fiducia-auth-test-idempotency-secret".to_vec(),
+        };
+
+        let intro = store
+            .introspect(&format!("fdc_live_{key_id}.{secret}"))
+            .await
+            .unwrap();
+        assert!(!intro.valid);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn revoke_is_scoped_to_the_owning_org() {
         let s = store();
         let (_raw, meta) = s
             .create(
-                "user_1",
-                "create-1",
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
                 "k".into(),
                 vec![],
@@ -853,8 +976,7 @@ mod tests {
         let s = store();
         let (old_raw, created) = s
             .create(
-                "user_1",
-                "create-1",
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
                 "worker".into(),
                 vec!["requests:write".into()],
@@ -900,8 +1022,7 @@ mod tests {
         let s = store();
         let (_raw, created) = s
             .create(
-                "user_1",
-                "create-1",
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
                 "worker".into(),
                 vec![],
@@ -927,8 +1048,7 @@ mod tests {
         let s = store();
         let (_raw, created) = s
             .create(
-                "user_1",
-                "create-1",
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
                 "worker".into(),
                 vec![],
@@ -952,8 +1072,7 @@ mod tests {
         let s = store();
         let (_raw, created) = s
             .create(
-                "user_1",
-                "create-1",
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
                 "worker".into(),
                 vec![],

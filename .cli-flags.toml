@@ -8,7 +8,7 @@ columns = ["options", "env", "type", "description"]
 allow_unknown = false
 
 [env]
-ignore = ["FIDUCIA_INTROSPECT_SECRET", "FIDUCIA_JWT_SIGNING_KEY", "SUPABASE_SERVICE_ROLE_KEY"]
+ignore = ["FIDUCIA_INTERNAL_SECRET", "FIDUCIA_INTROSPECT_SECRET", "FIDUCIA_JWT_SIGNING_KEY", "FIDUCIA_KEY_IDEMPOTENCY_SECRET", "SUPABASE_SERVICE_ROLE_KEY"]
 
 [flags.port]
 env = "PORT"
@@ -22,6 +22,18 @@ env = "FIDUCIA_KV_URL"
 aliases = ["kv-url"]
 type = "string"
 help = "Durable Fiducia KV endpoint for API keys."
+
+[flags.kv-org-id]
+env = "FIDUCIA_KV_ORG_ID"
+aliases = ["kv-org-id"]
+type = "string"
+help = "Dedicated Fiducia node tenant used for auth-owned KV records."
+
+[flags.customer-origin]
+env = "FIDUCIA_CUSTOMER_ORIGIN"
+aliases = ["customer-origin"]
+type = "string"
+help = "Exact standalone customer-app HTTP(S) origin allowed by CORS."
 
 [flags.rotation-overlap-seconds]
 env = "FIDUCIA_ROTATION_OVERLAP_SECONDS"
