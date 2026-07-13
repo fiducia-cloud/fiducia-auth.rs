@@ -27,6 +27,14 @@ const DEFAULT_PROJECT_REF: &str = "ruxctrzdvugxztbjcpoi";
 const DEFAULT_AUDIENCE: &str = "authenticated";
 const DEFAULT_JWKS_TTL_SECS: u64 = 10 * 60;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 5;
+/// Minimum age of the cached JWKS before an unknown `kid` may force a refetch.
+/// Without this floor, an unauthenticated caller can mint junk JWTs with random
+/// `kid`s and turn every request into an outbound JWKS fetch (amplification and
+/// upstream rate-limit exhaustion, which would also starve legitimate
+/// refreshes). Real signing-key rotations still converge within this window,
+/// and the remote-userinfo fallback (when enabled) keeps freshly rotated
+/// tokens verifiable in the interim.
+const MIN_FORCED_JWKS_REFRESH_SECS: u64 = 30;
 
 static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
 static JWKS_CACHE: OnceCell<RwLock<Option<CachedJwks>>> = OnceCell::const_new();
@@ -75,6 +83,12 @@ async fn verify_with_jwks(
     let jwk = match jwks.find(kid).cloned() {
         Some(jwk) => jwk,
         None => {
+            // An unknown `kid` may force one refetch, but only when the cached
+            // set is old enough — otherwise attacker-minted kids would turn
+            // every request into an outbound JWKS fetch.
+            if !forced_refresh_allowed(config).await {
+                return Err(VerifyError::MissingJwk(kid.to_string()));
+            }
             jwks = refresh_jwks(config).await?;
             jwks.find(kid)
                 .cloned()
@@ -141,6 +155,24 @@ async fn cached_jwks(config: &SupabaseConfig) -> Result<JwkSet, VerifyError> {
     }
 
     refresh_jwks(config).await
+}
+
+/// Whether an unknown-`kid` miss may force a refetch: only when there is no
+/// cached set for this URL yet, or the cached set is older than the
+/// anti-amplification floor ([`MIN_FORCED_JWKS_REFRESH_SECS`]).
+async fn forced_refresh_allowed(config: &SupabaseConfig) -> bool {
+    let cache = JWKS_CACHE.get_or_init(|| async { RwLock::new(None) }).await;
+    let guard = cache.read().await;
+    match guard.as_ref() {
+        Some(cached) if cached.url == config.jwks_url => {
+            forced_refresh_cooldown_elapsed(cached.fetched_at.elapsed())
+        }
+        _ => true,
+    }
+}
+
+fn forced_refresh_cooldown_elapsed(cached_age: Duration) -> bool {
+    cached_age >= Duration::from_secs(MIN_FORCED_JWKS_REFRESH_SECS)
 }
 
 async fn refresh_jwks(config: &SupabaseConfig) -> Result<JwkSet, VerifyError> {
@@ -583,6 +615,81 @@ mod tests {
             user_ctx_from_claims(claims),
             Err(VerifyError::UnexpectedRole(Some(role))) if role == "service_role"
         ));
+    }
+
+    #[test]
+    fn forced_refresh_cooldown_gates_young_caches() {
+        assert!(!forced_refresh_cooldown_elapsed(Duration::from_secs(0)));
+        assert!(!forced_refresh_cooldown_elapsed(Duration::from_secs(
+            MIN_FORCED_JWKS_REFRESH_SECS - 1
+        )));
+        assert!(forced_refresh_cooldown_elapsed(Duration::from_secs(
+            MIN_FORCED_JWKS_REFRESH_SECS
+        )));
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_cannot_force_a_jwks_refetch_within_the_cooldown() {
+        use axum::{extract::State, routing::get, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/jwks.json",
+                get(|State(hits): State<Arc<AtomicUsize>>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(crate::token::jwks())
+                }),
+            )
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = SupabaseConfig::for_project("jwks-cooldown-test");
+        config.jwks_url = format!("http://{address}/jwks.json");
+
+        // Populate the cache once (one upstream fetch).
+        refresh_jwks(&config).await.expect("initial jwks fetch");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // A fresh cache means an attacker-controlled unknown `kid` must NOT
+        // trigger another upstream fetch — it fails fast instead.
+        let result = verify_with_jwks("junk-jwt", &config, Algorithm::ES256, "unknown-kid").await;
+        assert!(matches!(result, Err(VerifyError::MissingJwk(kid)) if kid == "unknown-kid"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "kid-miss within the cooldown must not refetch the JWKS"
+        );
+
+        // Once the cached set is older than the cooldown, a kid-miss may force
+        // exactly one refetch again (how genuine rotations are picked up).
+        {
+            let cache = JWKS_CACHE.get_or_init(|| async { RwLock::new(None) }).await;
+            let mut guard = cache.write().await;
+            let cached = guard.as_mut().expect("cache populated");
+            cached.fetched_at = Instant::now()
+                .checked_sub(Duration::from_secs(MIN_FORCED_JWKS_REFRESH_SECS + 1))
+                .expect("age within Instant range");
+        }
+        let result = verify_with_jwks("junk-jwt", &config, Algorithm::ES256, "unknown-kid").await;
+        assert!(matches!(result, Err(VerifyError::MissingJwk(_))));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a stale cache allows one forced refetch on kid-miss"
+        );
+
+        server.abort();
     }
 
     #[test]
