@@ -1,0 +1,51 @@
+# flags-2-env flag schema for the fiducia-auth server: maps command-line flags to
+# the FIDUCIA_*/SUPABASE_* env vars the binary reads. Consumed by
+# scripts/with-flags2env.sh and audited in CI (cli-flags.yml).
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-auth.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[flags.port]
+env = "PORT"
+aliases = ["port"]
+type = "integer"
+help = "HTTP listen port (defaults to 8097)."
+
+[flags.jwt-signing-key]
+env = "FIDUCIA_JWT_SIGNING_KEY"
+aliases = ["jwt-signing-key"]
+type = "string"
+help = "SECRET: PKCS#8 EC P-256 private-key PEM used to sign fiducia JWTs (shared across replicas)."
+
+[flags.key-cache-ttl-ms]
+env = "FIDUCIA_KEY_CACHE_TTL_MS"
+aliases = ["key-cache-ttl-ms"]
+type = "integer"
+help = "Introspection hot-cache TTL in milliseconds (defaults to 30000)."
+
+[flags.kv-url]
+env = "FIDUCIA_KV_URL"
+aliases = ["kv-url"]
+type = "string"
+help = "Durable fiducia KV endpoint backing the API-key store (required)."
+
+[flags.supabase-url]
+env = "SUPABASE_URL"
+aliases = ["supabase-url"]
+type = "string"
+help = "Supabase project URL — the system of record for org membership (required)."
+
+[flags.supabase-service-role-key]
+env = "SUPABASE_SERVICE_ROLE_KEY"
+aliases = ["supabase-service-role-key"]
+type = "string"
+help = "SECRET: Supabase service-role key used by the required org sync (required)."
+
+[flags.supabase-sync-interval-secs]
+env = "SUPABASE_SYNC_INTERVAL_SECS"
+aliases = ["supabase-sync-interval-secs"]
+type = "integer"
+help = "Interval between Supabase org syncs in seconds (defaults to 60)."
