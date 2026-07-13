@@ -41,9 +41,10 @@ validation/caching and attaches a verified identity inward.
 
 | Route | Caller | Purpose |
 |-------|--------|---------|
-| `GET /v1/me` | dashboard (Supabase JWT) | return the authenticated Supabase user context |
+| `GET /v1/me` | dashboard (Supabase JWT) | return user id, email, orgs, and trusted staff roles |
 | `POST /v1/keys` | dashboard (Supabase JWT) | create a key (raw shown **once**) |
 | `GET /v1/keys` | dashboard | list keys (masked) |
+| `POST /v1/keys/{id}/rotate` | dashboard (Supabase JWT) | replace an owned key secret (raw shown **once**) |
 | `DELETE /v1/keys/{id}` | dashboard | revoke |
 | `POST /v1/introspect` | edge/LB (internal) | validate key → org + scopes (cache this); **requires `x-server-auth`** |
 | `POST /v1/token` | any valid API-key holder (public) | exchange key → short-lived JWT; authenticated by the key itself, **no `x-server-auth`** |
@@ -53,8 +54,10 @@ validation/caching and attaches a verified identity inward.
 ## Storage & secrets
 
 - Only a **hash** of the key secret is stored; the raw key is returned exactly
-  once at creation. Secrets are 256-bit random values, so SHA-256 plus
+  once at creation or rotation. Secrets are 256-bit random values, so SHA-256 plus
   constant-time comparison is sufficient for introspection.
+- New keys require an `Idempotency-Key` on mutating data-plane calls by default;
+  callers may explicitly set `require_idempotency=false` at creation.
 - Keys are scoped to an **org** and may be narrowed to a **project**; dashboard
   ops require a Supabase session whose user has the right org/project role.
 - API keys persist in the Fiducia KV endpoint selected by `FIDUCIA_KV_URL`.
@@ -84,7 +87,10 @@ curl localhost:8097/healthz
 ```
 
 Organization access comes only from Supabase `app_metadata`; user-editable
-metadata and a synthetic default organization are never trusted.
+metadata and a synthetic default organization are never trusted. The same rule
+applies to staff roles: `roles`, `fiducia_roles`, or `role` are read only from
+trusted `app_metadata`. Customer apps require org membership; the admin app
+additionally requires `admin` or `operator` plus its local operator registry.
 
 ## Configuration
 
@@ -139,6 +145,9 @@ There is **no** flag that disables authentication, accepts unsigned tokens, or
 grants a synthetic "all orgs" identity. Org access is derived solely from
 admin-controlled Supabase `app_metadata`; user-writable `user_metadata` is never
 trusted for org membership.
+Trusted staff roles are likewise copied only from `app_metadata`; the
+top-level Supabase JWT `role=authenticated` proves token class but does not grant
+Fiducia operator access.
 
 ## CLI flags → env (flags-2-env)
 

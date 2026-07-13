@@ -12,6 +12,10 @@ pub struct UserCtx {
     pub email: Option<String>,
     /// Orgs this user belongs to (from the org-membership table).
     pub orgs: Vec<OrgId>,
+    /// Staff roles copied only from trusted Supabase `app_metadata`.
+    /// Customer callers normally have no roles; admin apps require one of the
+    /// explicitly recognized operator roles in addition to their local registry.
+    pub roles: Vec<String>,
 }
 
 /// What an API key resolves to (data plane). This is what the edge/LB caches.
@@ -69,6 +73,7 @@ pub struct ApiKeyMeta {
     pub last_used_ms: Option<u64>,
     pub revoked: bool,
     pub env: String,
+    pub require_idempotency: bool,
 }
 
 impl From<&ApiKeyRecord> for ApiKeyMeta {
@@ -82,6 +87,7 @@ impl From<&ApiKeyRecord> for ApiKeyMeta {
             last_used_ms: r.last_used_ms,
             revoked: r.revoked,
             env: r.env.clone(),
+            require_idempotency: r.require_idempotency,
         }
     }
 }
@@ -95,6 +101,8 @@ pub struct CreateKeyBody {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub env: Option<String>, // "live" | "test"
+    #[serde(default)]
+    pub require_idempotency: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

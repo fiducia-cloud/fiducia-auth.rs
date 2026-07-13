@@ -197,6 +197,7 @@ fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> 
         // user via `auth.updateUser({ data })`, so trusting it for org claims
         // would let any user assign themselves into a victim org (tenant takeover).
         orgs: orgs_from_metadata(&[claims.app_metadata.as_ref()]),
+        roles: roles_from_metadata(claims.app_metadata.as_ref()),
     })
 }
 
@@ -228,7 +229,38 @@ fn user_ctx_from_remote_user(
         // Only admin-controlled `app_metadata` — never user-writable
         // `user_metadata` — may grant org membership (see the note above).
         orgs: orgs_from_metadata(&[user.app_metadata.as_ref()]),
+        roles: roles_from_metadata(user.app_metadata.as_ref()),
     })
+}
+
+fn roles_from_metadata(value: Option<&Value>) -> Vec<String> {
+    let mut roles = Vec::new();
+    let Some(value) = value else {
+        return roles;
+    };
+    for key in ["roles", "fiducia_roles", "role"] {
+        if let Some(role_value) = value.get(key) {
+            push_role_value(&mut roles, role_value);
+        }
+    }
+    roles
+}
+
+fn push_role_value(roles: &mut Vec<String>, value: &Value) {
+    match value {
+        Value::String(role) => {
+            let role = role.trim().to_ascii_lowercase();
+            if !role.is_empty() && !roles.iter().any(|existing| existing == &role) {
+                roles.push(role);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                push_role_value(roles, value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn orgs_from_metadata(values: &[Option<&Value>]) -> Vec<String> {
@@ -494,6 +526,23 @@ mod tests {
         assert_eq!(
             orgs_from_metadata(&[Some(&json!({ "name": "alex" }))]),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn trusted_metadata_roles_accept_strings_arrays_and_dedupe() {
+        let app_metadata = json!({
+            "roles": ["Admin", "operator", "admin"],
+            "fiducia_roles": "viewer"
+        });
+
+        assert_eq!(
+            roles_from_metadata(Some(&app_metadata)),
+            vec![
+                "admin".to_string(),
+                "operator".to_string(),
+                "viewer".to_string()
+            ]
         );
     }
 

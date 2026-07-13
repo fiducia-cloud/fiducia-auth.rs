@@ -103,6 +103,7 @@ impl KeyStore {
         name: String,
         scopes: Vec<String>,
         env: String,
+        require_idempotency: bool,
     ) -> Result<(String, ApiKeyMeta), StoreError> {
         let key_id = gen_id();
         let secret = gen_secret();
@@ -117,9 +118,7 @@ impl KeyStore {
             last_used_ms: None,
             revoked: false,
             env,
-            // Opt-in: keys minted directly here default to not requiring a key.
-            // The customer-facing default lives with the backend key config.
-            require_idempotency: false,
+            require_idempotency,
         };
         let meta: ApiKeyMeta = (&rec).into();
         if let Some(kv) = &self.kv {
@@ -136,6 +135,55 @@ impl KeyStore {
             .unwrap()
             .insert(key_id, CacheEntry::now(rec));
         Ok((raw, meta))
+    }
+
+    /// Rotate a key secret without changing its public key id or policy. The
+    /// replacement raw key is returned once; the previous secret stops
+    /// validating as soon as the authoritative KV write commits.
+    pub async fn rotate(
+        &self,
+        org_id: &str,
+        key_id: &str,
+    ) -> Result<Option<(String, ApiKeyMeta)>, StoreError> {
+        if let Some(kv) = &self.kv {
+            let Some(mut rec) = self.load(kv, key_id).await? else {
+                return Ok(None);
+            };
+            if rec.org_id != org_id || rec.revoked {
+                return Ok(None);
+            }
+            let secret = gen_secret();
+            rec.secret_hash = hash_secret(&secret);
+            let raw = format!("fdc_{}_{}.{}", rec.env, rec.key_id, secret);
+            let meta = ApiKeyMeta::from(&rec);
+            let stored = StoredKey::from(&rec);
+            kv.put(
+                &key_path(key_id),
+                &serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?,
+            )
+            .await?;
+            self.cache
+                .lock()
+                .unwrap()
+                .insert(key_id.to_string(), CacheEntry::now(rec));
+            return Ok(Some((raw, meta)));
+        }
+
+        let mut cache = self.cache.lock().unwrap();
+        let Some(entry) = cache.get_mut(key_id) else {
+            return Ok(None);
+        };
+        if entry.record.org_id != org_id || entry.record.revoked {
+            return Ok(None);
+        }
+        let secret = gen_secret();
+        entry.record.secret_hash = hash_secret(&secret);
+        entry.inserted = Instant::now();
+        let raw = format!(
+            "fdc_{}_{}.{}",
+            entry.record.env, entry.record.key_id, secret
+        );
+        Ok(Some((raw, ApiKeyMeta::from(&entry.record))))
     }
 
     /// List an org's keys (masked - never returns secrets).
@@ -387,6 +435,7 @@ mod tests {
                 "ci".into(),
                 vec!["kv:read".into()],
                 "live".into(),
+                true,
             )
             .await
             .unwrap();
@@ -397,6 +446,7 @@ mod tests {
         assert_eq!(intro.org_id.as_deref(), Some("org_1"));
         assert_eq!(intro.key_id.as_deref(), Some(meta.key_id.as_str()));
         assert_eq!(intro.scopes, vec!["kv:read".to_string()]);
+        assert!(intro.require_idempotency);
     }
 
     #[tokio::test]
@@ -408,6 +458,7 @@ mod tests {
                 "ci".into(),
                 vec!["kv:read".into()],
                 "live".into(),
+                true,
             )
             .await
             .unwrap();
@@ -426,7 +477,7 @@ mod tests {
     async fn introspect_rejects_tampered_secret_and_revoked_keys() {
         let s = store();
         let (raw, meta) = s
-            .create("org_1".into(), "ci".into(), vec![], "live".into())
+            .create("org_1".into(), "ci".into(), vec![], "live".into(), true)
             .await
             .unwrap();
 
@@ -462,7 +513,7 @@ mod tests {
         // Tiny TTL so an aged entry is unambiguously stale.
         let s = KeyStore::with_ttl(Duration::from_millis(50));
         let (raw, meta) = s
-            .create("org_1".into(), "ci".into(), vec![], "live".into())
+            .create("org_1".into(), "ci".into(), vec![], "live".into(), true)
             .await
             .unwrap();
         let key_id = meta.key_id.as_str();
@@ -497,9 +548,35 @@ mod tests {
     async fn revoke_is_scoped_to_the_owning_org() {
         let s = store();
         let (_raw, meta) = s
-            .create("org_1".into(), "k".into(), vec![], "live".into())
+            .create("org_1".into(), "k".into(), vec![], "live".into(), true)
             .await
             .unwrap();
         assert!(!s.revoke("org_2", &meta.key_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rotation_invalidates_the_previous_secret_and_preserves_policy() {
+        let s = store();
+        let (original, meta) = s
+            .create(
+                "org_1".into(),
+                "rotating".into(),
+                vec!["kv:write".into()],
+                "live".into(),
+                true,
+            )
+            .await
+            .unwrap();
+        let (replacement, rotated) = s
+            .rotate("org_1", &meta.key_id)
+            .await
+            .unwrap()
+            .expect("owned key rotates");
+
+        assert_ne!(replacement, original);
+        assert_eq!(rotated.key_id, meta.key_id);
+        assert!(rotated.require_idempotency);
+        assert!(!s.introspect(&original).await.unwrap().valid);
+        assert!(s.introspect(&replacement).await.unwrap().valid);
     }
 }
