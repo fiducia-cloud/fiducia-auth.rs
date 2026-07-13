@@ -101,7 +101,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/keys", post(create_key).get(list_keys))
         .route("/v1/keys/:key_id", axum::routing::delete(revoke_key))
         .route("/v1/orgs/:org_id", get(get_org))
-        // Data plane (called by the edge/LB; should be internal-only / mTLS).
+        // Data plane. `introspect` is a server-to-server oracle (answers "is this
+        // arbitrary key valid?" for keys the caller does not hold), so it is
+        // internal-only and gated by the `x-server-auth` shared secret. `token`
+        // is a customer-facing exchange: the caller proves possession of a valid
+        // API key and receives a JWT scoped to that key's own org — it is
+        // self-authenticated by the key and intentionally NOT secret-gated.
         .route("/v1/introspect", post(introspect))
         .route("/v1/token", post(exchange_token))
         .with_state(state)
@@ -345,6 +350,17 @@ async fn introspect(
 }
 
 /// `POST /v1/token` — exchange an API key for a short-lived JWT (offline-verifiable).
+///
+/// Public / customer-facing: unlike `introspect`, this endpoint is deliberately
+/// NOT gated by the `x-server-auth` internal secret. It is self-authenticated by
+/// the API key itself — the caller must present a valid `fdc_…` key (verified by
+/// the constant-time secret-hash check in `keys.rs`), an invalid key yields 401,
+/// and a valid one only ever mints a JWT scoped to *that key's own* org/scopes.
+/// A caller without a valid key learns nothing, so there is no introspection
+/// oracle to protect here. The customers who exchange keys for JWTs do not (and
+/// must not) hold the internal server secret, so gating this would break the
+/// exchange while adding no security. Do not add an `internal_secret_authorized`
+/// check here — see `introspect` for the endpoint that genuinely needs it.
 async fn exchange_token(State(s): State<Arc<AppState>>, Json(body): Json<TokenBody>) -> Response {
     let intro = match s.keys.introspect(&body.api_key).await {
         Ok(result) => result,
