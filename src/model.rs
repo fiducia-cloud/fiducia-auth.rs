@@ -14,7 +14,8 @@ pub struct UserCtx {
     pub orgs: Vec<OrgId>,
     /// Application roles copied only from Supabase `app_metadata`, which is
     /// controlled by trusted server-side administration. Browser-writable user
-    /// metadata is never an authorization source.
+    /// metadata is never an authorization source. Customer callers normally
+    /// have no roles; admin apps additionally require a recognized operator role.
     pub roles: Vec<String>,
 }
 

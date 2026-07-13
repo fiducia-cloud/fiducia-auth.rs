@@ -43,7 +43,7 @@ validation/caching and attaches a verified identity inward.
 
 | Route | Caller | Purpose |
 |-------|--------|---------|
-| `GET /v1/me` | customer/admin app (Supabase JWT) | return the authenticated Supabase user context; each app enforces its own surface authorization |
+| `GET /v1/me` | customer/admin app (Supabase JWT) | return user id, email, orgs, and trusted roles; each app enforces its own surface authorization |
 | `POST /v1/keys` | customer app/BFF (Supabase JWT) | create a key; requires `Idempotency-Key` (raw returned to the original request and exact retries) |
 | `GET /v1/keys?org_id={org}` | customer app/BFF | list one authorized org's keys (masked) |
 | `POST /v1/keys/{id}/rotate?org_id={org}` | customer app/BFF | replace the authoritative secret; requires `Idempotency-Key` and reports bounded consumer-cache overlap (raw returned to the original request and exact retries) |
@@ -108,9 +108,10 @@ curl localhost:8097/healthz
 Organization access and application roles come only from Supabase
 `app_metadata`; user-editable metadata and a synthetic default organization are
 never trusted. Operator accounts carry `admin` or `operator` in
-`app_metadata.fiducia_roles` (or `app_metadata.roles`). `GET /v1/me` returns
-those trusted roles so separately deployed applications can authorize their own
-surface without maintaining email-based role lists.
+`app_metadata.fiducia_roles`, `app_metadata.roles`, or `app_metadata.role`.
+`GET /v1/me` returns those trusted roles so separately deployed applications can
+authorize their own surface without maintaining email-based role lists. The
+admin app additionally requires its own local operator-registry entry.
 
 ## Configuration
 
@@ -174,7 +175,9 @@ admin-controlled Supabase `app_metadata`; user-writable `user_metadata` is never
 trusted for org membership or operator roles. API-key scopes intentionally do
 not include admin-dashboard permissions, and introspection strips any such scope
 from legacy durable records. Human operator access is a verified Supabase role,
-never a customer-minted key scope.
+never a customer-minted key scope. The top-level Supabase JWT
+`role=authenticated` proves token class but does not grant Fiducia operator
+access.
 
 ## CLI flags → env (flags-2-env)
 

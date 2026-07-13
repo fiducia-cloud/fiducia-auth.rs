@@ -852,6 +852,7 @@ mod tests {
         assert_eq!(intro.org_id.as_deref(), Some("org_1"));
         assert_eq!(intro.key_id.as_deref(), Some(meta.key_id.as_str()));
         assert_eq!(intro.scopes, vec!["kv:read".to_string()]);
+        assert!(intro.require_idempotency);
         assert_eq!(meta.version, 1);
         assert!(meta.require_idempotency);
         let wrong_env = raw.replacen("fdc_live_", "fdc_test_", 1);
@@ -1172,7 +1173,6 @@ mod tests {
             )
             .await
             .unwrap();
-
         assert!(s
             .rotate("user_1", "rotate-1", "org_2", &created.key_id)
             .await

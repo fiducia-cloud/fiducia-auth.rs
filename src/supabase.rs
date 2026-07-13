@@ -319,7 +319,7 @@ fn push_org(orgs: &mut Vec<String>, org: &str) {
 fn roles_from_metadata(values: &[Option<&Value>]) -> Vec<String> {
     let mut roles = Vec::new();
     for value in values.iter().flatten() {
-        for key in ["fiducia_roles", "roles"] {
+        for key in ["fiducia_roles", "roles", "role"] {
             if let Some(role_value) = value.get(key) {
                 push_role_value(&mut roles, role_value);
             }
@@ -583,14 +583,16 @@ mod tests {
     fn roles_come_only_from_trusted_app_metadata_shape() {
         let metadata = json!({
             "fiducia_roles": ["Admin", "operator", "admin"],
-            "roles": "auditor"
+            "roles": "auditor",
+            "role": "viewer"
         });
         assert_eq!(
             roles_from_metadata(&[Some(&metadata)]),
             vec![
                 "admin".to_string(),
                 "operator".to_string(),
-                "auditor".to_string()
+                "auditor".to_string(),
+                "viewer".to_string()
             ]
         );
     }
