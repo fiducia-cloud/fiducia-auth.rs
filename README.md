@@ -45,8 +45,8 @@ validation/caching and attaches a verified identity inward.
 | `POST /v1/keys` | dashboard (Supabase JWT) | create a key (raw shown **once**) |
 | `GET /v1/keys` | dashboard | list keys (masked) |
 | `DELETE /v1/keys/{id}` | dashboard | revoke |
-| `POST /v1/introspect` | edge/LB (internal) | validate key → org + scopes (cache this) |
-| `POST /v1/token` | edge/LB (internal) | exchange key → short-lived JWT |
+| `POST /v1/introspect` | edge/LB (internal) | validate key → org + scopes (cache this); **requires `x-server-auth`** |
+| `POST /v1/token` | any valid API-key holder (public) | exchange key → short-lived JWT; authenticated by the key itself, **no `x-server-auth`** |
 | `GET /.well-known/jwks.json` | anyone | public keys for offline JWT verify |
 | `GET /healthz` | — | liveness |
 
@@ -167,6 +167,18 @@ Hardening in place:
 - **Constant-time** comparison of both the API-key secret hash (`keys.rs`) and the
   internal `x-server-auth` secret (`main.rs`), so neither leaks byte-by-byte under
   timing probes.
+- **Two data-plane endpoints, two threat models.** `POST /v1/introspect` is a
+  server-to-server oracle — it reports validity/scopes for *any* key the caller
+  submits, including keys the caller does not hold — so it is internal-only and
+  gated by the `x-server-auth` shared secret (`FIDUCIA_INTROSPECT_SECRET`);
+  requests without it get 401. `POST /v1/token` is **intentionally public and is
+  not `x-server-auth`-gated**: it is self-authenticated by the API key itself. The
+  caller must present a valid `fdc_…` key (verified by the same constant-time
+  secret-hash check), an invalid key yields 401, and a valid key only mints a JWT
+  scoped to *that key's own* org/scopes. Customers exchanging a key for an
+  offline-verifiable JWT never hold the internal secret, so gating `/v1/token`
+  would break the exchange without adding protection — a caller lacking a valid
+  key already learns nothing from it.
 - Only a **SHA-256 hash** of a 256-bit API-key secret is ever stored; the raw key
   is returned exactly once.
 - **Fail-fast startup**: missing `FIDUCIA_JWT_SIGNING_KEY`,
