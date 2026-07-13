@@ -2,56 +2,64 @@
 //!
 //! B2B *machines* authenticate to the coordination API with a static API key
 //! (`Authorization: Bearer fdc_live_<id>.<secret>`). We store only a **hash** of
-//! the secret; the raw key is shown to the user exactly once, at creation.
+//! the secret; a raw key is shown to the user only in the creation or rotation
+//! response that minted it.
 //!
-//! Storage is **cache-aside**: durable records live in fiducia's own KV (see
-//! `store.rs`) and an in-memory hot cache fronts it, so the steady-state
-//! [`introspect`](KeyStore::introspect) - the call the edge/LB make (and cache
-//! again, with a short TTL) - is a local map lookup, never a round trip, and
-//! never Supabase.
+//! Durable records live in fiducia's own KV (see `store.rs`). Production
+//! introspection reads that authority on every request so rotation/revocation is
+//! immediately visible across auth replicas; test-only in-memory stores use the
+//! local map.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::model::{ApiKeyMeta, ApiKeyRecord, Introspection, OrgId};
-use crate::store::{key_path, org_index_path, KvClient, StoreError, StoredKey};
+use crate::store::{
+    key_path, org_index_path, CasOutcome, KvClient, StoreError, StoredKey, VersionedValue,
+};
 
-/// Default hot-cache TTL: how long a cached introspection result may be served
-/// before it must be re-read from the authoritative KV. Bounds how long a
-/// *revocation issued on another replica* can go unseen here (see [`KeyStore`]).
-const DEFAULT_KEY_CACHE_TTL_MS: u64 = 30_000;
+/// Retrying a CAS is safe because every attempt re-reads and merges the latest
+/// authoritative value. Bound it so sustained contention fails closed instead
+/// of hanging a request indefinitely.
+const MAX_CAS_RETRIES: usize = 8;
 
-/// A cached key record plus when it was cached, so entries can expire (TTL).
 struct CacheEntry {
     record: ApiKeyRecord,
-    inserted: Instant,
 }
 
 impl CacheEntry {
     fn now(record: ApiKeyRecord) -> Self {
-        CacheEntry {
-            record,
-            inserted: Instant::now(),
-        }
+        CacheEntry { record }
     }
 }
 
-/// Cache-aside key store: an in-memory hot cache fronts durable fiducia KV.
-///
-/// Cache entries carry a **TTL** (`FIDUCIA_KEY_CACHE_TTL_MS`, default
-/// [`DEFAULT_KEY_CACHE_TTL_MS`]). A hit within the TTL short-circuits (the hot
-/// path, no round trip); an entry older than the TTL is a MISS, so `introspect`
-/// re-reads the authoritative KV and picks up revocations propagated from other
-/// replicas — without this, replica B would serve `valid:true` for a key revoked
-/// via replica A until it restarted.
+/// Durable KV is the production introspection authority. The local map supports
+/// lifecycle response caching and the in-memory test store, but never bypasses
+/// a production KV read during credential verification.
 pub struct KeyStore {
-    cache: Mutex<HashMap<String, CacheEntry>>, // key_id -> (record, inserted)
+    cache: Mutex<HashMap<String, CacheEntry>>,
     kv: Option<KvClient>,
-    ttl: Duration,
+    idempotency_secret: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub struct MutationIdentity<'a> {
+    pub actor_id: &'a str,
+    pub idempotency_key: &'a str,
+}
+
+impl<'a> MutationIdentity<'a> {
+    pub fn new(actor_id: &'a str, idempotency_key: &'a str) -> Self {
+        Self {
+            actor_id,
+            idempotency_key,
+        }
+    }
 }
 
 impl KeyStore {
@@ -61,129 +69,100 @@ impl KeyStore {
         KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: None,
-            ttl: Duration::from_millis(DEFAULT_KEY_CACHE_TTL_MS),
-        }
-    }
-
-    /// In-memory only with an explicit cache TTL - tests.
-    #[cfg(test)]
-    pub fn with_ttl(ttl: Duration) -> Self {
-        KeyStore {
-            cache: Mutex::new(HashMap::new()),
-            kv: None,
-            ttl,
+            idempotency_secret: b"fiducia-auth-test-idempotency-secret".to_vec(),
         }
     }
 
     /// Construct the production store. Durable KV is mandatory.
     pub fn from_env() -> Result<Self, StoreError> {
+        let idempotency_secret = validated_idempotency_secret(
+            std::env::var("FIDUCIA_KEY_IDEMPOTENCY_SECRET")
+                .ok()
+                .as_deref(),
+        )?;
         Ok(KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: Some(KvClient::from_env()?),
-            ttl: key_cache_ttl_from_env(),
+            idempotency_secret,
         })
     }
 
-    /// Backdate a cached entry's insertion time so it reads as `age` old, to
-    /// exercise TTL expiry deterministically without sleeping.
-    #[cfg(test)]
-    fn test_age_entry(&self, key_id: &str, age: Duration) {
-        let mut cache = self.cache.lock().unwrap();
-        if let Some(e) = cache.get_mut(key_id) {
-            e.inserted = Instant::now()
-                .checked_sub(age)
-                .expect("age within Instant range");
-        }
-    }
-
-    /// Create a key for an org. Returns the **raw key (shown once)** + its meta.
+    /// Create a key for an org. Returns the raw key to the original request and
+    /// exact idempotent retries, without persisting the raw value.
     pub async fn create(
         &self,
+        mutation: MutationIdentity<'_>,
         org_id: OrgId,
         name: String,
         scopes: Vec<String>,
         env: String,
         require_idempotency: bool,
     ) -> Result<(String, ApiKeyMeta), StoreError> {
-        let key_id = gen_id();
-        let secret = gen_secret();
+        let MutationIdentity {
+            actor_id,
+            idempotency_key,
+        } = mutation;
+        let create_idempotency_hash =
+            self.derive_idempotency("create-marker", &[actor_id, &org_id, idempotency_key]);
+        let key_id = self
+            .derive_idempotency("create-key-id", &[actor_id, &org_id, idempotency_key])[..16]
+            .to_string();
+        let secret =
+            self.derive_idempotency("create-secret", &[actor_id, &org_id, idempotency_key]);
         let raw = format!("fdc_{env}_{key_id}.{secret}");
         let rec = ApiKeyRecord {
             key_id: key_id.clone(),
             org_id: org_id.clone(),
             name,
             secret_hash: hash_secret(&secret),
+            create_idempotency_hash,
+            last_rotation_idempotency_hash: None,
             scopes,
             created_ms: now_ms(),
             last_used_ms: None,
             revoked: false,
+            version: 1,
             env,
             require_idempotency,
         };
-        let meta: ApiKeyMeta = (&rec).into();
         if let Some(kv) = &self.kv {
             let stored: StoredKey = (&rec).into();
-            kv.put(
-                &key_path(&key_id),
-                &serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?,
-            )
-            .await?;
+            let value = serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?;
+            if kv.put_if_revision(&key_path(&key_id), &value, 0).await? == CasOutcome::Mismatch {
+                let Some(existing) = self.load(kv, &key_id).await? else {
+                    return Err(StoreError::KeyIdCollision);
+                };
+                if !same_create_request(&existing, &rec) {
+                    return Err(StoreError::IdempotencyConflict);
+                }
+                self.index_add(kv, &org_id, &key_id).await?;
+                let meta: ApiKeyMeta = (&existing).into();
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .insert(key_id, CacheEntry::now(existing));
+                return Ok((raw, meta));
+            }
+            // The org index is part of the credential's committed identity.
+            // Introspection requires this membership, so a failure here leaves
+            // the just-written record unusable. Retrying the same idempotency
+            // key repairs the index and replays the same one-time secret.
             self.index_add(kv, &org_id, &key_id).await?;
+        } else {
+            let cache = self.cache.lock().unwrap();
+            if let Some(existing) = cache.get(&key_id).map(|entry| &entry.record) {
+                if !same_create_request(existing, &rec) {
+                    return Err(StoreError::IdempotencyConflict);
+                }
+                return Ok((raw, existing.into()));
+            }
         }
+        let meta: ApiKeyMeta = (&rec).into();
         self.cache
             .lock()
             .unwrap()
             .insert(key_id, CacheEntry::now(rec));
         Ok((raw, meta))
-    }
-
-    /// Rotate a key secret without changing its public key id or policy. The
-    /// replacement raw key is returned once; the previous secret stops
-    /// validating as soon as the authoritative KV write commits.
-    pub async fn rotate(
-        &self,
-        org_id: &str,
-        key_id: &str,
-    ) -> Result<Option<(String, ApiKeyMeta)>, StoreError> {
-        if let Some(kv) = &self.kv {
-            let Some(mut rec) = self.load(kv, key_id).await? else {
-                return Ok(None);
-            };
-            if rec.org_id != org_id || rec.revoked {
-                return Ok(None);
-            }
-            let secret = gen_secret();
-            rec.secret_hash = hash_secret(&secret);
-            let raw = format!("fdc_{}_{}.{}", rec.env, rec.key_id, secret);
-            let meta = ApiKeyMeta::from(&rec);
-            let stored = StoredKey::from(&rec);
-            kv.put(
-                &key_path(key_id),
-                &serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?,
-            )
-            .await?;
-            self.cache
-                .lock()
-                .unwrap()
-                .insert(key_id.to_string(), CacheEntry::now(rec));
-            return Ok(Some((raw, meta)));
-        }
-
-        let mut cache = self.cache.lock().unwrap();
-        let Some(entry) = cache.get_mut(key_id) else {
-            return Ok(None);
-        };
-        if entry.record.org_id != org_id || entry.record.revoked {
-            return Ok(None);
-        }
-        let secret = gen_secret();
-        entry.record.secret_hash = hash_secret(&secret);
-        entry.inserted = Instant::now();
-        let raw = format!(
-            "fdc_{}_{}.{}",
-            entry.record.env, entry.record.key_id, secret
-        );
-        Ok(Some((raw, ApiKeyMeta::from(&entry.record))))
     }
 
     /// List an org's keys (masked - never returns secrets).
@@ -213,57 +192,165 @@ impl KeyStore {
     /// Revoke a key (must belong to the caller's org). Returns whether it matched.
     pub async fn revoke(&self, org_id: &str, key_id: &str) -> Result<bool, StoreError> {
         if let Some(kv) = &self.kv {
-            if let Some(mut rec) = self.load(kv, key_id).await? {
-                if rec.org_id == org_id {
-                    rec.revoked = true;
-                    let stored: StoredKey = (&rec).into();
-                    kv.put(
-                        &key_path(key_id),
-                        &serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?,
-                    )
-                    .await?;
+            for _ in 0..MAX_CAS_RETRIES {
+                let Some((mut rec, mod_revision)) = self.load_versioned(kv, key_id).await? else {
+                    return Ok(false);
+                };
+                if rec.org_id != org_id {
+                    return Ok(false);
+                }
+                if rec.revoked {
                     self.cache
                         .lock()
                         .unwrap()
                         .insert(key_id.to_string(), CacheEntry::now(rec));
                     return Ok(true);
                 }
+                rec.revoked = true;
+                rec.version = next_version(rec.version)?;
+                let stored: StoredKey = (&rec).into();
+                let value = serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?;
+                match kv
+                    .put_if_revision(&key_path(key_id), &value, mod_revision)
+                    .await?
+                {
+                    CasOutcome::Applied => {
+                        self.cache
+                            .lock()
+                            .unwrap()
+                            .insert(key_id.to_string(), CacheEntry::now(rec));
+                        return Ok(true);
+                    }
+                    CasOutcome::Mismatch => continue,
+                }
             }
-            return Ok(false);
+            return Err(StoreError::CasRetriesExhausted);
         }
         let mut cache = self.cache.lock().unwrap();
         match cache.get_mut(key_id) {
             Some(e) if e.record.org_id == org_id => {
-                e.record.revoked = true;
-                e.inserted = Instant::now();
+                if !e.record.revoked {
+                    e.record.revoked = true;
+                    e.record.version = next_version(e.record.version)?;
+                }
                 Ok(true)
             }
             _ => Ok(false),
         }
     }
 
-    /// Validate a raw API key -> org + scopes. Called by the edge/LB (and cached).
-    /// Hot path: an in-memory cache hit avoids any KV round trip.
-    pub async fn introspect(&self, raw: &str) -> Result<Introspection, StoreError> {
-        // Parse `fdc_<env>_<key_id>.<secret>`.
-        let Some((left, secret)) = raw.split_once('.') else {
-            return Ok(Introspection::invalid());
+    /// Replace a key's secret without any overlap. Returns the raw replacement
+    /// exactly once plus the updated public metadata.
+    pub async fn rotate(
+        &self,
+        actor_id: &str,
+        idempotency_key: &str,
+        org_id: &str,
+        key_id: &str,
+    ) -> Result<Option<(String, ApiKeyMeta)>, StoreError> {
+        let rotation_idempotency_hash = self.derive_idempotency(
+            "rotate-marker",
+            &[actor_id, org_id, key_id, idempotency_key],
+        );
+        let secret = self.derive_idempotency(
+            "rotate-secret",
+            &[actor_id, org_id, key_id, idempotency_key],
+        );
+        let secret_hash = hash_secret(&secret);
+        if let Some(kv) = &self.kv {
+            for _ in 0..MAX_CAS_RETRIES {
+                let Some((mut rec, mod_revision)) = self.load_versioned(kv, key_id).await? else {
+                    return Ok(None);
+                };
+                if rec.org_id != org_id {
+                    return Ok(None);
+                }
+                if rec.last_rotation_idempotency_hash.as_deref()
+                    == Some(rotation_idempotency_hash.as_str())
+                {
+                    if rec.secret_hash != secret_hash {
+                        return Err(StoreError::InvalidValue);
+                    }
+                    let raw = format!("fdc_{}_{}.{secret}", rec.env, rec.key_id);
+                    return Ok(Some((raw, (&rec).into())));
+                }
+                if rec.revoked {
+                    return Ok(None);
+                }
+                rec.secret_hash = secret_hash.clone();
+                rec.last_rotation_idempotency_hash = Some(rotation_idempotency_hash.clone());
+                rec.version = next_version(rec.version)?;
+                let raw = format!("fdc_{}_{}.{secret}", rec.env, rec.key_id);
+                let meta: ApiKeyMeta = (&rec).into();
+                let stored: StoredKey = (&rec).into();
+                let value = serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?;
+                match kv
+                    .put_if_revision(&key_path(key_id), &value, mod_revision)
+                    .await?
+                {
+                    CasOutcome::Applied => {
+                        self.cache
+                            .lock()
+                            .unwrap()
+                            .insert(key_id.to_string(), CacheEntry::now(rec));
+                        return Ok(Some((raw, meta)));
+                    }
+                    CasOutcome::Mismatch => continue,
+                }
+            }
+            return Err(StoreError::CasRetriesExhausted);
+        }
+
+        let mut cache = self.cache.lock().unwrap();
+        let Some(entry) = cache
+            .get_mut(key_id)
+            .filter(|entry| entry.record.org_id == org_id)
+        else {
+            return Ok(None);
         };
-        let Some(key_id) = left.rsplit('_').next() else {
+        if entry.record.last_rotation_idempotency_hash.as_deref()
+            == Some(rotation_idempotency_hash.as_str())
+        {
+            if entry.record.secret_hash != secret_hash {
+                return Err(StoreError::InvalidValue);
+            }
+            let raw = format!("fdc_{}_{}.{secret}", entry.record.env, entry.record.key_id);
+            return Ok(Some((raw, (&entry.record).into())));
+        }
+        if entry.record.revoked {
+            return Ok(None);
+        }
+        entry.record.secret_hash = secret_hash;
+        entry.record.last_rotation_idempotency_hash = Some(rotation_idempotency_hash);
+        entry.record.version = next_version(entry.record.version)?;
+        let raw = format!("fdc_{}_{}.{secret}", entry.record.env, entry.record.key_id);
+        Ok(Some((raw, (&entry.record).into())))
+    }
+
+    /// Validate a raw API key -> org + scopes. Production reads authoritative KV
+    /// on every call so another auth replica's rotation/revocation is visible.
+    pub async fn introspect(&self, raw: &str) -> Result<Introspection, StoreError> {
+        let Some((env, key_id, secret)) = parse_raw_key(raw) else {
             return Ok(Introspection::invalid());
         };
 
-        // Hot path: a *fresh* cache hit (within the TTL) short-circuits with no
-        // round trip.
-        if let Some(intro) = self.introspect_cached(key_id, secret) {
-            return Ok(intro);
-        }
-        // Miss, or an entry past its TTL: re-read the authoritative KV so a
-        // revocation issued on another replica is seen within the TTL, then
-        // refresh the entry.
+        // Production never accepts a local cache hit without checking durable
+        // state. This prevents per-replica stale acceptance after rotation.
         if let Some(kv) = &self.kv {
             if let Some(rec) = self.load(kv, key_id).await? {
-                let intro = verify(&rec, secret);
+                // Fail closed if create persisted the record but could not
+                // commit its org index. This prevents a valid-but-unlisted
+                // credential after a partial multi-key KV write.
+                let indexed = self
+                    .index_get(kv, &rec.org_id)
+                    .await?
+                    .iter()
+                    .any(|indexed_id| indexed_id == key_id);
+                let intro = if indexed {
+                    verify(&rec, env, secret)
+                } else {
+                    Introspection::invalid()
+                };
                 self.cache
                     .lock()
                     .unwrap()
@@ -278,20 +365,8 @@ impl KeyStore {
             .lock()
             .unwrap()
             .get(key_id)
-            .map(|e| verify(&e.record, secret))
+            .map(|e| verify(&e.record, env, secret))
             .unwrap_or_else(Introspection::invalid))
-    }
-
-    /// Fresh cache hit only. An entry older than `ttl` is treated as a MISS
-    /// (returns `None`) so the caller re-reads the authoritative KV — this is how
-    /// a revocation from another replica propagates here within the TTL.
-    fn introspect_cached(&self, key_id: &str, secret: &str) -> Option<Introspection> {
-        let cache = self.cache.lock().unwrap();
-        let entry = cache.get(key_id)?;
-        if entry.inserted.elapsed() >= self.ttl {
-            return None;
-        }
-        Some(verify(&entry.record, secret))
     }
 
     async fn load(&self, kv: &KvClient, key_id: &str) -> Result<Option<ApiKeyRecord>, StoreError> {
@@ -300,7 +375,30 @@ impl KeyStore {
         };
         let stored: StoredKey =
             serde_json::from_value(value).map_err(|_| StoreError::InvalidValue)?;
+        if stored.key_id != key_id {
+            return Err(StoreError::InvalidValue);
+        }
         Ok(Some((&stored).into()))
+    }
+
+    async fn load_versioned(
+        &self,
+        kv: &KvClient,
+        key_id: &str,
+    ) -> Result<Option<(ApiKeyRecord, u64)>, StoreError> {
+        let Some(VersionedValue {
+            value,
+            mod_revision,
+        }) = kv.get_versioned(&key_path(key_id)).await?
+        else {
+            return Ok(None);
+        };
+        let stored: StoredKey =
+            serde_json::from_value(value).map_err(|_| StoreError::InvalidValue)?;
+        if stored.key_id != key_id {
+            return Err(StoreError::InvalidValue);
+        }
+        Ok(Some(((&stored).into(), mod_revision)))
     }
 
     async fn index_get(&self, kv: &KvClient, org_id: &str) -> Result<Vec<String>, StoreError> {
@@ -311,23 +409,99 @@ impl KeyStore {
     }
 
     async fn index_add(&self, kv: &KvClient, org_id: &str, key_id: &str) -> Result<(), StoreError> {
-        let mut ids = self.index_get(kv, org_id).await?;
-        if !ids.iter().any(|id| id == key_id) {
+        let path = org_index_path(org_id);
+        for _ in 0..MAX_CAS_RETRIES {
+            let (mut ids, mod_revision) = match kv.get_versioned(&path).await? {
+                Some(entry) => (
+                    serde_json::from_value(entry.value).map_err(|_| StoreError::InvalidValue)?,
+                    entry.mod_revision,
+                ),
+                None => (Vec::<String>::new(), 0),
+            };
+            if ids.iter().any(|id| id == key_id) {
+                return Ok(());
+            }
             ids.push(key_id.to_string());
-            kv.put(&org_index_path(org_id), &json!(ids)).await?;
+            match kv.put_if_revision(&path, &json!(ids), mod_revision).await? {
+                CasOutcome::Applied => return Ok(()),
+                CasOutcome::Mismatch => continue,
+            }
         }
-        Ok(())
+        Err(StoreError::CasRetriesExhausted)
+    }
+
+    fn derive_idempotency(&self, purpose: &str, parts: &[&str]) -> String {
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&self.idempotency_secret)
+            .expect("HMAC accepts keys of any length");
+        mac.update(purpose.as_bytes());
+        for part in parts {
+            mac.update(&[0]);
+            mac.update(part.as_bytes());
+        }
+        to_hex(&mac.finalize().into_bytes())
     }
 }
 
+fn validated_idempotency_secret(value: Option<&str>) -> Result<Vec<u8>, StoreError> {
+    let value = value
+        .filter(|candidate| !candidate.is_empty())
+        .ok_or(StoreError::MissingIdempotencySecret)?;
+    if value.len() < 32 || value.chars().any(char::is_whitespace) {
+        return Err(StoreError::WeakIdempotencySecret);
+    }
+    Ok(value.as_bytes().to_vec())
+}
+
+fn same_create_request(existing: &ApiKeyRecord, requested: &ApiKeyRecord) -> bool {
+    existing.create_idempotency_hash == requested.create_idempotency_hash
+        && existing.key_id == requested.key_id
+        && existing.org_id == requested.org_id
+        && existing.name == requested.name
+        && existing.scopes == requested.scopes
+        && existing.env == requested.env
+        && existing.require_idempotency == requested.require_idempotency
+        && existing.secret_hash == requested.secret_hash
+}
+
+fn next_version(version: u64) -> Result<u64, StoreError> {
+    version.checked_add(1).ok_or(StoreError::VersionOverflow)
+}
+
+/// Parse the only accepted API-key wire shape without touching durable storage
+/// for malformed attacker input.
+fn parse_raw_key(raw: &str) -> Option<(&str, &str, &str)> {
+    let (left, secret) = raw.split_once('.')?;
+    if secret.len() != 64 || !secret.bytes().all(is_lower_hex) {
+        return None;
+    }
+    let rest = left.strip_prefix("fdc_")?;
+    let (env, key_id) = rest.split_once('_')?;
+    if !matches!(env, "live" | "test") || key_id.len() != 16 || !key_id.bytes().all(is_lower_hex) {
+        return None;
+    }
+    Some((env, key_id, secret))
+}
+
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
 /// Read-only check of a record against a presented secret (constant-time).
-fn verify(rec: &ApiKeyRecord, secret: &str) -> Introspection {
-    if !rec.revoked && constant_time_eq(&rec.secret_hash, &hash_secret(secret)) {
+fn verify(rec: &ApiKeyRecord, env: &str, secret: &str) -> Introspection {
+    if !rec.revoked && rec.env == env && constant_time_eq(&rec.secret_hash, &hash_secret(secret)) {
         Introspection {
             valid: true,
             org_id: Some(rec.org_id.clone()),
             key_id: Some(rec.key_id.clone()),
-            scopes: rec.scopes.clone(),
+            // Defense in depth for durable records minted before customer/admin
+            // separation: an API key must never surface operator authority.
+            scopes: rec
+                .scopes
+                .iter()
+                .filter(|scope| !is_admin_scope(scope))
+                .cloned()
+                .collect(),
             require_idempotency: rec.require_idempotency,
         }
     } else {
@@ -335,14 +509,8 @@ fn verify(rec: &ApiKeyRecord, secret: &str) -> Introspection {
     }
 }
 
-/// Hot-cache TTL from `FIDUCIA_KEY_CACHE_TTL_MS` (milliseconds), defaulting to
-/// [`DEFAULT_KEY_CACHE_TTL_MS`] when unset or unparseable.
-fn key_cache_ttl_from_env() -> Duration {
-    let ms = std::env::var("FIDUCIA_KEY_CACHE_TTL_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_KEY_CACHE_TTL_MS);
-    Duration::from_millis(ms)
+fn is_admin_scope(scope: &str) -> bool {
+    scope == "admin" || scope.starts_with("admin:")
 }
 
 fn now_ms() -> u64 {
@@ -353,6 +521,7 @@ fn now_ms() -> u64 {
 }
 
 /// `n` cryptographically-random bytes from the OS CSPRNG, lower-hex encoded.
+#[cfg(test)]
 fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
     getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
@@ -369,11 +538,13 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// Public, non-secret key identifier (64 random bits -> 16 hex chars).
+#[cfg(test)]
 fn gen_id() -> String {
     random_hex(8)
 }
 
 /// The secret half of an API key: 256 bits of CSPRNG entropy.
+#[cfg(test)]
 fn gen_secret() -> String {
     random_hex(32)
 }
@@ -399,9 +570,111 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::{Query, State},
+        http::StatusCode,
+        routing::get,
+        Json, Router,
+    };
+    use serde_json::Value;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[derive(Clone, Default)]
+    struct IndexCasState {
+        reads: Arc<AtomicUsize>,
+        writes: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn mock_index_get(State(state): State<IndexCasState>) -> Json<Value> {
+        let read = state.reads.fetch_add(1, Ordering::SeqCst);
+        let (ids, mod_revision) = if read == 0 {
+            (json!(["existing"]), 7)
+        } else {
+            (json!(["existing", "concurrent"]), 8)
+        };
+        Json(json!({
+            "found": true,
+            "entry": {
+                "value": ids.to_string(),
+                "mod_revision": mod_revision,
+                "expires_at_ms": null
+            }
+        }))
+    }
+
+    async fn mock_index_put(
+        State(state): State<IndexCasState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let attempt = {
+            let mut writes = state.writes.lock().unwrap();
+            writes.push(body);
+            writes.len()
+        };
+        if attempt == 1 {
+            Json(json!({
+                "committed": true,
+                "result": { "output": {
+                    "ok": false,
+                    "reason": "cas_mismatch",
+                    "current_revision": 8,
+                    "revision": 8
+                } }
+            }))
+        } else {
+            Json(json!({
+                "committed": true,
+                "result": { "output": { "ok": true, "revision": 9 } }
+            }))
+        }
+    }
+
+    async fn mock_storage_failure() -> StatusCode {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+
+    async fn mock_unindexed_key(
+        State(stored): State<StoredKey>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        if query.get("key") == Some(&key_path(&stored.key_id)) {
+            return Json(json!({
+                "found": true,
+                "entry": {
+                    "value": serde_json::to_string(&stored).unwrap(),
+                    "mod_revision": 1,
+                    "expires_at_ms": null
+                }
+            }));
+        }
+        Json(json!({ "found": false }))
+    }
 
     fn store() -> KeyStore {
         KeyStore::new()
+    }
+
+    #[test]
+    fn credential_derivation_secret_is_strong_and_unambiguous() {
+        assert!(matches!(
+            validated_idempotency_secret(None),
+            Err(StoreError::MissingIdempotencySecret)
+        ));
+        assert!(matches!(
+            validated_idempotency_secret(Some("too-short")),
+            Err(StoreError::WeakIdempotencySecret)
+        ));
+        assert!(matches!(
+            validated_idempotency_secret(Some("0123456789abcdef0123456789abcde ")),
+            Err(StoreError::WeakIdempotencySecret)
+        ));
+        assert_eq!(
+            validated_idempotency_secret(Some("0123456789abcdef0123456789abcdef")).unwrap(),
+            b"0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]
@@ -426,11 +699,33 @@ mod tests {
         assert_ne!(h, hash_secret("super-secreu"));
     }
 
+    #[test]
+    fn raw_key_parser_accepts_only_the_minted_wire_shape() {
+        let key_id = "0123456789abcdef";
+        let secret = "a".repeat(64);
+        assert_eq!(
+            parse_raw_key(&format!("fdc_live_{key_id}.{secret}")),
+            Some(("live", key_id, secret.as_str()))
+        );
+        for invalid in [
+            format!("other_live_{key_id}.{secret}"),
+            format!("fdc_prod_{key_id}.{secret}"),
+            format!("fdc_live_short.{secret}"),
+            format!("fdc_live_{key_id}.short"),
+            format!("fdc_live_{key_id}.{}", "z".repeat(64)),
+            format!("fdc_live_{}.{}", key_id.to_ascii_uppercase(), secret),
+            format!("fdc_live_{key_id}.{}", secret.to_ascii_uppercase()),
+        ] {
+            assert!(parse_raw_key(&invalid).is_none(), "accepted {invalid}");
+        }
+    }
+
     #[tokio::test]
     async fn introspect_round_trips_a_created_key() {
         let s = store();
         let (raw, meta) = s
             .create(
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
                 "ci".into(),
                 vec!["kv:read".into()],
@@ -447,6 +742,53 @@ mod tests {
         assert_eq!(intro.key_id.as_deref(), Some(meta.key_id.as_str()));
         assert_eq!(intro.scopes, vec!["kv:read".to_string()]);
         assert!(intro.require_idempotency);
+        assert_eq!(meta.version, 1);
+        assert!(meta.require_idempotency);
+        let wrong_env = raw.replacen("fdc_live_", "fdc_test_", 1);
+        assert!(!s.introspect(&wrong_env).await.unwrap().valid);
+    }
+
+    #[tokio::test]
+    async fn create_replays_the_same_one_time_secret_for_the_same_idempotency_key() {
+        let s = store();
+        let first = s
+            .create(
+                MutationIdentity::new("user_1", "create-retry"),
+                "org_1".into(),
+                "worker".into(),
+                vec!["kv:read".into()],
+                "live".into(),
+                true,
+            )
+            .await
+            .unwrap();
+        let replay = s
+            .create(
+                MutationIdentity::new("user_1", "create-retry"),
+                "org_1".into(),
+                "worker".into(),
+                vec!["kv:read".into()],
+                "live".into(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(replay.0, first.0);
+        assert_eq!(replay.1.key_id, first.1.key_id);
+        assert_eq!(replay.1.version, 1);
+
+        let conflict = s
+            .create(
+                MutationIdentity::new("user_1", "create-retry"),
+                "org_1".into(),
+                "changed".into(),
+                vec!["kv:read".into()],
+                "live".into(),
+                true,
+            )
+            .await;
+        assert!(matches!(conflict, Err(StoreError::IdempotencyConflict)));
     }
 
     #[tokio::test]
@@ -454,6 +796,7 @@ mod tests {
         let s = store();
         let (raw, _) = s
             .create(
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
                 "ci".into(),
                 vec!["kv:read".into()],
@@ -474,10 +817,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_customer_keys_never_surface_admin_scopes() {
+        let s = store();
+        let (raw, _) = s
+            .create(
+                MutationIdentity::new("user_1", "create-1"),
+                "org_1".into(),
+                "legacy".into(),
+                vec!["admin:read".into(), "kv:read".into()],
+                "live".into(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let intro = s.introspect(&raw).await.unwrap();
+        assert!(intro.valid);
+        assert_eq!(intro.scopes, vec!["kv:read"]);
+    }
+
+    #[tokio::test]
     async fn introspect_rejects_tampered_secret_and_revoked_keys() {
         let s = store();
         let (raw, meta) = s
-            .create("org_1".into(), "ci".into(), vec![], "live".into(), true)
+            .create(
+                MutationIdentity::new("user_1", "create-1"),
+                "org_1".into(),
+                "ci".into(),
+                vec![],
+                "live".into(),
+                true,
+            )
             .await
             .unwrap();
 
@@ -499,84 +869,253 @@ mod tests {
         );
     }
 
-    #[test]
-    fn default_cache_ttl_is_the_safe_default() {
-        assert_eq!(
-            store().ttl,
-            Duration::from_millis(DEFAULT_KEY_CACHE_TTL_MS),
-            "unset FIDUCIA_KEY_CACHE_TTL_MS must fall back to the safe default"
+    #[tokio::test]
+    async fn production_introspection_never_falls_back_to_a_stale_local_record() {
+        let app = Router::new().route("/v1/kv", get(mock_storage_failure));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let key_id = "0123456789abcdef";
+        let secret = "a".repeat(64);
+        let rec = ApiKeyRecord {
+            key_id: key_id.to_string(),
+            org_id: "org_1".to_string(),
+            name: "cached".to_string(),
+            secret_hash: hash_secret(&secret),
+            create_idempotency_hash: "test-create".to_string(),
+            last_rotation_idempotency_hash: None,
+            scopes: vec!["kv:read".to_string()],
+            created_ms: 1,
+            last_used_ms: None,
+            revoked: false,
+            version: 1,
+            env: "live".to_string(),
+            require_idempotency: true,
+        };
+        let store = KeyStore {
+            cache: Mutex::new(HashMap::from([(key_id.to_string(), CacheEntry::now(rec))])),
+            kv: Some(KvClient::for_test(format!("http://{address}"))),
+            idempotency_secret: b"fiducia-auth-test-idempotency-secret".to_vec(),
+        };
+
+        let result = store
+            .introspect(&format!("fdc_live_{key_id}.{secret}"))
+            .await;
+        assert!(
+            matches!(result, Err(StoreError::Http(status)) if status == StatusCode::SERVICE_UNAVAILABLE)
         );
+        server.abort();
     }
 
     #[tokio::test]
-    async fn a_cache_entry_past_its_ttl_is_a_miss_and_triggers_a_reread() {
-        // Tiny TTL so an aged entry is unambiguously stale.
-        let s = KeyStore::with_ttl(Duration::from_millis(50));
-        let (raw, meta) = s
-            .create("org_1".into(), "ci".into(), vec![], "live".into(), true)
+    async fn production_introspection_rejects_a_record_missing_from_its_org_index() {
+        let key_id = "0123456789abcdef";
+        let secret = "a".repeat(64);
+        let stored = StoredKey {
+            key_id: key_id.to_string(),
+            org_id: "org_1".to_string(),
+            name: "unindexed".to_string(),
+            secret_hash: hash_secret(&secret),
+            create_idempotency_hash: "create-marker".to_string(),
+            last_rotation_idempotency_hash: None,
+            scopes: vec!["kv:read".to_string()],
+            created_ms: 1,
+            last_used_ms: None,
+            revoked: false,
+            version: 1,
+            env: "live".to_string(),
+            require_idempotency: true,
+        };
+        let app = Router::new()
+            .route("/v1/kv", get(mock_unindexed_key))
+            .with_state(stored);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
-        let key_id = meta.key_id.as_str();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let store = KeyStore {
+            cache: Mutex::new(HashMap::new()),
+            kv: Some(KvClient::for_test(format!("http://{address}"))),
+            idempotency_secret: b"fiducia-auth-test-idempotency-secret".to_vec(),
+        };
 
-        // Split `fdc_<env>_<key_id>.<secret>` back into its pieces.
-        let (_left, secret) = raw.split_once('.').unwrap();
-
-        // Fresh: a hit within the TTL short-circuits (authoritative, still valid).
-        assert!(
-            s.introspect_cached(key_id, secret).is_some(),
-            "a fresh entry must short-circuit the hot path"
-        );
-
-        // Age the entry beyond the TTL: the cache layer now reports a MISS, which
-        // is what forces `introspect` to re-read the authoritative KV (and thus
-        // observe revocations propagated from another replica).
-        s.test_age_entry(key_id, Duration::from_millis(500));
-        assert!(
-            s.introspect_cached(key_id, secret).is_none(),
-            "an entry past its TTL must be a MISS so KV is re-read"
-        );
-
-        // No durable KV here, so `introspect` still honors the (only) local record
-        // rather than spuriously 401-ing a valid key — existing behavior preserved.
-        assert!(
-            s.introspect(&raw).await.unwrap().valid,
-            "with no KV to re-read, a stale-but-valid key must stay valid"
-        );
+        let intro = store
+            .introspect(&format!("fdc_live_{key_id}.{secret}"))
+            .await
+            .unwrap();
+        assert!(!intro.valid);
+        server.abort();
     }
 
     #[tokio::test]
     async fn revoke_is_scoped_to_the_owning_org() {
         let s = store();
         let (_raw, meta) = s
-            .create("org_1".into(), "k".into(), vec![], "live".into(), true)
+            .create(
+                MutationIdentity::new("user_1", "create-1"),
+                "org_1".into(),
+                "k".into(),
+                vec![],
+                "live".into(),
+                true,
+            )
             .await
             .unwrap();
         assert!(!s.revoke("org_2", &meta.key_id).await.unwrap());
     }
 
     #[tokio::test]
-    async fn rotation_invalidates_the_previous_secret_and_preserves_policy() {
+    async fn rotate_replaces_secret_increments_version_and_preserves_policy() {
         let s = store();
-        let (original, meta) = s
+        let (old_raw, created) = s
             .create(
+                MutationIdentity::new("user_1", "create-1"),
                 "org_1".into(),
-                "rotating".into(),
-                vec!["kv:write".into()],
+                "worker".into(),
+                vec!["requests:write".into()],
+                "test".into(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let (new_raw, rotated) = s
+            .rotate("user_1", "rotate-1", "org_1", &created.key_id)
+            .await
+            .unwrap()
+            .expect("owning org can rotate");
+
+        assert_ne!(new_raw, old_raw);
+        assert!(new_raw.starts_with("fdc_test_"));
+        assert!(!s.introspect(&old_raw).await.unwrap().valid);
+        assert!(s.introspect(&new_raw).await.unwrap().valid);
+        assert_eq!(rotated.version, created.version + 1);
+        assert!(rotated.require_idempotency);
+        assert!(!rotated.revoked);
+
+        let (replayed_raw, replayed) = s
+            .rotate("user_1", "rotate-1", "org_1", &created.key_id)
+            .await
+            .unwrap()
+            .expect("the same rotation request replays");
+        assert_eq!(replayed_raw, new_raw);
+        assert_eq!(replayed.version, rotated.version);
+
+        let (next_raw, next) = s
+            .rotate("user_1", "rotate-2", "org_1", &created.key_id)
+            .await
+            .unwrap()
+            .expect("a new idempotency key performs a new rotation");
+        assert_ne!(next_raw, new_raw);
+        assert_eq!(next.version, rotated.version + 1);
+    }
+
+    #[tokio::test]
+    async fn revoke_versions_only_the_first_state_transition() {
+        let s = store();
+        let (_raw, created) = s
+            .create(
+                MutationIdentity::new("user_1", "create-1"),
+                "org_1".into(),
+                "worker".into(),
+                vec![],
+                "live".into(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(s.revoke("org_1", &created.key_id).await.unwrap());
+        let once = s.list("org_1").await.unwrap().pop().unwrap();
+        assert_eq!(once.version, created.version + 1);
+        assert!(once.revoked);
+        assert!(!once.require_idempotency);
+
+        assert!(s.revoke("org_1", &created.key_id).await.unwrap());
+        let twice = s.list("org_1").await.unwrap().pop().unwrap();
+        assert_eq!(twice.version, once.version);
+    }
+
+    #[tokio::test]
+    async fn rotate_is_scoped_to_the_owning_org() {
+        let s = store();
+        let (_raw, created) = s
+            .create(
+                MutationIdentity::new("user_1", "create-1"),
+                "org_1".into(),
+                "worker".into(),
+                vec![],
                 "live".into(),
                 true,
             )
             .await
             .unwrap();
-        let (replacement, rotated) = s
-            .rotate("org_1", &meta.key_id)
+        assert!(s
+            .rotate("user_1", "rotate-1", "org_2", &created.key_id)
             .await
             .unwrap()
-            .expect("owned key rotates");
+            .is_none());
+        let unchanged = s.list("org_1").await.unwrap().pop().unwrap();
+        assert_eq!(unchanged.version, created.version);
+    }
 
-        assert_ne!(replacement, original);
-        assert_eq!(rotated.key_id, meta.key_id);
-        assert!(rotated.require_idempotency);
-        assert!(!s.introspect(&original).await.unwrap().valid);
-        assert!(s.introspect(&replacement).await.unwrap().valid);
+    #[tokio::test]
+    async fn revoked_key_cannot_be_rotated() {
+        let s = store();
+        let (_raw, created) = s
+            .create(
+                MutationIdentity::new("user_1", "create-1"),
+                "org_1".into(),
+                "worker".into(),
+                vec![],
+                "live".into(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(s.revoke("org_1", &created.key_id).await.unwrap());
+        assert!(s
+            .rotate("user_1", "rotate-1", "org_1", &created.key_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn org_index_cas_retries_and_merges_a_concurrent_insert() {
+        let state = IndexCasState::default();
+        let app = Router::new()
+            .route("/v1/kv", get(mock_index_get).put(mock_index_put))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let kv = KvClient::for_test(format!("http://{address}"));
+
+        store()
+            .index_add(&kv, "org_1", "ours")
+            .await
+            .expect("retry should merge the concurrent index entry");
+
+        let writes = state.writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0]["prev_revision"], json!(7));
+        assert_eq!(writes[1]["prev_revision"], json!(8));
+        let merged: Vec<String> =
+            serde_json::from_str(writes[1]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(merged, vec!["existing", "concurrent", "ours"]);
+        server.abort();
     }
 }

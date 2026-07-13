@@ -1,7 +1,8 @@
 //! fiducia-auth — the auth server.
 //!
-//! Two planes, two credentials, and **neither hits Supabase (or the DB) on the
-//! hot path**:
+//! Two planes and two credentials. Human JWT verification avoids Supabase on
+//! the normal path; API-key introspection reads authoritative Fiducia KV so
+//! rotations and revocations are visible across auth replicas:
 //!
 //!   * **Dashboard (humans):** Supabase Auth issues a session JWT. We verify it
 //!     **offline** with Supabase's cached JWKS (only the dashboard/control plane;
@@ -25,8 +26,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -34,14 +35,19 @@ use axum::{
 use serde_json::{json, Value};
 use std::time::Duration;
 use tower_http::{
-    catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
-    trace::TraceLayer,
+    catch_panic::CatchPanicLayer, cors::CorsLayer, limit::RequestBodyLimitLayer,
+    timeout::TimeoutLayer, trace::TraceLayer,
 };
 
-use keys::KeyStore;
+use keys::{KeyStore, MutationIdentity};
 use model::{CreateKeyBody, IntrospectBody, TokenBody, UserCtx};
+use store::StoreError;
 
 const SERVICE: &str = "fiducia-auth";
+/// Default positive-introspection cache bound used by the current edge/LB.
+/// Deployments that raise a consumer cache TTL must raise
+/// `FIDUCIA_ROTATION_OVERLAP_SECONDS` to the same maximum.
+const DEFAULT_ROTATION_OVERLAP_SECONDS: u64 = 60;
 const ALLOWED_API_KEY_SCOPES: &[&str] = &[
     "requests:read",
     "requests:write",
@@ -57,7 +63,6 @@ const ALLOWED_API_KEY_SCOPES: &[&str] = &[
     "cron:write",
     "rate-limit:read",
     "rate-limit:write",
-    "admin:read",
 ];
 
 /// Reject any request whose handler runs longer than this (slow-loris / hung
@@ -70,6 +75,7 @@ struct AppState {
     keys: KeyStore,
     orgs: Arc<sync::OrgCache>,
     introspect_secret: String,
+    rotation_overlap_seconds: u64,
 }
 
 #[tokio::main]
@@ -78,7 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     token::validate_config().map_err(std::io::Error::other)?;
     let introspect_secret = required_env("FIDUCIA_INTROSPECT_SECRET")?;
+    let rotation_overlap_seconds = rotation_overlap_seconds_from_env()?;
     let keys = KeyStore::from_env().map_err(std::io::Error::other)?;
+    let customer_origin = customer_origin_from_env()?;
 
     // Supabase is the durable system of record; complete one initial sync before
     // accepting traffic so an empty cache cannot impersonate real org state.
@@ -91,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keys,
         orgs,
         introspect_secret,
+        rotation_overlap_seconds,
     });
 
     let app = Router::new()
@@ -99,8 +108,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Dashboard plane (requires a Supabase session JWT).
         .route("/v1/me", get(me))
         .route("/v1/keys", post(create_key).get(list_keys))
-        .route("/v1/keys/:key_id/rotate", post(rotate_key))
         .route("/v1/keys/:key_id", axum::routing::delete(revoke_key))
+        .route("/v1/keys/:key_id/rotate", post(rotate_key))
         .route("/v1/orgs/:org_id", get(get_org))
         // Data plane. `introspect` is a server-to-server oracle (answers "is this
         // arbitrary key valid?" for keys the caller does not hold), so it is
@@ -116,7 +125,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CatchPanicLayer::new());
+        .layer(CatchPanicLayer::new())
+        // The customer portal is independently hosted. Permit only its exact
+        // configured origin to call browser-facing auth routes; this is never a
+        // wildcard and does not enable credentialed cookies.
+        .layer(customer_cors_layer(customer_origin));
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -159,6 +172,36 @@ fn unauthorized(msg: &str) -> Response {
         .into_response()
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct OrgQuery {
+    #[serde(default)]
+    org_id: Option<String>,
+}
+
+#[allow(clippy::result_large_err)]
+fn select_user_org(user: &UserCtx, requested: Option<&str>) -> Result<String, Response> {
+    if let Some(org_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+        if user.orgs.iter().any(|allowed| allowed == org_id) {
+            return Ok(org_id.to_string());
+        }
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "forbidden_org", "org_id": org_id })),
+        )
+            .into_response());
+    }
+
+    match user.orgs.as_slice() {
+        [] => Err((StatusCode::FORBIDDEN, Json(json!({ "error": "no_org" }))).into_response()),
+        [org_id] => Ok(org_id.clone()),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "org_id_required" })),
+        )
+            .into_response()),
+    }
+}
+
 struct KeyCreateInput {
     name: String,
     scopes: Vec<String>,
@@ -181,7 +224,6 @@ fn validated_key_create_input(body: CreateKeyBody) -> Result<KeyCreateInput, &'s
         return Err("invalid_environment");
     }
 
-    let require_idempotency = body.require_idempotency.unwrap_or(true);
     let mut scopes = Vec::new();
     for scope in body.scopes {
         let scope = scope.trim().to_string();
@@ -203,7 +245,7 @@ fn validated_key_create_input(body: CreateKeyBody) -> Result<KeyCreateInput, &'s
         name,
         scopes,
         env,
-        require_idempotency,
+        require_idempotency: body.require_idempotency,
     })
 }
 
@@ -220,11 +262,81 @@ fn storage_unavailable(error: &dyn std::fmt::Display) -> Response {
         .into_response()
 }
 
+fn key_store_error(error: StoreError) -> Response {
+    if matches!(error, StoreError::IdempotencyConflict) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "idempotency_conflict" })),
+        )
+            .into_response();
+    }
+    storage_unavailable(&error)
+}
+
+#[allow(clippy::result_large_err)]
+fn require_idempotency_key(headers: &HeaderMap) -> Result<String, Response> {
+    let Some(value) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    else {
+        return Err(bad_key_request("idempotency_key_required"));
+    };
+    if value.is_empty()
+        || value.len() > 128
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(bad_key_request("invalid_idempotency_key"));
+    }
+    Ok(value.to_string())
+}
+
 fn required_env(name: &str) -> Result<String, std::io::Error> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| std::io::Error::other(format!("{name} must be configured")))
+}
+
+fn customer_origin_from_env() -> Result<HeaderValue, std::io::Error> {
+    customer_origin_from(std::env::var("FIDUCIA_CUSTOMER_ORIGIN").ok().as_deref())
+}
+
+fn customer_origin_from(value: Option<&str>) -> Result<HeaderValue, std::io::Error> {
+    let configured = value.unwrap_or("https://app.fiducia.cloud").trim();
+    let parsed = reqwest::Url::parse(configured).map_err(|_| {
+        std::io::Error::other("FIDUCIA_CUSTOMER_ORIGIN must be an absolute HTTP(S) origin")
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(std::io::Error::other(
+            "FIDUCIA_CUSTOMER_ORIGIN must contain only an HTTP(S) scheme, host, and optional port",
+        ));
+    }
+    let origin = parsed.origin().ascii_serialization();
+    HeaderValue::from_str(&origin).map_err(|_| {
+        std::io::Error::other("FIDUCIA_CUSTOMER_ORIGIN is not a valid HTTP Origin header")
+    })
+}
+
+fn customer_cors_layer(origin: HeaderValue) -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(origin)
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("idempotency-key"),
+            HeaderName::from_static("x-fiducia-org-id"),
+        ])
 }
 
 // --- dashboard handlers ---
@@ -278,20 +390,14 @@ async fn create_key(
         Ok(u) => u,
         Err(e) => return e,
     };
-    let Some(org) = body.org_id.clone().or_else(|| user.orgs.first().cloned()) else {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            Json(json!({ "error": "no_org" })),
-        )
-            .into_response();
+    let idempotency_key = match require_idempotency_key(&headers) {
+        Ok(value) => value,
+        Err(response) => return response,
     };
-    if !user.orgs.iter().any(|allowed| allowed == &org) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "forbidden_org", "org_id": org })),
-        )
-            .into_response();
-    }
+    let org = match select_user_org(&user, body.org_id.as_deref()) {
+        Ok(org) => org,
+        Err(response) => return response,
+    };
     let input = match validated_key_create_input(body) {
         Ok(input) => input,
         Err(error) => return bad_key_request(error),
@@ -299,6 +405,7 @@ async fn create_key(
     let (raw, meta) = match s
         .keys
         .create(
+            MutationIdentity::new(&user.user_id, &idempotency_key),
             org,
             input.name,
             input.scopes,
@@ -308,50 +415,105 @@ async fn create_key(
         .await
     {
         Ok(created) => created,
-        Err(error) => return storage_unavailable(&error),
+        Err(error) => return key_store_error(error),
     };
-    // The only time the raw key is ever returned.
-    Json(json!({ "api_key": raw, "key": meta })).into_response()
+    // This raw value is returned only in the response that minted it.
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "api_key": raw, "key": meta })),
+    )
+        .into_response()
 }
 
-/// `GET /v1/keys` — list the caller org's keys (masked).
-async fn list_keys(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let user = match require_user(&headers).await {
-        Ok(u) => u,
-        Err(e) => return e,
-    };
-    let org = user.orgs.first().cloned().unwrap_or_default();
-    match s.keys.list(&org).await {
-        Ok(keys) => Json(json!({ "keys": keys })).into_response(),
-        Err(error) => storage_unavailable(&error),
-    }
-}
-
-/// `POST /v1/keys/{key_id}/rotate` — replace an owned key's secret. The new raw
-/// key is returned once and the previous secret is invalid immediately.
+/// `POST /v1/keys/{key_id}/rotate` — replace the authoritative secret and return
+/// the raw replacement only once. The response reports the configured bound for
+/// already-cached positive introspection decisions at edge/LB consumers.
 async fn rotate_key(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(key_id): Path<String>,
+    Query(query): Query<OrgQuery>,
 ) -> Response {
     let user = match require_user(&headers).await {
-        Ok(user) => user,
-        Err(error) => return error,
+        Ok(u) => u,
+        Err(e) => return e,
     };
-    for org in &user.orgs {
-        match s.keys.rotate(org, &key_id).await {
-            Ok(Some((raw, meta))) => {
-                return Json(json!({ "api_key": raw, "key": meta })).into_response()
-            }
-            Ok(None) => {}
-            Err(error) => return storage_unavailable(&error),
-        }
+    let idempotency_key = match require_idempotency_key(&headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let org = match select_user_org(&user, query.org_id.as_deref()) {
+        Ok(org) => org,
+        Err(response) => return response,
+    };
+    match s
+        .keys
+        .rotate(&user.user_id, &idempotency_key, &org, &key_id)
+        .await
+    {
+        Ok(Some((raw, meta))) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "ok": true,
+                "api_key": raw,
+                "key": meta,
+                "secret_once": true,
+                "overlap_seconds": s.rotation_overlap_seconds,
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "key_not_found" })),
+        )
+            .into_response(),
+        Err(error) => key_store_error(error),
     }
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "error": "key_not_found" })),
-    )
-        .into_response()
+}
+
+fn rotation_overlap_seconds_from_env() -> Result<u64, std::io::Error> {
+    match std::env::var("FIDUCIA_ROTATION_OVERLAP_SECONDS") {
+        Ok(value) => rotation_overlap_seconds_from(Some(&value)),
+        Err(std::env::VarError::NotPresent) => rotation_overlap_seconds_from(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::other(
+            "FIDUCIA_ROTATION_OVERLAP_SECONDS must be valid UTF-8",
+        )),
+    }
+}
+
+fn rotation_overlap_seconds_from(value: Option<&str>) -> Result<u64, std::io::Error> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_ROTATION_OVERLAP_SECONDS);
+    };
+    let seconds = value.trim().parse::<u64>().map_err(|_| {
+        std::io::Error::other("FIDUCIA_ROTATION_OVERLAP_SECONDS must be a positive integer")
+    })?;
+    if seconds == 0 {
+        return Err(std::io::Error::other(
+            "FIDUCIA_ROTATION_OVERLAP_SECONDS must be greater than zero",
+        ));
+    }
+    Ok(seconds)
+}
+
+/// `GET /v1/keys` — list the caller org's keys (masked).
+async fn list_keys(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<OrgQuery>,
+) -> Response {
+    let user = match require_user(&headers).await {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
+    let org = match select_user_org(&user, query.org_id.as_deref()) {
+        Ok(org) => org,
+        Err(response) => return response,
+    };
+    match s.keys.list(&org).await {
+        Ok(keys) => Json(json!({ "keys": keys })).into_response(),
+        Err(error) => storage_unavailable(&error),
+    }
 }
 
 /// `DELETE /v1/keys/{key_id}` — revoke a key the caller's org owns.
@@ -359,12 +521,16 @@ async fn revoke_key(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(key_id): Path<String>,
+    Query(query): Query<OrgQuery>,
 ) -> Response {
     let user = match require_user(&headers).await {
         Ok(u) => u,
         Err(e) => return e,
     };
-    let org = user.orgs.first().cloned().unwrap_or_default();
+    let org = match select_user_org(&user, query.org_id.as_deref()) {
+        Ok(org) => org,
+        Err(response) => return response,
+    };
     match s.keys.revoke(&org, &key_id).await {
         Ok(revoked) => Json(json!({ "revoked": revoked })).into_response(),
         Err(error) => storage_unavailable(&error),
@@ -453,8 +619,75 @@ mod constant_time_tests {
 }
 
 #[cfg(test)]
+mod cors_tests {
+    use super::{customer_cors_layer, customer_origin_from};
+    use axum::{
+        body::Body,
+        http::{header, Method, Request, StatusCode},
+        routing::get,
+        Router,
+    };
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        Router::new()
+            .route("/v1/me", get(|| async { StatusCode::OK }))
+            .layer(customer_cors_layer(
+                customer_origin_from(Some("https://app.fiducia.cloud")).unwrap(),
+            ))
+    }
+
+    #[tokio::test]
+    async fn customer_origin_preflight_is_allowed_exactly() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/v1/me")
+                    .header(header::ORIGIN, "https://app.fiducia.cloud")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&"https://app.fiducia.cloud".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn sibling_origin_never_receives_itself_as_an_allowed_origin() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/me")
+                    .header(header::ORIGIN, "https://admin.fiducia.cloud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let allowed = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap();
+        assert_eq!(allowed, "https://app.fiducia.cloud");
+        assert_ne!(allowed, "https://admin.fiducia.cloud");
+    }
+}
+
+#[cfg(test)]
 mod interface_contract_tests {
-    use super::{validated_key_create_input, CreateKeyBody};
+    use super::{
+        customer_origin_from, rotation_overlap_seconds_from, select_user_org,
+        validated_key_create_input, CreateKeyBody, UserCtx,
+    };
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 
     #[test]
@@ -484,26 +717,26 @@ mod interface_contract_tests {
                 "".to_string(),
             ],
             env: None,
-            require_idempotency: Some(false),
+            require_idempotency: true,
         })
         .expect("valid input");
 
         assert_eq!(input.name, "production");
         assert_eq!(input.env, "live");
         assert_eq!(input.scopes, vec!["kv:read".to_string()]);
-        assert!(!input.require_idempotency);
+        assert!(input.require_idempotency);
 
         let defaulted = validated_key_create_input(CreateKeyBody {
             name: "worker".to_string(),
             org_id: None,
             scopes: vec![],
             env: Some("test".to_string()),
-            require_idempotency: None,
+            require_idempotency: false,
         })
         .expect("valid input");
         assert_eq!(defaulted.scopes, vec!["requests:write".to_string()]);
         assert_eq!(defaulted.env, "test");
-        assert!(defaulted.require_idempotency);
+        assert!(!defaulted.require_idempotency);
     }
 
     #[test]
@@ -513,7 +746,7 @@ mod interface_contract_tests {
             org_id: None,
             scopes: vec!["kv:read".to_string()],
             env: None,
-            require_idempotency: None,
+            require_idempotency: true,
         })
         .is_err());
         assert!(validated_key_create_input(CreateKeyBody {
@@ -521,7 +754,7 @@ mod interface_contract_tests {
             org_id: None,
             scopes: vec!["kv:read".to_string()],
             env: Some("prod".to_string()),
-            require_idempotency: None,
+            require_idempotency: true,
         })
         .is_err());
         assert!(validated_key_create_input(CreateKeyBody {
@@ -529,8 +762,89 @@ mod interface_contract_tests {
             org_id: None,
             scopes: vec!["*".to_string()],
             env: None,
-            require_idempotency: None,
+            require_idempotency: true,
         })
         .is_err());
+    }
+
+    #[test]
+    fn key_request_defaults_idempotency_to_true() {
+        let body: CreateKeyBody = serde_json::from_value(serde_json::json!({
+            "name": "worker",
+            "org_id": "org_1",
+            "scopes": ["requests:write"],
+            "env": "live"
+        }))
+        .unwrap();
+        assert!(body.require_idempotency);
+    }
+
+    fn user(orgs: &[&str]) -> UserCtx {
+        UserCtx {
+            user_id: "user_1".to_string(),
+            email: None,
+            orgs: orgs.iter().map(|value| (*value).to_string()).collect(),
+            roles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn multi_org_key_operations_require_an_explicit_authorized_org() {
+        let multi = user(&["org_a", "org_b"]);
+        assert!(select_user_org(&multi, None).is_err());
+        assert_eq!(select_user_org(&multi, Some("org_b")).unwrap(), "org_b");
+        assert!(select_user_org(&multi, Some("org_c")).is_err());
+
+        let single = user(&["org_a"]);
+        assert_eq!(select_user_org(&single, None).unwrap(), "org_a");
+    }
+
+    #[test]
+    fn customer_key_creation_rejects_admin_scopes() {
+        for scope in ["admin:read", "admin:write", "admin:*"] {
+            assert!(validated_key_create_input(CreateKeyBody {
+                name: "worker".to_string(),
+                org_id: Some("org_a".to_string()),
+                scopes: vec![scope.to_string()],
+                env: None,
+                require_idempotency: true,
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn rotation_overlap_configuration_fails_closed_when_invalid() {
+        assert_eq!(rotation_overlap_seconds_from(None).unwrap(), 60);
+        assert_eq!(rotation_overlap_seconds_from(Some("120")).unwrap(), 120);
+        assert!(rotation_overlap_seconds_from(Some("0")).is_err());
+        assert!(rotation_overlap_seconds_from(Some("not-a-number")).is_err());
+    }
+
+    #[test]
+    fn customer_cors_origin_is_exact_and_normalized() {
+        assert_eq!(
+            customer_origin_from(None).unwrap().to_str().unwrap(),
+            "https://app.fiducia.cloud"
+        );
+        assert_eq!(
+            customer_origin_from(Some("http://127.0.0.1:4173/"))
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "http://127.0.0.1:4173"
+        );
+        for invalid in [
+            "*",
+            "null",
+            "ftp://app.fiducia.cloud",
+            "https://app.fiducia.cloud/path",
+            "https://app.fiducia.cloud?query=1",
+        ] {
+            assert!(
+                customer_origin_from(Some(invalid)).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 }

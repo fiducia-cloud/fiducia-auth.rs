@@ -8,7 +8,7 @@ columns = ["options", "env", "type", "description"]
 allow_unknown = false
 
 [env]
-ignore = ["FIDUCIA_INTROSPECT_SECRET", "FIDUCIA_JWT_SIGNING_KEY", "SUPABASE_SERVICE_ROLE_KEY"]
+ignore = ["FIDUCIA_INTERNAL_SECRET", "FIDUCIA_INTROSPECT_SECRET", "FIDUCIA_JWT_SIGNING_KEY", "FIDUCIA_KEY_IDEMPOTENCY_SECRET", "SUPABASE_SERVICE_ROLE_KEY"]
 
 [flags.port]
 env = "PORT"
@@ -23,11 +23,23 @@ aliases = ["kv-url"]
 type = "string"
 help = "Durable Fiducia KV endpoint for API keys."
 
-[flags.key-cache-ttl-ms]
-env = "FIDUCIA_KEY_CACHE_TTL_MS"
-aliases = ["key-cache-ttl-ms"]
+[flags.kv-org-id]
+env = "FIDUCIA_KV_ORG_ID"
+aliases = ["kv-org-id"]
+type = "string"
+help = "Dedicated Fiducia node tenant used for auth-owned KV records."
+
+[flags.customer-origin]
+env = "FIDUCIA_CUSTOMER_ORIGIN"
+aliases = ["customer-origin"]
+type = "string"
+help = "Exact standalone customer-app HTTP(S) origin allowed by CORS."
+
+[flags.rotation-overlap-seconds]
+env = "FIDUCIA_ROTATION_OVERLAP_SECONDS"
+aliases = ["rotation-overlap-seconds"]
 type = "integer"
-help = "API-key cache lifetime in milliseconds."
+help = "Maximum positive-introspection cache overlap after rotation, in seconds."
 
 [flags.jwt-issuer]
 env = "FIDUCIA_JWT_ISSUER"

@@ -27,6 +27,14 @@ const DEFAULT_PROJECT_REF: &str = "ruxctrzdvugxztbjcpoi";
 const DEFAULT_AUDIENCE: &str = "authenticated";
 const DEFAULT_JWKS_TTL_SECS: u64 = 10 * 60;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 5;
+/// Minimum age of the cached JWKS before an unknown `kid` may force a refetch.
+/// Without this floor, an unauthenticated caller can mint junk JWTs with random
+/// `kid`s and turn every request into an outbound JWKS fetch (amplification and
+/// upstream rate-limit exhaustion, which would also starve legitimate
+/// refreshes). Real signing-key rotations still converge within this window,
+/// and the remote-userinfo fallback (when enabled) keeps freshly rotated
+/// tokens verifiable in the interim.
+const MIN_FORCED_JWKS_REFRESH_SECS: u64 = 30;
 
 static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
 static JWKS_CACHE: OnceCell<RwLock<Option<CachedJwks>>> = OnceCell::const_new();
@@ -75,6 +83,12 @@ async fn verify_with_jwks(
     let jwk = match jwks.find(kid).cloned() {
         Some(jwk) => jwk,
         None => {
+            // An unknown `kid` may force one refetch, but only when the cached
+            // set is old enough — otherwise attacker-minted kids would turn
+            // every request into an outbound JWKS fetch.
+            if !forced_refresh_allowed(config).await {
+                return Err(VerifyError::MissingJwk(kid.to_string()));
+            }
             jwks = refresh_jwks(config).await?;
             jwks.find(kid)
                 .cloned()
@@ -143,6 +157,24 @@ async fn cached_jwks(config: &SupabaseConfig) -> Result<JwkSet, VerifyError> {
     refresh_jwks(config).await
 }
 
+/// Whether an unknown-`kid` miss may force a refetch: only when there is no
+/// cached set for this URL yet, or the cached set is older than the
+/// anti-amplification floor ([`MIN_FORCED_JWKS_REFRESH_SECS`]).
+async fn forced_refresh_allowed(config: &SupabaseConfig) -> bool {
+    let cache = JWKS_CACHE.get_or_init(|| async { RwLock::new(None) }).await;
+    let guard = cache.read().await;
+    match guard.as_ref() {
+        Some(cached) if cached.url == config.jwks_url => {
+            forced_refresh_cooldown_elapsed(cached.fetched_at.elapsed())
+        }
+        _ => true,
+    }
+}
+
+fn forced_refresh_cooldown_elapsed(cached_age: Duration) -> bool {
+    cached_age >= Duration::from_secs(MIN_FORCED_JWKS_REFRESH_SECS)
+}
+
 async fn refresh_jwks(config: &SupabaseConfig) -> Result<JwkSet, VerifyError> {
     let jwks = http_client()
         .await
@@ -189,6 +221,8 @@ fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> 
         return Err(VerifyError::InvalidToken("missing subject"));
     }
 
+    let orgs = orgs_from_metadata(&[claims.app_metadata.as_ref()]);
+    let roles = roles_from_metadata(&[claims.app_metadata.as_ref()]);
     Ok(UserCtx {
         user_id: claims.sub,
         email: claims.email,
@@ -196,8 +230,8 @@ fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> 
         // `user_metadata` (raw_user_meta_data) is writable by the authenticated
         // user via `auth.updateUser({ data })`, so trusting it for org claims
         // would let any user assign themselves into a victim org (tenant takeover).
-        orgs: orgs_from_metadata(&[claims.app_metadata.as_ref()]),
-        roles: roles_from_metadata(claims.app_metadata.as_ref()),
+        orgs,
+        roles,
     })
 }
 
@@ -223,44 +257,16 @@ fn user_ctx_from_remote_user(
         return Err(VerifyError::InvalidToken("missing user id"));
     }
 
+    let orgs = orgs_from_metadata(&[user.app_metadata.as_ref()]);
+    let roles = roles_from_metadata(&[user.app_metadata.as_ref()]);
     Ok(UserCtx {
         user_id: user.id,
         email: user.email,
         // Only admin-controlled `app_metadata` — never user-writable
         // `user_metadata` — may grant org membership (see the note above).
-        orgs: orgs_from_metadata(&[user.app_metadata.as_ref()]),
-        roles: roles_from_metadata(user.app_metadata.as_ref()),
+        orgs,
+        roles,
     })
-}
-
-fn roles_from_metadata(value: Option<&Value>) -> Vec<String> {
-    let mut roles = Vec::new();
-    let Some(value) = value else {
-        return roles;
-    };
-    for key in ["roles", "fiducia_roles", "role"] {
-        if let Some(role_value) = value.get(key) {
-            push_role_value(&mut roles, role_value);
-        }
-    }
-    roles
-}
-
-fn push_role_value(roles: &mut Vec<String>, value: &Value) {
-    match value {
-        Value::String(role) => {
-            let role = role.trim().to_ascii_lowercase();
-            if !role.is_empty() && !roles.iter().any(|existing| existing == &role) {
-                roles.push(role);
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                push_role_value(roles, value);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn orgs_from_metadata(values: &[Option<&Value>]) -> Vec<String> {
@@ -300,6 +306,35 @@ fn push_org(orgs: &mut Vec<String>, org: &str) {
     let org = org.trim();
     if !org.is_empty() && !orgs.iter().any(|existing| existing == org) {
         orgs.push(org.to_string());
+    }
+}
+
+fn roles_from_metadata(values: &[Option<&Value>]) -> Vec<String> {
+    let mut roles = Vec::new();
+    for value in values.iter().flatten() {
+        for key in ["fiducia_roles", "roles", "role"] {
+            if let Some(role_value) = value.get(key) {
+                push_role_value(&mut roles, role_value);
+            }
+        }
+    }
+    roles
+}
+
+fn push_role_value(roles: &mut Vec<String>, value: &Value) {
+    match value {
+        Value::String(role) => {
+            let role = role.trim().to_ascii_lowercase();
+            if !role.is_empty() && !roles.iter().any(|existing| existing == &role) {
+                roles.push(role);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                push_role_value(roles, value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -530,20 +565,42 @@ mod tests {
     }
 
     #[test]
-    fn trusted_metadata_roles_accept_strings_arrays_and_dedupe() {
-        let app_metadata = json!({
-            "roles": ["Admin", "operator", "admin"],
-            "fiducia_roles": "viewer"
+    fn roles_come_only_from_trusted_app_metadata_shape() {
+        let metadata = json!({
+            "fiducia_roles": ["Admin", "operator", "admin"],
+            "roles": "auditor",
+            "role": "viewer"
         });
-
         assert_eq!(
-            roles_from_metadata(Some(&app_metadata)),
+            roles_from_metadata(&[Some(&metadata)]),
             vec![
                 "admin".to_string(),
                 "operator".to_string(),
+                "auditor".to_string(),
                 "viewer".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn verified_claims_ignore_user_writable_orgs_and_roles() {
+        let claims = SupabaseClaims {
+            sub: "user_1".to_string(),
+            email: Some("user@example.com".to_string()),
+            role: Some(DEFAULT_AUDIENCE.to_string()),
+            app_metadata: Some(json!({
+                "orgs": ["org_trusted"],
+                "fiducia_roles": ["operator"]
+            })),
+            _user_metadata: Some(json!({
+                "orgs": ["org_victim"],
+                "fiducia_roles": ["admin"]
+            })),
+        };
+
+        let user = user_ctx_from_claims(claims).unwrap();
+        assert_eq!(user.orgs, vec!["org_trusted"]);
+        assert_eq!(user.roles, vec!["operator"]);
     }
 
     #[test]
@@ -560,6 +617,81 @@ mod tests {
             user_ctx_from_claims(claims),
             Err(VerifyError::UnexpectedRole(Some(role))) if role == "service_role"
         ));
+    }
+
+    #[test]
+    fn forced_refresh_cooldown_gates_young_caches() {
+        assert!(!forced_refresh_cooldown_elapsed(Duration::from_secs(0)));
+        assert!(!forced_refresh_cooldown_elapsed(Duration::from_secs(
+            MIN_FORCED_JWKS_REFRESH_SECS - 1
+        )));
+        assert!(forced_refresh_cooldown_elapsed(Duration::from_secs(
+            MIN_FORCED_JWKS_REFRESH_SECS
+        )));
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_cannot_force_a_jwks_refetch_within_the_cooldown() {
+        use axum::{extract::State, routing::get, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/jwks.json",
+                get(|State(hits): State<Arc<AtomicUsize>>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(crate::token::jwks())
+                }),
+            )
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = SupabaseConfig::for_project("jwks-cooldown-test");
+        config.jwks_url = format!("http://{address}/jwks.json");
+
+        // Populate the cache once (one upstream fetch).
+        refresh_jwks(&config).await.expect("initial jwks fetch");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // A fresh cache means an attacker-controlled unknown `kid` must NOT
+        // trigger another upstream fetch — it fails fast instead.
+        let result = verify_with_jwks("junk-jwt", &config, Algorithm::ES256, "unknown-kid").await;
+        assert!(matches!(result, Err(VerifyError::MissingJwk(kid)) if kid == "unknown-kid"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "kid-miss within the cooldown must not refetch the JWKS"
+        );
+
+        // Once the cached set is older than the cooldown, a kid-miss may force
+        // exactly one refetch again (how genuine rotations are picked up).
+        {
+            let cache = JWKS_CACHE.get_or_init(|| async { RwLock::new(None) }).await;
+            let mut guard = cache.write().await;
+            let cached = guard.as_mut().expect("cache populated");
+            cached.fetched_at = Instant::now()
+                .checked_sub(Duration::from_secs(MIN_FORCED_JWKS_REFRESH_SECS + 1))
+                .expect("age within Instant range");
+        }
+        let result = verify_with_jwks("junk-jwt", &config, Algorithm::ES256, "unknown-kid").await;
+        assert!(matches!(result, Err(VerifyError::MissingJwk(_))));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a stale cache allows one forced refetch on kid-miss"
+        );
+
+        server.abort();
     }
 
     #[test]
