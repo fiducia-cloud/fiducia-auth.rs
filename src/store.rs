@@ -120,6 +120,12 @@ pub enum StoreError {
     MissingIdempotencySecret,
     #[error("FIDUCIA_KEY_IDEMPOTENCY_SECRET must contain at least 32 bytes and no whitespace")]
     WeakIdempotencySecret,
+    #[error("CUSTOMER_API_KEY_PEPPER must be set")]
+    MissingApiKeyPepper,
+    #[error("CUSTOMER_API_KEY_PEPPER must contain at least 32 bytes and no whitespace")]
+    WeakApiKeyPepper,
+    #[error("CUSTOMER_API_KEY_HASH_ALGORITHM must be hmac-sha256")]
+    UnsupportedApiKeyHashAlgorithm,
     #[error("FIDUCIA_KV_ORG_ID must be non-empty and contain no whitespace or control characters")]
     InvalidStorageOrg,
     #[error("fiducia KV request failed: {0}")]

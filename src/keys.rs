@@ -27,6 +27,8 @@ use crate::store::{
 /// authoritative value. Bound it so sustained contention fails closed instead
 /// of hanging a request indefinitely.
 const MAX_CAS_RETRIES: usize = 8;
+#[cfg(test)]
+const TEST_API_KEY_PEPPER: &[u8] = b"fiducia-auth-test-api-key-pepper";
 
 struct CacheEntry {
     record: ApiKeyRecord,
@@ -45,6 +47,8 @@ pub struct KeyStore {
     cache: Mutex<HashMap<String, CacheEntry>>,
     kv: Option<KvClient>,
     idempotency_secret: Vec<u8>,
+    api_key_pepper: Vec<u8>,
+    allow_legacy_sha256: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +74,8 @@ impl KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: None,
             idempotency_secret: b"fiducia-auth-test-idempotency-secret".to_vec(),
+            api_key_pepper: TEST_API_KEY_PEPPER.to_vec(),
+            allow_legacy_sha256: false,
         }
     }
 
@@ -80,10 +86,26 @@ impl KeyStore {
                 .ok()
                 .as_deref(),
         )?;
+        let api_key_pepper =
+            validated_api_key_pepper(std::env::var("CUSTOMER_API_KEY_PEPPER").ok().as_deref())?;
+        let hash_algorithm = std::env::var("CUSTOMER_API_KEY_HASH_ALGORITHM")
+            .unwrap_or_else(|_| "hmac-sha256".to_string());
+        if hash_algorithm.trim() != "hmac-sha256" {
+            return Err(StoreError::UnsupportedApiKeyHashAlgorithm);
+        }
+        let allow_legacy_sha256 = matches!(
+            std::env::var("CUSTOMER_API_KEY_ACCEPT_LEGACY_SHA256")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        );
         Ok(KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: Some(KvClient::from_env()?),
             idempotency_secret,
+            api_key_pepper,
+            allow_legacy_sha256,
         })
     }
 
@@ -114,7 +136,7 @@ impl KeyStore {
             key_id: key_id.clone(),
             org_id: org_id.clone(),
             name,
-            secret_hash: hash_secret(&secret),
+            secret_hash: hash_secret(&secret, &self.api_key_pepper),
             create_idempotency_hash,
             last_rotation_idempotency_hash: None,
             scopes,
@@ -256,7 +278,7 @@ impl KeyStore {
             "rotate-secret",
             &[actor_id, org_id, key_id, idempotency_key],
         );
-        let secret_hash = hash_secret(&secret);
+        let secret_hash = hash_secret(&secret, &self.api_key_pepper);
         if let Some(kv) = &self.kv {
             for _ in 0..MAX_CAS_RETRIES {
                 let Some((mut rec, mod_revision)) = self.load_versioned(kv, key_id).await? else {
@@ -347,7 +369,13 @@ impl KeyStore {
                     .iter()
                     .any(|indexed_id| indexed_id == key_id);
                 let intro = if indexed {
-                    verify(&rec, env, secret)
+                    verify(
+                        &rec,
+                        env,
+                        secret,
+                        &self.api_key_pepper,
+                        self.allow_legacy_sha256,
+                    )
                 } else {
                     Introspection::invalid()
                 };
@@ -365,7 +393,15 @@ impl KeyStore {
             .lock()
             .unwrap()
             .get(key_id)
-            .map(|e| verify(&e.record, env, secret))
+            .map(|e| {
+                verify(
+                    &e.record,
+                    env,
+                    secret,
+                    &self.api_key_pepper,
+                    self.allow_legacy_sha256,
+                )
+            })
             .unwrap_or_else(Introspection::invalid))
     }
 
@@ -453,6 +489,16 @@ fn validated_idempotency_secret(value: Option<&str>) -> Result<Vec<u8>, StoreErr
     Ok(value.as_bytes().to_vec())
 }
 
+fn validated_api_key_pepper(value: Option<&str>) -> Result<Vec<u8>, StoreError> {
+    let value = value
+        .filter(|candidate| !candidate.is_empty())
+        .ok_or(StoreError::MissingApiKeyPepper)?;
+    if value.len() < 32 || value.chars().any(char::is_whitespace) {
+        return Err(StoreError::WeakApiKeyPepper);
+    }
+    Ok(value.as_bytes().to_vec())
+}
+
 fn same_create_request(existing: &ApiKeyRecord, requested: &ApiKeyRecord) -> bool {
     existing.create_idempotency_hash == requested.create_idempotency_hash
         && existing.key_id == requested.key_id
@@ -488,8 +534,17 @@ fn is_lower_hex(byte: u8) -> bool {
 }
 
 /// Read-only check of a record against a presented secret (constant-time).
-fn verify(rec: &ApiKeyRecord, env: &str, secret: &str) -> Introspection {
-    if !rec.revoked && rec.env == env && constant_time_eq(&rec.secret_hash, &hash_secret(secret)) {
+fn verify(
+    rec: &ApiKeyRecord,
+    env: &str,
+    secret: &str,
+    pepper: &[u8],
+    allow_legacy_sha256: bool,
+) -> Introspection {
+    if !rec.revoked
+        && rec.env == env
+        && verify_secret_hash(&rec.secret_hash, secret, pepper, allow_legacy_sha256)
+    {
         Introspection {
             valid: true,
             org_id: Some(rec.org_id.clone()),
@@ -549,10 +604,31 @@ fn gen_secret() -> String {
     random_hex(32)
 }
 
-/// SHA-256 of the secret half (hex). The raw secret is never stored.
-fn hash_secret(secret: &str) -> String {
-    let digest = Sha256::digest(secret.as_bytes());
-    format!("sha256:{}", to_hex(&digest))
+/// Pepper-keyed HMAC of the secret half. The raw secret is never stored.
+fn hash_secret(secret: &str, pepper: &[u8]) -> String {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(pepper).expect("HMAC accepts keys of any length");
+    mac.update(secret.as_bytes());
+    format!("hmac-sha256:{}", to_hex(&mac.finalize().into_bytes()))
+}
+
+/// Verify both current peppered records and legacy SHA-256 records during the
+/// rotation window. Every newly created or rotated key uses HMAC.
+fn verify_secret_hash(
+    stored: &str,
+    secret: &str,
+    pepper: &[u8],
+    allow_legacy_sha256: bool,
+) -> bool {
+    let expected = if stored.starts_with("hmac-sha256:") {
+        hash_secret(secret, pepper)
+    } else if allow_legacy_sha256 && stored.starts_with("sha256:") {
+        let digest = Sha256::digest(secret.as_bytes());
+        format!("sha256:{}", to_hex(&digest))
+    } else {
+        return false;
+    };
+    constant_time_eq(stored, &expected)
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
@@ -675,6 +751,18 @@ mod tests {
             validated_idempotency_secret(Some("0123456789abcdef0123456789abcdef")).unwrap(),
             b"0123456789abcdef0123456789abcdef"
         );
+        assert!(matches!(
+            validated_api_key_pepper(None),
+            Err(StoreError::MissingApiKeyPepper)
+        ));
+        assert!(matches!(
+            validated_api_key_pepper(Some("too-short")),
+            Err(StoreError::WeakApiKeyPepper)
+        ));
+        assert_eq!(
+            validated_api_key_pepper(Some("0123456789abcdef0123456789abcdef")).unwrap(),
+            b"0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]
@@ -691,12 +779,35 @@ mod tests {
     }
 
     #[test]
-    fn hash_is_sha256_and_hides_the_secret() {
-        let h = hash_secret("super-secret");
-        assert!(h.starts_with("sha256:"));
+    fn hash_is_pepper_keyed_and_legacy_records_remain_verifiable() {
+        let h = hash_secret("super-secret", TEST_API_KEY_PEPPER);
+        assert!(h.starts_with("hmac-sha256:"));
         assert!(!h.contains("super-secret"));
-        assert_eq!(h, hash_secret("super-secret"));
-        assert_ne!(h, hash_secret("super-secreu"));
+        assert_eq!(h, hash_secret("super-secret", TEST_API_KEY_PEPPER));
+        assert_ne!(h, hash_secret("super-secreu", TEST_API_KEY_PEPPER));
+        assert_ne!(
+            h,
+            hash_secret("super-secret", b"another-valid-test-pepper-0123456789")
+        );
+        let legacy = format!("sha256:{}", to_hex(&Sha256::digest(b"super-secret")));
+        assert!(verify_secret_hash(
+            &legacy,
+            "super-secret",
+            TEST_API_KEY_PEPPER,
+            true,
+        ));
+        assert!(!verify_secret_hash(
+            &legacy,
+            "wrong-secret",
+            TEST_API_KEY_PEPPER,
+            true,
+        ));
+        assert!(!verify_secret_hash(
+            &legacy,
+            "super-secret",
+            TEST_API_KEY_PEPPER,
+            false,
+        ));
     }
 
     #[test]
@@ -885,7 +996,7 @@ mod tests {
             key_id: key_id.to_string(),
             org_id: "org_1".to_string(),
             name: "cached".to_string(),
-            secret_hash: hash_secret(&secret),
+            secret_hash: hash_secret(&secret, TEST_API_KEY_PEPPER),
             create_idempotency_hash: "test-create".to_string(),
             last_rotation_idempotency_hash: None,
             scopes: vec!["kv:read".to_string()],
@@ -900,6 +1011,8 @@ mod tests {
             cache: Mutex::new(HashMap::from([(key_id.to_string(), CacheEntry::now(rec))])),
             kv: Some(KvClient::for_test(format!("http://{address}"))),
             idempotency_secret: b"fiducia-auth-test-idempotency-secret".to_vec(),
+            api_key_pepper: TEST_API_KEY_PEPPER.to_vec(),
+            allow_legacy_sha256: false,
         };
 
         let result = store
@@ -919,7 +1032,7 @@ mod tests {
             key_id: key_id.to_string(),
             org_id: "org_1".to_string(),
             name: "unindexed".to_string(),
-            secret_hash: hash_secret(&secret),
+            secret_hash: hash_secret(&secret, TEST_API_KEY_PEPPER),
             create_idempotency_hash: "create-marker".to_string(),
             last_rotation_idempotency_hash: None,
             scopes: vec!["kv:read".to_string()],
@@ -944,6 +1057,8 @@ mod tests {
             cache: Mutex::new(HashMap::new()),
             kv: Some(KvClient::for_test(format!("http://{address}"))),
             idempotency_secret: b"fiducia-auth-test-idempotency-secret".to_vec(),
+            api_key_pepper: TEST_API_KEY_PEPPER.to_vec(),
+            allow_legacy_sha256: false,
         };
 
         let intro = store

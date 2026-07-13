@@ -59,8 +59,11 @@ validation/caching and attaches a verified identity inward.
   key secret is stored. Create/rotate require a client `Idempotency-Key`; a
   domain-separated HMAC derives a pseudorandom 256-bit credential so an exact
   retry can recover the same response without persisting the raw secret. Reusing
-  an idempotency key with a different create payload returns `409`. SHA-256 plus
-  constant-time comparison is sufficient for introspection.
+  an idempotency key with a different create payload returns `409`. Stored
+  secrets use pepper-keyed HMAC-SHA-256 plus constant-time comparison. Legacy
+  `sha256:` records are rejected by default and can be enabled only for an
+  explicit rotation window; every new or rotated key is written as
+  `hmac-sha256:`.
 - Public key metadata carries a durable monotonic `version`. Rotation replaces
   the authoritative secret immediately and advances the version; the response's
   `overlap_seconds` reports how long an already-cached positive edge/LB decision
@@ -125,6 +128,9 @@ traffic with a half-initialized identity.
 | `FIDUCIA_KV_ORG_ID` | string | no | Dedicated node tenant for auth-owned KV records; sent as `x-fiducia-org-id` | `fiducia-auth` |
 | `FIDUCIA_INTERNAL_SECRET` | string | **yes** | Node service credential sent as `x-fiducia-internal-auth` on every KV request | — (required) |
 | `FIDUCIA_KEY_IDEMPOTENCY_SECRET` | string (32+ bytes, no whitespace) | **yes** | Stable HMAC root used to derive replayable create/rotate credentials; changing it breaks outstanding exact retries and requires a coordinated migration | — (required) |
+| `CUSTOMER_API_KEY_PEPPER` | string (32+ bytes, no whitespace) | **yes** | Server-side HMAC key for stored API-key hashes; rotate existing keys before retiring legacy `sha256:` reads | — (required) |
+| `CUSTOMER_API_KEY_HASH_ALGORITHM` | enum | no | Stored key-hash algorithm; any value other than `hmac-sha256` aborts startup | `hmac-sha256` |
+| `CUSTOMER_API_KEY_ACCEPT_LEGACY_SHA256` | bool | no | Temporary migration gate for pre-pepper `sha256:` records; rotate all such keys, then disable | `false` |
 | `FIDUCIA_ROTATION_OVERLAP_SECONDS` | positive integer | no | Maximum positive-introspection cache TTL across edge/LB consumers; reported to clients after rotation. Invalid or zero values abort startup. | `60` |
 | `FIDUCIA_INTROSPECT_SECRET` | string | **yes** | `x-server-auth` shared secret required on the internal `POST /v1/introspect` route | — (required) |
 | `FIDUCIA_CUSTOMER_ORIGIN` | HTTP(S) origin | no | Exact independently hosted customer-app origin allowed by CORS; paths, wildcards, query strings, and `null` are rejected | `https://app.fiducia.cloud` |
@@ -137,7 +143,7 @@ traffic with a half-initialized identity.
 | Var | Type | Secret? | Meaning | Default |
 |-----|------|:------:|---------|---------|
 | `SUPABASE_PUBLISHABLE_KEY` | string | no | Publishable key for the `/auth/v1/user` fallback (shared-secret projects) | none |
-| `SUPABASE_PROJECT_REF` / `SUPABASE_PROJECT_ID` | string | no | Project ref used to derive URLs when `SUPABASE_URL` is unset | built-in project ref |
+| `SUPABASE_PROJECT_REF` / `SUPABASE_PROJECT_ID` | string | no | Project ref used to derive URLs when `SUPABASE_URL` is unset | none; one source is required |
 | `SUPABASE_AUTH_ISSUER` | string | no | Override for `{SUPABASE_URL}/auth/v1` | derived |
 | `SUPABASE_AUTH_JWKS_URL` | string | no | Override for the JWKS endpoint | `{issuer}/.well-known/jwks.json` |
 | `SUPABASE_AUTH_USER_URL` | string | no | Override for the `/auth/v1/user` endpoint | `{issuer}/user` |
@@ -187,8 +193,9 @@ scripts/with-flags2env.sh \
 ```
 
 Secrets such as `FIDUCIA_JWT_SIGNING_KEY`, `FIDUCIA_INTERNAL_SECRET`,
-`FIDUCIA_INTROSPECT_SECRET`, `FIDUCIA_KEY_IDEMPOTENCY_SECRET`, and
-`SUPABASE_SERVICE_ROLE_KEY` are intentionally excluded from the CLI schema.
+`FIDUCIA_INTROSPECT_SECRET`, `FIDUCIA_KEY_IDEMPOTENCY_SECRET`,
+`CUSTOMER_API_KEY_PEPPER`, and `SUPABASE_SERVICE_ROLE_KEY` are intentionally
+excluded from the CLI schema.
 Inject them only through the environment or your secret store so they cannot
 leak through shell history or process listings.
 
@@ -211,7 +218,11 @@ Hardening in place:
   offline-verifiable JWT never hold the internal secret, so gating `/v1/token`
   would break the exchange without adding protection — a caller lacking a valid
   key already learns nothing from it.
-- Only a **SHA-256 hash** of a 256-bit HMAC-derived API-key secret is stored.
+- Only a **pepper-keyed HMAC-SHA-256 hash** of a 256-bit HMAC-derived API-key
+  secret is stored. A leaked key store is insufficient to test guesses without
+  the separately managed pepper. Legacy unkeyed hashes are readable only when
+  the explicit migration gate is enabled, while every create/rotate writes the
+  current format.
   Exact `Idempotency-Key` retries deterministically recover the original raw
   response; changed-payload reuse fails with `409`. Secret-bearing responses set
   `Cache-Control: no-store`.

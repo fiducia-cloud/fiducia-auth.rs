@@ -83,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
     token::validate_config().map_err(std::io::Error::other)?;
+    supabase::validate_config().map_err(std::io::Error::other)?;
     let introspect_secret = required_env("FIDUCIA_INTROSPECT_SECRET")?;
     let rotation_overlap_seconds = rotation_overlap_seconds_from_env()?;
     let keys = KeyStore::from_env().map_err(std::io::Error::other)?;

@@ -23,7 +23,6 @@ use tokio::sync::{OnceCell, RwLock};
 
 use crate::model::UserCtx;
 
-const DEFAULT_PROJECT_REF: &str = "ruxctrzdvugxztbjcpoi";
 const DEFAULT_AUDIENCE: &str = "authenticated";
 const DEFAULT_JWKS_TTL_SECS: u64 = 10 * 60;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 5;
@@ -38,6 +37,14 @@ const MIN_FORCED_JWKS_REFRESH_SECS: u64 = 30;
 
 static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
 static JWKS_CACHE: OnceCell<RwLock<Option<CachedJwks>>> = OnceCell::const_new();
+
+/// Validate the project identity at startup so a missing deployment value can
+/// never silently select a real project or turn into per-request auth failure.
+pub fn validate_config() -> Result<(), String> {
+    SupabaseConfig::from_env()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
 
 /// Verifies a Supabase Auth access token and returns the caller identity.
 pub async fn verify_session(bearer_jwt: &str) -> Option<UserCtx> {
@@ -55,7 +62,7 @@ async fn verify_session_inner(jwt: &str) -> Result<UserCtx, VerifyError> {
         return Err(VerifyError::InvalidToken("empty bearer token"));
     }
 
-    let config = SupabaseConfig::from_env();
+    let config = SupabaseConfig::from_env()?;
     let header = decode_header(jwt).map_err(VerifyError::Jwt)?;
 
     if is_asymmetric_algorithm(header.alg) && header.kid.is_some() {
@@ -372,12 +379,18 @@ struct SupabaseConfig {
 }
 
 impl SupabaseConfig {
-    fn from_env() -> Self {
-        let project_ref = env_value("SUPABASE_PROJECT_REF")
-            .or_else(|| env_value("SUPABASE_PROJECT_ID"))
-            .unwrap_or_else(|| DEFAULT_PROJECT_REF.to_string());
-        let url =
-            env_value("SUPABASE_URL").unwrap_or_else(|| supabase_url_for_project(&project_ref));
+    fn from_env() -> Result<Self, VerifyError> {
+        let url = match env_value("SUPABASE_URL") {
+            Some(url) => url,
+            None => {
+                let project_ref = env_value("SUPABASE_PROJECT_REF")
+                    .or_else(|| env_value("SUPABASE_PROJECT_ID"))
+                    .ok_or(VerifyError::MissingConfiguration(
+                        "SUPABASE_URL or SUPABASE_PROJECT_REF must be set",
+                    ))?;
+                supabase_url_for_project(&project_ref)
+            }
+        };
         let url = normalize_url(&url);
         let issuer = env_value("SUPABASE_AUTH_ISSUER").unwrap_or_else(|| format!("{url}/auth/v1"));
         let jwks_url = env_value("SUPABASE_AUTH_JWKS_URL")
@@ -385,7 +398,7 @@ impl SupabaseConfig {
         let user_url =
             env_value("SUPABASE_AUTH_USER_URL").unwrap_or_else(|| format!("{issuer}/user"));
 
-        SupabaseConfig {
+        Ok(SupabaseConfig {
             audience: env_value("SUPABASE_AUTH_AUDIENCE")
                 .unwrap_or_else(|| DEFAULT_AUDIENCE.to_string()),
             issuer,
@@ -398,7 +411,7 @@ impl SupabaseConfig {
             publishable_key: env_value("SUPABASE_PUBLISHABLE_KEY"),
             user_url,
             allow_remote_userinfo: env_bool("SUPABASE_AUTH_ALLOW_REMOTE_USERINFO", true),
-        }
+        })
     }
 
     #[cfg(test)]
@@ -476,6 +489,7 @@ enum VerifyError {
     Jwt(jsonwebtoken::errors::Error),
     MissingJwk(String),
     MissingPublishableKey,
+    MissingConfiguration(&'static str),
     RejectedBySupabase,
     SupabaseStatus(StatusCode),
     SymmetricJwk,
@@ -498,6 +512,7 @@ impl fmt::Display for VerifyError {
                     "SUPABASE_PUBLISHABLE_KEY is required for remote auth verification"
                 )
             }
+            VerifyError::MissingConfiguration(message) => write!(f, "{message}"),
             VerifyError::RejectedBySupabase => write!(f, "supabase rejected bearer token"),
             VerifyError::SupabaseStatus(status) => {
                 write!(f, "supabase auth returned unexpected status {status}")
