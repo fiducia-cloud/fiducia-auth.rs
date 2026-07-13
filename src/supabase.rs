@@ -157,6 +157,24 @@ async fn cached_jwks(config: &SupabaseConfig) -> Result<JwkSet, VerifyError> {
     refresh_jwks(config).await
 }
 
+/// Whether an unknown-`kid` miss may force a refetch: only when there is no
+/// cached set for this URL yet, or the cached set is older than the
+/// anti-amplification floor ([`MIN_FORCED_JWKS_REFRESH_SECS`]).
+async fn forced_refresh_allowed(config: &SupabaseConfig) -> bool {
+    let cache = JWKS_CACHE.get_or_init(|| async { RwLock::new(None) }).await;
+    let guard = cache.read().await;
+    match guard.as_ref() {
+        Some(cached) if cached.url == config.jwks_url => {
+            forced_refresh_cooldown_elapsed(cached.fetched_at.elapsed())
+        }
+        _ => true,
+    }
+}
+
+fn forced_refresh_cooldown_elapsed(cached_age: Duration) -> bool {
+    cached_age >= Duration::from_secs(MIN_FORCED_JWKS_REFRESH_SECS)
+}
+
 async fn refresh_jwks(config: &SupabaseConfig) -> Result<JwkSet, VerifyError> {
     let jwks = http_client()
         .await
