@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt;
+use thiserror::Error;
 
 use crate::model::{ApiKeyRecord, OrgId};
 
@@ -80,46 +80,26 @@ pub struct KvClient {
     http: reqwest::Client,
 }
 
-#[derive(Debug)]
-pub enum KvError {
-    Http(reqwest::Error),
-    Protocol(String),
-    Json(serde_json::Error),
-}
-
-impl fmt::Display for KvError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Http(error) => write!(formatter, "fiducia KV HTTP error: {error}"),
-            Self::Protocol(error) => write!(formatter, "fiducia KV protocol error: {error}"),
-            Self::Json(error) => write!(formatter, "fiducia KV JSON error: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for KvError {}
-
-impl From<reqwest::Error> for KvError {
-    fn from(error: reqwest::Error) -> Self {
-        Self::Http(error)
-    }
-}
-
-impl From<serde_json::Error> for KvError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Json(error)
-    }
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("FIDUCIA_KV_URL must be set")]
+    MissingUrl,
+    #[error("fiducia KV request failed: {0}")]
+    Transport(#[from] reqwest::Error),
+    #[error("fiducia KV returned HTTP {0}")]
+    Http(reqwest::StatusCode),
+    #[error("fiducia KV returned an invalid stored value")]
+    InvalidValue,
 }
 
 impl KvClient {
     /// Build from `FIDUCIA_KV_URL` (e.g. http://fiducia-node.fiducia.svc:8090).
-    /// Production auth requires an authoritative KV endpoint. Tests construct an
-    /// in-memory store directly and never call this initializer.
-    pub fn from_env() -> Result<Self, String> {
+    /// Production requires a durable Fiducia KV endpoint.
+    pub fn from_env() -> Result<Self, StoreError> {
         let base = std::env::var("FIDUCIA_KV_URL")
             .ok()
             .filter(|u| !u.trim().is_empty())
-            .ok_or_else(|| "FIDUCIA_KV_URL must be configured".to_string())?;
+            .ok_or(StoreError::MissingUrl)?;
         Ok(KvClient {
             base: base.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
@@ -127,44 +107,45 @@ impl KvClient {
     }
 
     /// GET /v1/kv?key=… → the stored value parsed back from its JSON string.
-    pub async fn get(&self, key: &str) -> Result<Option<Value>, KvError> {
+    pub async fn get(&self, key: &str) -> Result<Option<Value>, StoreError> {
         let resp = self
             .http
             .get(format!("{}/v1/kv", self.base))
             .query(&[("key", key)])
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        if !resp.status().is_success() {
+            return Err(StoreError::Http(resp.status()));
+        }
         let body: Value = resp.json().await?;
         match body.get("found").and_then(Value::as_bool) {
             Some(false) => return Ok(None),
             Some(true) => {}
-            None => {
-                return Err(KvError::Protocol(
-                    "response omitted found boolean".to_string(),
-                ))
-            }
+            None => return Err(StoreError::InvalidValue),
         }
         let raw = body
             .get("entry")
             .and_then(|entry| entry.get("value"))
             .and_then(Value::as_str)
-            .ok_or_else(|| KvError::Protocol("found response omitted entry.value".to_string()))?;
-        Ok(Some(serde_json::from_str(raw)?))
+            .ok_or(StoreError::InvalidValue)?;
+        Ok(Some(
+            serde_json::from_str(raw).map_err(|_| StoreError::InvalidValue)?,
+        ))
     }
 
-    /// PUT /v1/kv?key=… with the value as a JSON string. Success means the node
-    /// accepted the write; any transport or status failure is returned to the
-    /// caller so credentials cannot be issued before persistence.
-    pub async fn put(&self, key: &str, value: &Value) -> Result<(), KvError> {
+    /// PUT /v1/kv?key=… with the value as a JSON string. Returns commit success.
+    pub async fn put(&self, key: &str, value: &Value) -> Result<(), StoreError> {
         let body = serde_json::json!({ "value": value.to_string() });
-        self.http
+        let response = self
+            .http
             .put(format!("{}/v1/kv", self.base))
             .query(&[("key", key)])
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        if !response.status().is_success() {
+            return Err(StoreError::Http(response.status()));
+        }
         Ok(())
     }
 }

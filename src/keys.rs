@@ -18,7 +18,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::model::{ApiKeyMeta, ApiKeyRecord, Introspection, OrgId};
-use crate::store::{key_path, org_index_path, KvClient, KvError, StoredKey};
+use crate::store::{key_path, org_index_path, KvClient, StoreError, StoredKey};
 
 /// Default hot-cache TTL: how long a cached introspection result may be served
 /// before it must be re-read from the authoritative KV. Bounds how long a
@@ -41,8 +41,6 @@ impl CacheEntry {
 }
 
 /// Cache-aside key store: an in-memory hot cache fronts durable fiducia KV.
-/// Production construction requires `FIDUCIA_KV_URL`; the optional client exists
-/// only so isolated unit tests can exercise the cryptographic behavior.
 ///
 /// Cache entries carry a **TTL** (`FIDUCIA_KEY_CACHE_TTL_MS`, default
 /// [`DEFAULT_KEY_CACHE_TTL_MS`]). A hit within the TTL short-circuits (the hot
@@ -54,35 +52,6 @@ pub struct KeyStore {
     cache: Mutex<HashMap<String, CacheEntry>>, // key_id -> (record, inserted)
     kv: Option<KvClient>,
     ttl: Duration,
-}
-
-#[derive(Debug)]
-pub enum KeyStoreError {
-    Kv(KvError),
-    Serialization(serde_json::Error),
-}
-
-impl std::fmt::Display for KeyStoreError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Kv(error) => write!(formatter, "{error}"),
-            Self::Serialization(error) => write!(formatter, "key serialization failed: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for KeyStoreError {}
-
-impl From<KvError> for KeyStoreError {
-    fn from(error: KvError) -> Self {
-        Self::Kv(error)
-    }
-}
-
-impl From<serde_json::Error> for KeyStoreError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Serialization(error)
-    }
 }
 
 impl KeyStore {
@@ -106,9 +75,8 @@ impl KeyStore {
         }
     }
 
-    /// Construct the production store. Missing durable configuration is a
-    /// startup error rather than an implicit process-local credential database.
-    pub fn from_env() -> Result<Self, String> {
+    /// Construct the production store. Durable KV is mandatory.
+    pub fn from_env() -> Result<Self, StoreError> {
         Ok(KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: Some(KvClient::from_env()?),
@@ -135,7 +103,7 @@ impl KeyStore {
         name: String,
         scopes: Vec<String>,
         env: String,
-    ) -> Result<(String, ApiKeyMeta), KeyStoreError> {
+    ) -> Result<(String, ApiKeyMeta), StoreError> {
         let key_id = gen_id();
         let secret = gen_secret();
         let raw = format!("fdc_{env}_{key_id}.{secret}");
@@ -156,8 +124,11 @@ impl KeyStore {
         let meta: ApiKeyMeta = (&rec).into();
         if let Some(kv) = &self.kv {
             let stored: StoredKey = (&rec).into();
-            kv.put(&key_path(&key_id), &serde_json::to_value(&stored)?)
-                .await?;
+            kv.put(
+                &key_path(&key_id),
+                &serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?,
+            )
+            .await?;
             self.index_add(kv, &org_id, &key_id).await?;
         }
         self.cache
@@ -168,7 +139,7 @@ impl KeyStore {
     }
 
     /// List an org's keys (masked - never returns secrets).
-    pub async fn list(&self, org_id: &str) -> Result<Vec<ApiKeyMeta>, KeyStoreError> {
+    pub async fn list(&self, org_id: &str) -> Result<Vec<ApiKeyMeta>, StoreError> {
         if let Some(kv) = &self.kv {
             let mut out = Vec::new();
             for id in self.index_get(kv, org_id).await? {
@@ -192,14 +163,17 @@ impl KeyStore {
     }
 
     /// Revoke a key (must belong to the caller's org). Returns whether it matched.
-    pub async fn revoke(&self, org_id: &str, key_id: &str) -> Result<bool, KeyStoreError> {
+    pub async fn revoke(&self, org_id: &str, key_id: &str) -> Result<bool, StoreError> {
         if let Some(kv) = &self.kv {
             if let Some(mut rec) = self.load(kv, key_id).await? {
                 if rec.org_id == org_id {
                     rec.revoked = true;
                     let stored: StoredKey = (&rec).into();
-                    kv.put(&key_path(key_id), &serde_json::to_value(&stored)?)
-                        .await?;
+                    kv.put(
+                        &key_path(key_id),
+                        &serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?,
+                    )
+                    .await?;
                     self.cache
                         .lock()
                         .unwrap()
@@ -210,19 +184,19 @@ impl KeyStore {
             return Ok(false);
         }
         let mut cache = self.cache.lock().unwrap();
-        Ok(match cache.get_mut(key_id) {
+        match cache.get_mut(key_id) {
             Some(e) if e.record.org_id == org_id => {
                 e.record.revoked = true;
                 e.inserted = Instant::now();
-                true
+                Ok(true)
             }
-            _ => false,
-        })
+            _ => Ok(false),
+        }
     }
 
     /// Validate a raw API key -> org + scopes. Called by the edge/LB (and cached).
     /// Hot path: an in-memory cache hit avoids any KV round trip.
-    pub async fn introspect(&self, raw: &str) -> Result<Introspection, KeyStoreError> {
+    pub async fn introspect(&self, raw: &str) -> Result<Introspection, StoreError> {
         // Parse `fdc_<env>_<key_id>.<secret>`.
         let Some((left, secret)) = raw.split_once('.') else {
             return Ok(Introspection::invalid());
@@ -250,7 +224,7 @@ impl KeyStore {
             }
             return Ok(Introspection::invalid());
         }
-        // Test-only in-memory stores retain their local record past the TTL.
+        // Test-only stores have no KV and use their local map as the source.
         Ok(self
             .cache
             .lock()
@@ -272,31 +246,23 @@ impl KeyStore {
         Some(verify(&entry.record, secret))
     }
 
-    async fn load(
-        &self,
-        kv: &KvClient,
-        key_id: &str,
-    ) -> Result<Option<ApiKeyRecord>, KeyStoreError> {
+    async fn load(&self, kv: &KvClient, key_id: &str) -> Result<Option<ApiKeyRecord>, StoreError> {
         let Some(value) = kv.get(&key_path(key_id)).await? else {
             return Ok(None);
         };
-        let stored: StoredKey = serde_json::from_value(value)?;
+        let stored: StoredKey =
+            serde_json::from_value(value).map_err(|_| StoreError::InvalidValue)?;
         Ok(Some((&stored).into()))
     }
 
-    async fn index_get(&self, kv: &KvClient, org_id: &str) -> Result<Vec<String>, KeyStoreError> {
+    async fn index_get(&self, kv: &KvClient, org_id: &str) -> Result<Vec<String>, StoreError> {
         match kv.get(&org_index_path(org_id)).await? {
-            Some(value) => Ok(serde_json::from_value(value)?),
+            Some(value) => serde_json::from_value(value).map_err(|_| StoreError::InvalidValue),
             None => Ok(Vec::new()),
         }
     }
 
-    async fn index_add(
-        &self,
-        kv: &KvClient,
-        org_id: &str,
-        key_id: &str,
-    ) -> Result<(), KeyStoreError> {
+    async fn index_add(&self, kv: &KvClient, org_id: &str, key_id: &str) -> Result<(), StoreError> {
         let mut ids = self.index_get(kv, org_id).await?;
         if !ids.iter().any(|id| id == key_id) {
             ids.push(key_id.to_string());
