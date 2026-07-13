@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -20,11 +20,39 @@ use sha2::{Digest, Sha256};
 use crate::model::{ApiKeyMeta, ApiKeyRecord, Introspection, OrgId};
 use crate::store::{key_path, org_index_path, KvClient, StoredKey};
 
+/// Default hot-cache TTL: how long a cached introspection result may be served
+/// before it must be re-read from the authoritative KV. Bounds how long a
+/// *revocation issued on another replica* can go unseen here (see [`KeyStore`]).
+const DEFAULT_KEY_CACHE_TTL_MS: u64 = 30_000;
+
+/// A cached key record plus when it was cached, so entries can expire (TTL).
+struct CacheEntry {
+    record: ApiKeyRecord,
+    inserted: Instant,
+}
+
+impl CacheEntry {
+    fn now(record: ApiKeyRecord) -> Self {
+        CacheEntry {
+            record,
+            inserted: Instant::now(),
+        }
+    }
+}
+
 /// Cache-aside key store: an in-memory hot cache fronts durable fiducia KV. With
 /// no `FIDUCIA_KV_URL` configured it is purely in-memory (dev / tests).
+///
+/// Cache entries carry a **TTL** (`FIDUCIA_KEY_CACHE_TTL_MS`, default
+/// [`DEFAULT_KEY_CACHE_TTL_MS`]). A hit within the TTL short-circuits (the hot
+/// path, no round trip); an entry older than the TTL is a MISS, so `introspect`
+/// re-reads the authoritative KV and picks up revocations propagated from other
+/// replicas — without this, replica B would serve `valid:true` for a key revoked
+/// via replica A until it restarted.
 pub struct KeyStore {
-    cache: Mutex<HashMap<String, ApiKeyRecord>>, // key_id -> record
+    cache: Mutex<HashMap<String, CacheEntry>>, // key_id -> (record, inserted)
     kv: Option<KvClient>,
+    ttl: Duration,
 }
 
 impl KeyStore {
@@ -34,6 +62,17 @@ impl KeyStore {
         KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: None,
+            ttl: Duration::from_millis(DEFAULT_KEY_CACHE_TTL_MS),
+        }
+    }
+
+    /// In-memory only with an explicit cache TTL - tests.
+    #[cfg(test)]
+    pub fn with_ttl(ttl: Duration) -> Self {
+        KeyStore {
+            cache: Mutex::new(HashMap::new()),
+            kv: None,
+            ttl,
         }
     }
 
@@ -42,6 +81,19 @@ impl KeyStore {
         KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: KvClient::from_env(),
+            ttl: key_cache_ttl_from_env(),
+        }
+    }
+
+    /// Backdate a cached entry's insertion time so it reads as `age` old, to
+    /// exercise TTL expiry deterministically without sleeping.
+    #[cfg(test)]
+    fn test_age_entry(&self, key_id: &str, age: Duration) {
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(e) = cache.get_mut(key_id) {
+            e.inserted = Instant::now()
+                .checked_sub(age)
+                .expect("age within Instant range");
         }
     }
 
@@ -80,7 +132,7 @@ impl KeyStore {
             .await;
             self.index_add(kv, &org_id, &key_id).await;
         }
-        self.cache.lock().unwrap().insert(key_id, rec);
+        self.cache.lock().unwrap().insert(key_id, CacheEntry::now(rec));
         (raw, meta)
     }
 
@@ -101,6 +153,7 @@ impl KeyStore {
             .lock()
             .unwrap()
             .values()
+            .map(|e| &e.record)
             .filter(|r| r.org_id == org_id)
             .map(ApiKeyMeta::from)
             .collect()
@@ -118,7 +171,10 @@ impl KeyStore {
                         &serde_json::to_value(&stored).unwrap_or_default(),
                     )
                     .await;
-                    self.cache.lock().unwrap().insert(key_id.to_string(), rec);
+                    self.cache
+                        .lock()
+                        .unwrap()
+                        .insert(key_id.to_string(), CacheEntry::now(rec));
                     return true;
                 }
             }
@@ -126,8 +182,9 @@ impl KeyStore {
         }
         let mut cache = self.cache.lock().unwrap();
         match cache.get_mut(key_id) {
-            Some(r) if r.org_id == org_id => {
-                r.revoked = true;
+            Some(e) if e.record.org_id == org_id => {
+                e.record.revoked = true;
+                e.inserted = Instant::now();
                 true
             }
             _ => false,
@@ -145,25 +202,46 @@ impl KeyStore {
             return Introspection::invalid();
         };
 
+        // Hot path: a *fresh* cache hit (within the TTL) short-circuits with no
+        // round trip.
         if let Some(intro) = self.introspect_cached(key_id, secret) {
             return intro;
         }
+        // Miss, or an entry past its TTL: re-read the authoritative KV so a
+        // revocation issued on another replica is seen within the TTL, then
+        // refresh the entry.
         if let Some(kv) = &self.kv {
             if let Some(rec) = self.load(kv, key_id).await {
                 let intro = verify(&rec, secret);
-                self.cache.lock().unwrap().insert(key_id.to_string(), rec);
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .insert(key_id.to_string(), CacheEntry::now(rec));
                 return intro;
             }
         }
-        Introspection::invalid()
-    }
-
-    fn introspect_cached(&self, key_id: &str, secret: &str) -> Option<Introspection> {
+        // No durable KV to re-read (dev / single-process), or the KV no longer
+        // holds it: the local cache is the only source of truth, so honor a
+        // still-present entry even past its TTL rather than spuriously rejecting
+        // it. (Revocation still sets `revoked` on that entry, so it stays 401.)
         self.cache
             .lock()
             .unwrap()
             .get(key_id)
-            .map(|rec| verify(rec, secret))
+            .map(|e| verify(&e.record, secret))
+            .unwrap_or_else(Introspection::invalid)
+    }
+
+    /// Fresh cache hit only. An entry older than `ttl` is treated as a MISS
+    /// (returns `None`) so the caller re-reads the authoritative KV — this is how
+    /// a revocation from another replica propagates here within the TTL.
+    fn introspect_cached(&self, key_id: &str, secret: &str) -> Option<Introspection> {
+        let cache = self.cache.lock().unwrap();
+        let entry = cache.get(key_id)?;
+        if entry.inserted.elapsed() >= self.ttl {
+            return None;
+        }
+        Some(verify(&entry.record, secret))
     }
 
     async fn load(&self, kv: &KvClient, key_id: &str) -> Option<ApiKeyRecord> {
@@ -200,6 +278,16 @@ fn verify(rec: &ApiKeyRecord, secret: &str) -> Introspection {
     } else {
         Introspection::invalid()
     }
+}
+
+/// Hot-cache TTL from `FIDUCIA_KEY_CACHE_TTL_MS` (milliseconds), defaulting to
+/// [`DEFAULT_KEY_CACHE_TTL_MS`] when unset or unparseable.
+fn key_cache_ttl_from_env() -> Duration {
+    let ms = std::env::var("FIDUCIA_KEY_CACHE_TTL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_KEY_CACHE_TTL_MS);
+    Duration::from_millis(ms)
 }
 
 fn now_ms() -> u64 {
@@ -347,6 +435,50 @@ mod tests {
         assert!(
             !s.introspect(&raw).await.valid,
             "revoked key must be invalid"
+        );
+    }
+
+    #[test]
+    fn default_cache_ttl_is_the_safe_default() {
+        assert_eq!(
+            store().ttl,
+            Duration::from_millis(DEFAULT_KEY_CACHE_TTL_MS),
+            "unset FIDUCIA_KEY_CACHE_TTL_MS must fall back to the safe default"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cache_entry_past_its_ttl_is_a_miss_and_triggers_a_reread() {
+        // Tiny TTL so an aged entry is unambiguously stale.
+        let s = KeyStore::with_ttl(Duration::from_millis(50));
+        let (raw, meta) = s
+            .create("org_1".into(), "ci".into(), vec![], "live".into())
+            .await;
+        let key_id = meta.key_id.as_str();
+
+        // Split `fdc_<env>_<key_id>.<secret>` back into its pieces.
+        let (_left, secret) = raw.split_once('.').unwrap();
+
+        // Fresh: a hit within the TTL short-circuits (authoritative, still valid).
+        assert!(
+            s.introspect_cached(key_id, secret).is_some(),
+            "a fresh entry must short-circuit the hot path"
+        );
+
+        // Age the entry beyond the TTL: the cache layer now reports a MISS, which
+        // is what forces `introspect` to re-read the authoritative KV (and thus
+        // observe revocations propagated from another replica).
+        s.test_age_entry(key_id, Duration::from_millis(500));
+        assert!(
+            s.introspect_cached(key_id, secret).is_none(),
+            "an entry past its TTL must be a MISS so KV is re-read"
+        );
+
+        // No durable KV here, so `introspect` still honors the (only) local record
+        // rather than spuriously 401-ing a valid key — existing behavior preserved.
+        assert!(
+            s.introspect(&raw).await.valid,
+            "with no KV to re-read, a stale-but-valid key must stay valid"
         );
     }
 

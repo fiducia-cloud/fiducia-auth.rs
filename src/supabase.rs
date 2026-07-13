@@ -196,10 +196,11 @@ fn user_ctx_from_claims(
     Ok(UserCtx {
         user_id: claims.sub,
         email: claims.email,
-        orgs: orgs_from_metadata(
-            &[claims.app_metadata.as_ref(), claims.user_metadata.as_ref()],
-            config,
-        ),
+        // Org membership MUST come only from `app_metadata` (admin-controlled).
+        // `user_metadata` (raw_user_meta_data) is writable by the authenticated
+        // user via `auth.updateUser({ data })`, so trusting it for org claims
+        // would let any user assign themselves into a victim org (tenant takeover).
+        orgs: orgs_from_metadata(&[claims.app_metadata.as_ref()], config),
     })
 }
 
@@ -228,10 +229,9 @@ fn user_ctx_from_remote_user(
     Ok(UserCtx {
         user_id: user.id,
         email: user.email,
-        orgs: orgs_from_metadata(
-            &[user.app_metadata.as_ref(), user.user_metadata.as_ref()],
-            config,
-        ),
+        // Only admin-controlled `app_metadata` — never user-writable
+        // `user_metadata` — may grant org membership (see the note above).
+        orgs: orgs_from_metadata(&[user.app_metadata.as_ref()], config),
     })
 }
 
