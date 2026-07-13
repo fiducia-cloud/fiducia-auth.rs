@@ -189,6 +189,8 @@ fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> 
         return Err(VerifyError::InvalidToken("missing subject"));
     }
 
+    let orgs = orgs_from_metadata(&[claims.app_metadata.as_ref()]);
+    let roles = roles_from_metadata(&[claims.app_metadata.as_ref()]);
     Ok(UserCtx {
         user_id: claims.sub,
         email: claims.email,
@@ -196,7 +198,8 @@ fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> 
         // `user_metadata` (raw_user_meta_data) is writable by the authenticated
         // user via `auth.updateUser({ data })`, so trusting it for org claims
         // would let any user assign themselves into a victim org (tenant takeover).
-        orgs: orgs_from_metadata(&[claims.app_metadata.as_ref()]),
+        orgs,
+        roles,
     })
 }
 
@@ -222,12 +225,15 @@ fn user_ctx_from_remote_user(
         return Err(VerifyError::InvalidToken("missing user id"));
     }
 
+    let orgs = orgs_from_metadata(&[user.app_metadata.as_ref()]);
+    let roles = roles_from_metadata(&[user.app_metadata.as_ref()]);
     Ok(UserCtx {
         user_id: user.id,
         email: user.email,
         // Only admin-controlled `app_metadata` — never user-writable
         // `user_metadata` — may grant org membership (see the note above).
-        orgs: orgs_from_metadata(&[user.app_metadata.as_ref()]),
+        orgs,
+        roles,
     })
 }
 
@@ -268,6 +274,35 @@ fn push_org(orgs: &mut Vec<String>, org: &str) {
     let org = org.trim();
     if !org.is_empty() && !orgs.iter().any(|existing| existing == org) {
         orgs.push(org.to_string());
+    }
+}
+
+fn roles_from_metadata(values: &[Option<&Value>]) -> Vec<String> {
+    let mut roles = Vec::new();
+    for value in values.iter().flatten() {
+        for key in ["fiducia_roles", "roles"] {
+            if let Some(role_value) = value.get(key) {
+                push_role_value(&mut roles, role_value);
+            }
+        }
+    }
+    roles
+}
+
+fn push_role_value(roles: &mut Vec<String>, value: &Value) {
+    match value {
+        Value::String(role) => {
+            let role = role.trim().to_ascii_lowercase();
+            if !role.is_empty() && !roles.iter().any(|existing| existing == &role) {
+                roles.push(role);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                push_role_value(roles, value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -494,6 +529,22 @@ mod tests {
         assert_eq!(
             orgs_from_metadata(&[Some(&json!({ "name": "alex" }))]),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn roles_come_only_from_trusted_app_metadata_shape() {
+        let metadata = json!({
+            "fiducia_roles": ["Admin", "operator", "admin"],
+            "roles": "auditor"
+        });
+        assert_eq!(
+            roles_from_metadata(&[Some(&metadata)]),
+            vec![
+                "admin".to_string(),
+                "operator".to_string(),
+                "auditor".to_string()
+            ]
         );
     }
 

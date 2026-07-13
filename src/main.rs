@@ -1,7 +1,8 @@
 //! fiducia-auth — the auth server.
 //!
-//! Two planes, two credentials, and **neither hits Supabase (or the DB) on the
-//! hot path**:
+//! Two planes and two credentials. Human JWT verification avoids Supabase on
+//! the normal path; API-key introspection reads authoritative Fiducia KV so
+//! rotations and revocations are visible across auth replicas:
 //!
 //!   * **Dashboard (humans):** Supabase Auth issues a session JWT. We verify it
 //!     **offline** with Supabase's cached JWKS (only the dashboard/control plane;
@@ -25,7 +26,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -42,6 +43,10 @@ use keys::KeyStore;
 use model::{CreateKeyBody, IntrospectBody, TokenBody, UserCtx};
 
 const SERVICE: &str = "fiducia-auth";
+/// Default positive-introspection cache bound used by the current edge/LB.
+/// Deployments that raise a consumer cache TTL must raise
+/// `FIDUCIA_ROTATION_OVERLAP_SECONDS` to the same maximum.
+const DEFAULT_ROTATION_OVERLAP_SECONDS: u64 = 60;
 const ALLOWED_API_KEY_SCOPES: &[&str] = &[
     "requests:read",
     "requests:write",
@@ -57,7 +62,6 @@ const ALLOWED_API_KEY_SCOPES: &[&str] = &[
     "cron:write",
     "rate-limit:read",
     "rate-limit:write",
-    "admin:read",
 ];
 
 /// Reject any request whose handler runs longer than this (slow-loris / hung
@@ -100,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/me", get(me))
         .route("/v1/keys", post(create_key).get(list_keys))
         .route("/v1/keys/:key_id", axum::routing::delete(revoke_key))
+        .route("/v1/keys/:key_id/rotate", post(rotate_key))
         .route("/v1/orgs/:org_id", get(get_org))
         // Data plane (called by the edge/LB; should be internal-only / mTLS).
         .route("/v1/introspect", post(introspect))
@@ -153,10 +158,41 @@ fn unauthorized(msg: &str) -> Response {
         .into_response()
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct OrgQuery {
+    #[serde(default)]
+    org_id: Option<String>,
+}
+
+#[allow(clippy::result_large_err)]
+fn select_user_org(user: &UserCtx, requested: Option<&str>) -> Result<String, Response> {
+    if let Some(org_id) = requested.map(str::trim).filter(|value| !value.is_empty()) {
+        if user.orgs.iter().any(|allowed| allowed == org_id) {
+            return Ok(org_id.to_string());
+        }
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "forbidden_org", "org_id": org_id })),
+        )
+            .into_response());
+    }
+
+    match user.orgs.as_slice() {
+        [] => Err((StatusCode::FORBIDDEN, Json(json!({ "error": "no_org" }))).into_response()),
+        [org_id] => Ok(org_id.clone()),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "org_id_required" })),
+        )
+            .into_response()),
+    }
+}
+
 struct KeyCreateInput {
     name: String,
     scopes: Vec<String>,
     env: String,
+    require_idempotency: bool,
 }
 
 fn validated_key_create_input(body: CreateKeyBody) -> Result<KeyCreateInput, &'static str> {
@@ -191,7 +227,12 @@ fn validated_key_create_input(body: CreateKeyBody) -> Result<KeyCreateInput, &'s
         scopes.push("requests:write".to_string());
     }
 
-    Ok(KeyCreateInput { name, scopes, env })
+    Ok(KeyCreateInput {
+        name,
+        scopes,
+        env,
+        require_idempotency: body.require_idempotency,
+    })
 }
 
 fn bad_key_request(error: &str) -> Response {
@@ -265,43 +306,88 @@ async fn create_key(
         Ok(u) => u,
         Err(e) => return e,
     };
-    let Some(org) = body.org_id.clone().or_else(|| user.orgs.first().cloned()) else {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            Json(json!({ "error": "no_org" })),
-        )
-            .into_response();
+    let org = match select_user_org(&user, body.org_id.as_deref()) {
+        Ok(org) => org,
+        Err(response) => return response,
     };
-    if !user.orgs.iter().any(|allowed| allowed == &org) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "forbidden_org", "org_id": org })),
-        )
-            .into_response();
-    }
     let input = match validated_key_create_input(body) {
         Ok(input) => input,
         Err(error) => return bad_key_request(error),
     };
     let (raw, meta) = match s
         .keys
-        .create(org, input.name, input.scopes, input.env)
+        .create(
+            org,
+            input.name,
+            input.scopes,
+            input.env,
+            input.require_idempotency,
+        )
         .await
     {
         Ok(created) => created,
         Err(error) => return storage_unavailable(&error),
     };
-    // The only time the raw key is ever returned.
+    // This raw value is returned only in the response that minted it.
     Json(json!({ "api_key": raw, "key": meta })).into_response()
 }
 
-/// `GET /v1/keys` — list the caller org's keys (masked).
-async fn list_keys(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+/// `POST /v1/keys/{key_id}/rotate` — replace the authoritative secret and return
+/// the raw replacement only once. The response reports the configured bound for
+/// already-cached positive introspection decisions at edge/LB consumers.
+async fn rotate_key(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(key_id): Path<String>,
+    Query(query): Query<OrgQuery>,
+) -> Response {
     let user = match require_user(&headers).await {
         Ok(u) => u,
         Err(e) => return e,
     };
-    let org = user.orgs.first().cloned().unwrap_or_default();
+    let org = match select_user_org(&user, query.org_id.as_deref()) {
+        Ok(org) => org,
+        Err(response) => return response,
+    };
+    match s.keys.rotate(&org, &key_id).await {
+        Ok(Some((raw, meta))) => Json(json!({
+            "ok": true,
+            "api_key": raw,
+            "key": meta,
+            "secret_once": true,
+            "overlap_seconds": rotation_overlap_seconds(),
+        }))
+        .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": "key_not_found" })),
+        )
+            .into_response(),
+        Err(error) => storage_unavailable(&error),
+    }
+}
+
+fn rotation_overlap_seconds() -> u64 {
+    std::env::var("FIDUCIA_ROTATION_OVERLAP_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_ROTATION_OVERLAP_SECONDS)
+}
+
+/// `GET /v1/keys` — list the caller org's keys (masked).
+async fn list_keys(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<OrgQuery>,
+) -> Response {
+    let user = match require_user(&headers).await {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
+    let org = match select_user_org(&user, query.org_id.as_deref()) {
+        Ok(org) => org,
+        Err(response) => return response,
+    };
     match s.keys.list(&org).await {
         Ok(keys) => Json(json!({ "keys": keys })).into_response(),
         Err(error) => storage_unavailable(&error),
@@ -313,12 +399,16 @@ async fn revoke_key(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(key_id): Path<String>,
+    Query(query): Query<OrgQuery>,
 ) -> Response {
     let user = match require_user(&headers).await {
         Ok(u) => u,
         Err(e) => return e,
     };
-    let org = user.orgs.first().cloned().unwrap_or_default();
+    let org = match select_user_org(&user, query.org_id.as_deref()) {
+        Ok(org) => org,
+        Err(response) => return response,
+    };
     match s.keys.revoke(&org, &key_id).await {
         Ok(revoked) => Json(json!({ "revoked": revoked })).into_response(),
         Err(error) => storage_unavailable(&error),
@@ -427,22 +517,26 @@ mod interface_contract_tests {
                 "".to_string(),
             ],
             env: None,
+            require_idempotency: true,
         })
         .expect("valid input");
 
         assert_eq!(input.name, "production");
         assert_eq!(input.env, "live");
         assert_eq!(input.scopes, vec!["kv:read".to_string()]);
+        assert!(input.require_idempotency);
 
         let defaulted = validated_key_create_input(CreateKeyBody {
             name: "worker".to_string(),
             org_id: None,
             scopes: vec![],
             env: Some("test".to_string()),
+            require_idempotency: false,
         })
         .expect("valid input");
         assert_eq!(defaulted.scopes, vec!["requests:write".to_string()]);
         assert_eq!(defaulted.env, "test");
+        assert!(!defaulted.require_idempotency);
     }
 
     #[test]
@@ -452,6 +546,7 @@ mod interface_contract_tests {
             org_id: None,
             scopes: vec!["kv:read".to_string()],
             env: None,
+            require_idempotency: true,
         })
         .is_err());
         assert!(validated_key_create_input(CreateKeyBody {
@@ -459,6 +554,7 @@ mod interface_contract_tests {
             org_id: None,
             scopes: vec!["kv:read".to_string()],
             env: Some("prod".to_string()),
+            require_idempotency: true,
         })
         .is_err());
         assert!(validated_key_create_input(CreateKeyBody {
@@ -466,7 +562,20 @@ mod interface_contract_tests {
             org_id: None,
             scopes: vec!["*".to_string()],
             env: None,
+            require_idempotency: true,
         })
         .is_err());
+    }
+
+    #[test]
+    fn key_request_defaults_idempotency_to_true() {
+        let body: CreateKeyBody = serde_json::from_value(serde_json::json!({
+            "name": "worker",
+            "org_id": "org_1",
+            "scopes": ["requests:write"],
+            "env": "live"
+        }))
+        .unwrap();
+        assert!(body.require_idempotency);
     }
 }
