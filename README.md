@@ -83,6 +83,17 @@ cargo run    # :8097 (override PORT)
 curl localhost:8097/healthz
 ```
 
+For audited CLI-to-environment mapping, build the pinned parser and launch the
+service through the wrapper:
+
+```bash
+make -B -C vendor/flags-2-env all
+scripts/with-flags2env.sh --port=8097 --kv-url=http://localhost:8090 -- cargo run --locked
+```
+
+Secrets and signing material are intentionally environment-only and are not
+accepted as command-line flags.
+
 Env:
 
 - `SUPABASE_URL`

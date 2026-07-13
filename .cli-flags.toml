@@ -1,0 +1,60 @@
+# Non-secret command-line configuration for fiducia-auth. Keys and signing
+# material remain environment-only and are deliberately not accepted as flags.
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-auth.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[env]
+ignore = ["FIDUCIA_INTROSPECT_SECRET", "FIDUCIA_JWT_SIGNING_KEY", "SUPABASE_SERVICE_ROLE_KEY"]
+
+[flags.port]
+env = "PORT"
+aliases = ["port"]
+short = "p"
+type = "integer"
+help = "HTTP listen port."
+
+[flags.kv-url]
+env = "FIDUCIA_KV_URL"
+aliases = ["kv-url"]
+type = "string"
+help = "Durable Fiducia KV endpoint for API keys."
+
+[flags.key-cache-ttl-ms]
+env = "FIDUCIA_KEY_CACHE_TTL_MS"
+aliases = ["key-cache-ttl-ms"]
+type = "integer"
+help = "API-key cache lifetime in milliseconds."
+
+[flags.jwt-issuer]
+env = "FIDUCIA_JWT_ISSUER"
+aliases = ["jwt-issuer"]
+type = "string"
+help = "JWT issuer claim."
+
+[flags.jwt-audience]
+env = "FIDUCIA_JWT_AUDIENCE"
+aliases = ["jwt-audience"]
+type = "string"
+help = "JWT audience claim."
+
+[flags.supabase-url]
+env = "SUPABASE_URL"
+aliases = ["supabase-url"]
+type = "string"
+help = "Optional Supabase project URL."
+
+[flags.supabase-sync-interval-secs]
+env = "SUPABASE_SYNC_INTERVAL_SECS"
+aliases = ["supabase-sync-interval-secs"]
+type = "integer"
+help = "Supabase synchronization interval in seconds."
+
+[flags.log]
+env = "RUST_LOG"
+aliases = ["log"]
+type = "string"
+help = "Rust tracing filter."
