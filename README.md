@@ -182,7 +182,6 @@ Hardening in place:
 - **Constant-time** comparison of both the API-key secret hash (`keys.rs`) and the
   internal `x-server-auth` secret (`main.rs`), so neither leaks byte-by-byte under
   timing probes.
-<<<<<<< Updated upstream
 - **Two data-plane endpoints, two threat models.** `POST /v1/introspect` is a
   server-to-server oracle — it reports validity/scopes for *any* key the caller
   submits, including keys the caller does not hold — so it is internal-only and
@@ -195,12 +194,8 @@ Hardening in place:
   offline-verifiable JWT never hold the internal secret, so gating `/v1/token`
   would break the exchange without adding protection — a caller lacking a valid
   key already learns nothing from it.
-- Only a **SHA-256 hash** of a 256-bit API-key secret is ever stored; the raw key
-  is returned exactly once.
-=======
 - Only a **SHA-256 hash** of a 256-bit API-key secret is ever stored; each raw key
   is returned only by the create/rotate response that minted it.
->>>>>>> Stashed changes
 - **Fail-fast startup**: missing `FIDUCIA_JWT_SIGNING_KEY`,
   `FIDUCIA_INTROSPECT_SECRET`, `FIDUCIA_KV_URL`, `SUPABASE_URL`, or
   `SUPABASE_SERVICE_ROLE_KEY` aborts boot; the org cache completes one sync before
