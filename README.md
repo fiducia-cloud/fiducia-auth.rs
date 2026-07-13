@@ -1,8 +1,10 @@
 # fiducia-auth
 
 The auth server for [fiducia.cloud](https://fiducia.cloud). It authenticates two
-very different callers — and **neither hits Supabase (or the DB) on the hot
-path**. Routing, Supabase Auth verification, and the API-key store are real;
+very different callers. Human JWT verification avoids Supabase on the normal
+path; API-key introspection reads authoritative Fiducia KV so rotations and
+revocations are visible across auth replicas. Routing, Supabase Auth
+verification, and the API-key store are real;
 API-key records are durable in Fiducia KV and JWT signing is env-backed.
 Supabase remains the
 source of truth for human identity and org membership.
@@ -42,9 +44,10 @@ validation/caching and attaches a verified identity inward.
 | Route | Caller | Purpose |
 |-------|--------|---------|
 | `GET /v1/me` | dashboard (Supabase JWT) | return the authenticated Supabase user context |
-| `POST /v1/keys` | dashboard (Supabase JWT) | create a key (raw shown **once**) |
-| `GET /v1/keys` | dashboard | list keys (masked) |
-| `DELETE /v1/keys/{id}` | dashboard | revoke |
+| `POST /v1/keys` | customer app/BFF (Supabase JWT) | create a key (raw shown **once**) |
+| `GET /v1/keys?org_id={org}` | customer app/BFF | list one authorized org's keys (masked) |
+| `POST /v1/keys/{id}/rotate?org_id={org}` | customer app/BFF | replace the authoritative secret and report bounded consumer-cache overlap (raw shown **once**) |
+| `DELETE /v1/keys/{id}?org_id={org}` | customer app/BFF | revoke |
 | `POST /v1/introspect` | edge/LB (internal) | validate key → org + scopes (cache this); **requires `x-server-auth`** |
 | `POST /v1/token` | any valid API-key holder (public) | exchange key → short-lived JWT; authenticated by the key itself, **no `x-server-auth`** |
 | `GET /.well-known/jwks.json` | anyone | public keys for offline JWT verify |
@@ -52,16 +55,25 @@ validation/caching and attaches a verified identity inward.
 
 ## Storage & secrets
 
-- Only a **hash** of the key secret is stored; the raw key is returned exactly
-  once at creation. Secrets are 256-bit random values, so SHA-256 plus
-  constant-time comparison is sufficient for introspection.
+- `fiducia-auth` is the sole customer API-key authority. Only a **hash** of the
+  key secret is stored; a raw key is returned only by the create/rotate response
+  that minted it. Secrets are 256-bit random values, so SHA-256 plus constant-time
+  comparison is sufficient for introspection.
+- Public key metadata carries a durable monotonic `version`. Rotation replaces
+  the authoritative secret immediately and advances the version; the response's
+  `overlap_seconds` reports how long an already-cached positive edge/LB decision
+  may remain valid. Revocation advances the version only on the first
+  active-to-revoked transition.
+- Customer-created keys default to `require_idempotency: true`; durable records
+  written before that field existed remain backward-compatible as `false`.
 - Keys are scoped to an **org** and may be narrowed to a **project**; dashboard
   ops require a Supabase session whose user has the right org/project role.
 - API keys persist in the Fiducia KV endpoint selected by `FIDUCIA_KV_URL`.
   Startup fails if durable KV is not configured or cannot be used by a request.
-- Source of truth: **Supabase** for human login identity and org membership.
-  `fiducia-auth` materializes the hot API-key state locally so edge/LB calls
-  stay private and fast.
+- Source of truth: **Supabase** for human login identity and org membership,
+  and Fiducia KV for API-key hashes and versions. Auth replicas read KV for
+  each introspection request; edge/LB consumers may keep a bounded positive
+  decision cache whose maximum TTL is reported by rotation.
 - API-key introspection returns `{org, project?, scopes}` for the edge/LB to
   cache. Serious B2B deployments can require both the API key and a registered
   client certificate fingerprint.
@@ -72,7 +84,7 @@ validation/caching and attaches a verified identity inward.
 |------|----------------|
 | `src/main.rs` | axum wiring, dashboard-vs-internal routes, Supabase-session guard |
 | `src/supabase.rs` | verify Supabase session JWT (offline via cached JWKS) |
-| `src/keys.rs` | API key create/list/revoke + **introspect** (hashed store) |
+| `src/keys.rs` | API key create/list/rotate/revoke + **introspect** (hashed store) |
 | `src/token.rs` | mint short-lived JWT + publish JWKS |
 | `src/model.rs` | domain types |
 
@@ -83,8 +95,12 @@ cargo run    # :8097 (override PORT)
 curl localhost:8097/healthz
 ```
 
-Organization access comes only from Supabase `app_metadata`; user-editable
-metadata and a synthetic default organization are never trusted.
+Organization access and application roles come only from Supabase
+`app_metadata`; user-editable metadata and a synthetic default organization are
+never trusted. Operator accounts carry `admin` or `operator` in
+`app_metadata.fiducia_roles` (or `app_metadata.roles`). `GET /v1/me` returns
+those trusted roles so separately deployed applications can authorize their own
+surface without maintaining email-based role lists.
 
 ## Configuration
 
@@ -99,7 +115,7 @@ traffic with a half-initialized identity.
 | `PORT` | integer | no | HTTP listen port | `8097` |
 | `FIDUCIA_JWT_SIGNING_KEY` | string (PEM) | **yes** | PKCS#8 EC P-256 private key that signs fiducia JWTs; shared across replicas via a k8s secret | — (required) |
 | `FIDUCIA_KV_URL` | string (URL) | no | Durable fiducia KV endpoint backing the API-key store | — (required) |
-| `FIDUCIA_KEY_CACHE_TTL_MS` | integer | no | Introspection hot-cache TTL in ms (bounds cross-replica revocation lag) | `30000` |
+| `FIDUCIA_ROTATION_OVERLAP_SECONDS` | integer | no | Maximum positive-introspection cache TTL across edge/LB consumers; reported to clients after rotation | `60` |
 | `FIDUCIA_INTROSPECT_SECRET` | string | **yes** | `x-server-auth` shared secret required on the internal `POST /v1/introspect` route | — (required) |
 | `SUPABASE_URL` | string (URL) | no | Supabase project URL — the system of record for org membership | derived from project ref |
 | `SUPABASE_SERVICE_ROLE_KEY` | string | **yes** | Supabase service-role key used by the required org sync | — (required) |
@@ -138,7 +154,9 @@ is verified, so treat it deliberately:
 There is **no** flag that disables authentication, accepts unsigned tokens, or
 grants a synthetic "all orgs" identity. Org access is derived solely from
 admin-controlled Supabase `app_metadata`; user-writable `user_metadata` is never
-trusted for org membership.
+trusted for org membership or operator roles. API-key scopes intentionally do
+not include admin-dashboard permissions; human operator access is a verified
+Supabase role, never a customer-minted key scope.
 
 ## CLI flags → env (flags-2-env)
 
@@ -164,6 +182,7 @@ Hardening in place:
 - **Constant-time** comparison of both the API-key secret hash (`keys.rs`) and the
   internal `x-server-auth` secret (`main.rs`), so neither leaks byte-by-byte under
   timing probes.
+<<<<<<< Updated upstream
 - **Two data-plane endpoints, two threat models.** `POST /v1/introspect` is a
   server-to-server oracle — it reports validity/scopes for *any* key the caller
   submits, including keys the caller does not hold — so it is internal-only and
@@ -178,6 +197,10 @@ Hardening in place:
   key already learns nothing from it.
 - Only a **SHA-256 hash** of a 256-bit API-key secret is ever stored; the raw key
   is returned exactly once.
+=======
+- Only a **SHA-256 hash** of a 256-bit API-key secret is ever stored; each raw key
+  is returned only by the create/rotate response that minted it.
+>>>>>>> Stashed changes
 - **Fail-fast startup**: missing `FIDUCIA_JWT_SIGNING_KEY`,
   `FIDUCIA_INTROSPECT_SECRET`, `FIDUCIA_KV_URL`, `SUPABASE_URL`, or
   `SUPABASE_SERVICE_ROLE_KEY` aborts boot; the org cache completes one sync before
