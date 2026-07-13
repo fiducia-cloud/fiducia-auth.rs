@@ -55,19 +55,16 @@ static SIGNER: Lazy<Signer> = Lazy::new(Signer::load);
 
 impl Signer {
     /// Load the signing key from `FIDUCIA_JWT_SIGNING_KEY` (PKCS#8 EC P-256 PEM,
-    /// shared across replicas via a k8s secret). With no env key we generate an
-    /// EPHEMERAL one - fine for a single dev pod, but multi-replica MUST share a
-    /// key or each pod publishes a different JWKS and cross-pod verification fails.
+    /// shared across replicas via a k8s secret). Production refuses to start
+    /// without it; only unit tests may generate an ephemeral signer.
     fn load() -> Self {
         let secret = match std::env::var("FIDUCIA_JWT_SIGNING_KEY") {
             Ok(pem) if !pem.trim().is_empty() => SecretKey::from_pkcs8_pem(pem.trim())
                 .expect("FIDUCIA_JWT_SIGNING_KEY must be a PKCS#8 EC (P-256) private key PEM"),
-            _ => {
-                tracing::warn!(
-                    "FIDUCIA_JWT_SIGNING_KEY not set - generating an EPHEMERAL ES256 key (OK for a single dev pod; provide a shared key for multi-replica)"
-                );
-                generate_secret()
-            }
+            #[cfg(test)]
+            _ => generate_secret(),
+            #[cfg(not(test))]
+            _ => panic!("FIDUCIA_JWT_SIGNING_KEY must be set; ephemeral production JWT signers are forbidden"),
         };
         Self::from_secret(&secret)
     }
@@ -118,6 +115,12 @@ impl Signer {
     }
 }
 
+/// Force signer initialization during startup so missing/invalid shared key
+/// configuration fails before the service begins accepting requests.
+pub fn ensure_configured() {
+    Lazy::force(&SIGNER);
+}
+
 /// Mint a short-lived JWT for an introspected key/session.
 pub fn mint_token(org_id: &OrgId, scopes: &[String], ttl_secs: u64) -> String {
     mint_with(&SIGNER, org_id, scopes, ttl_secs)
@@ -153,6 +156,7 @@ fn verify_with(signer: &Signer, token: &str) -> Option<Claims> {
         .map(|data| data.claims)
 }
 
+#[cfg(test)]
 fn generate_secret() -> SecretKey {
     // Use the OS CSPRNG directly (no extra rng dep); reject the negligible chance
     // of an out-of-range scalar and retry.
