@@ -25,6 +25,7 @@ impl OrgCache {
         self.orgs.read().await.get(org_id).cloned()
     }
 
+    #[cfg(test)]
     pub async fn len(&self) -> usize {
         self.orgs.read().await.len()
     }

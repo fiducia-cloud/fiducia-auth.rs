@@ -164,6 +164,7 @@ fn verify_with(signer: &Signer, token: &str) -> Option<Claims> {
         .map(|data| data.claims)
 }
 
+#[cfg(test)]
 fn generate_secret() -> SecretKey {
     // Use the OS CSPRNG directly (no extra rng dep); reject the negligible chance
     // of an out-of-range scalar and retry.
