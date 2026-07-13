@@ -69,20 +69,28 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 struct AppState {
     keys: KeyStore,
     orgs: Arc<sync::OrgCache>,
+    introspect_secret: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
-    // Supabase is the durable system of record; sync org/plan data into a fast
-    // in-cluster cache so the hot path never calls it. No-op without Supabase env.
+    token::validate_config().map_err(std::io::Error::other)?;
+    let introspect_secret = required_env("FIDUCIA_INTROSPECT_SECRET")?;
+    let keys = KeyStore::from_env().map_err(std::io::Error::other)?;
+
+    // Supabase is the durable system of record; complete one initial sync before
+    // accepting traffic so an empty cache cannot impersonate real org state.
     let orgs = Arc::new(sync::OrgCache::default());
-    sync::spawn(orgs.clone());
+    sync::start(orgs.clone())
+        .await
+        .map_err(std::io::Error::other)?;
 
     let state = Arc::new(AppState {
-        keys: KeyStore::from_env(),
+        keys,
         orgs,
+        introspect_secret,
     });
 
     let app = Router::new()
@@ -190,6 +198,22 @@ fn bad_key_request(error: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
 }
 
+fn storage_unavailable(error: &dyn std::fmt::Display) -> Response {
+    tracing::error!(error = %error, "auth storage operation failed");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "storage_unavailable" })),
+    )
+        .into_response()
+}
+
+fn required_env(name: &str) -> Result<String, std::io::Error> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| std::io::Error::other(format!("{name} must be configured")))
+}
+
 // --- dashboard handlers ---
 
 /// `GET /v1/me` — return the Supabase-authenticated dashboard identity.
@@ -219,7 +243,9 @@ async fn get_org(
             .into_response();
     }
     match s.orgs.get(&org_id).await {
-        Some(org) => Json(json!({ "org_id": org_id, "org": org, "source": "synced-cache" })).into_response(),
+        Some(org) => {
+            Json(json!({ "org_id": org_id, "org": org, "source": "synced-cache" })).into_response()
+        }
         None => (
             axum::http::StatusCode::NOT_FOUND,
             Json(json!({ "error": "not_found", "org_id": org_id })),
@@ -257,10 +283,14 @@ async fn create_key(
         Ok(input) => input,
         Err(error) => return bad_key_request(error),
     };
-    let (raw, meta) = s
+    let (raw, meta) = match s
         .keys
         .create(org, input.name, input.scopes, input.env)
-        .await;
+        .await
+    {
+        Ok(created) => created,
+        Err(error) => return storage_unavailable(&error),
+    };
     // The only time the raw key is ever returned.
     Json(json!({ "api_key": raw, "key": meta })).into_response()
 }
@@ -272,7 +302,10 @@ async fn list_keys(State(s): State<Arc<AppState>>, headers: HeaderMap) -> Respon
         Err(e) => return e,
     };
     let org = user.orgs.first().cloned().unwrap_or_default();
-    Json(json!({ "keys": s.keys.list(&org).await })).into_response()
+    match s.keys.list(&org).await {
+        Ok(keys) => Json(json!({ "keys": keys })).into_response(),
+        Err(error) => storage_unavailable(&error),
+    }
 }
 
 /// `DELETE /v1/keys/{key_id}` — revoke a key the caller's org owns.
@@ -286,28 +319,37 @@ async fn revoke_key(
         Err(e) => return e,
     };
     let org = user.orgs.first().cloned().unwrap_or_default();
-    Json(json!({ "revoked": s.keys.revoke(&org, &key_id).await })).into_response()
+    match s.keys.revoke(&org, &key_id).await {
+        Ok(revoked) => Json(json!({ "revoked": revoked })).into_response(),
+        Err(error) => storage_unavailable(&error),
+    }
 }
 
 // --- data-plane handlers (edge/LB) ---
 
 /// `POST /v1/introspect` — validate an API key → org + scopes. The edge/LB caches
-/// this. Set `FIDUCIA_INTROSPECT_SECRET` to require `x-server-auth` on this
-/// internal endpoint.
+/// this. `FIDUCIA_INTROSPECT_SECRET` is required at startup and supplied via
+/// `x-server-auth` on this internal endpoint.
 async fn introspect(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<IntrospectBody>,
 ) -> Response {
-    if !internal_secret_authorized(&headers) {
+    if !internal_secret_authorized(&headers, &s.introspect_secret) {
         return unauthorized("missing or invalid internal auth");
     }
-    Json(json!(s.keys.introspect(&body.api_key).await)).into_response()
+    match s.keys.introspect(&body.api_key).await {
+        Ok(result) => Json(json!(result)).into_response(),
+        Err(error) => storage_unavailable(&error),
+    }
 }
 
 /// `POST /v1/token` — exchange an API key for a short-lived JWT (offline-verifiable).
 async fn exchange_token(State(s): State<Arc<AppState>>, Json(body): Json<TokenBody>) -> Response {
-    let intro = s.keys.introspect(&body.api_key).await;
+    let intro = match s.keys.introspect(&body.api_key).await {
+        Ok(result) => result,
+        Err(error) => return storage_unavailable(&error),
+    };
     if !intro.valid {
         return unauthorized("invalid api key");
     }
@@ -316,13 +358,7 @@ async fn exchange_token(State(s): State<Arc<AppState>>, Json(body): Json<TokenBo
     Json(json!({ "token": jwt, "token_type": "Bearer", "expires_in": 900 })).into_response()
 }
 
-fn internal_secret_authorized(headers: &HeaderMap) -> bool {
-    let Some(expected) = std::env::var("FIDUCIA_INTROSPECT_SECRET")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return true;
-    };
+fn internal_secret_authorized(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get("x-server-auth")
         .and_then(|value| value.to_str().ok())

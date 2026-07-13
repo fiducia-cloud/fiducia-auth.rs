@@ -25,7 +25,6 @@ use crate::model::UserCtx;
 
 const DEFAULT_PROJECT_REF: &str = "ruxctrzdvugxztbjcpoi";
 const DEFAULT_AUDIENCE: &str = "authenticated";
-const DEFAULT_ORG_ID: &str = "fiducia-cloud";
 const DEFAULT_JWKS_TTL_SECS: u64 = 10 * 60;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 5;
 
@@ -95,7 +94,7 @@ async fn verify_with_jwks(
 
     let token =
         decode::<SupabaseClaims>(jwt, &decoding_key, &validation).map_err(VerifyError::Jwt)?;
-    user_ctx_from_claims(token.claims, config)
+    user_ctx_from_claims(token.claims)
 }
 
 async fn verify_with_user_endpoint(
@@ -182,10 +181,7 @@ async fn http_client() -> &'static reqwest::Client {
         .await
 }
 
-fn user_ctx_from_claims(
-    claims: SupabaseClaims,
-    config: &SupabaseConfig,
-) -> Result<UserCtx, VerifyError> {
+fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> {
     if claims.role.as_deref() != Some(DEFAULT_AUDIENCE) {
         return Err(VerifyError::UnexpectedRole(claims.role));
     }
@@ -200,7 +196,7 @@ fn user_ctx_from_claims(
         // `user_metadata` (raw_user_meta_data) is writable by the authenticated
         // user via `auth.updateUser({ data })`, so trusting it for org claims
         // would let any user assign themselves into a victim org (tenant takeover).
-        orgs: orgs_from_metadata(&[claims.app_metadata.as_ref()], config),
+        orgs: orgs_from_metadata(&[claims.app_metadata.as_ref()]),
     })
 }
 
@@ -231,11 +227,11 @@ fn user_ctx_from_remote_user(
         email: user.email,
         // Only admin-controlled `app_metadata` — never user-writable
         // `user_metadata` — may grant org membership (see the note above).
-        orgs: orgs_from_metadata(&[user.app_metadata.as_ref()], config),
+        orgs: orgs_from_metadata(&[user.app_metadata.as_ref()]),
     })
 }
 
-fn orgs_from_metadata(values: &[Option<&Value>], config: &SupabaseConfig) -> Vec<String> {
+fn orgs_from_metadata(values: &[Option<&Value>]) -> Vec<String> {
     let mut orgs = Vec::new();
     for value in values.iter().flatten() {
         for key in [
@@ -253,9 +249,6 @@ fn orgs_from_metadata(values: &[Option<&Value>], config: &SupabaseConfig) -> Vec
         }
     }
 
-    if orgs.is_empty() {
-        orgs.push(config.default_org_id.clone());
-    }
     orgs
 }
 
@@ -303,7 +296,6 @@ fn is_asymmetric_algorithm(alg: Algorithm) -> bool {
 #[derive(Debug, Clone)]
 struct SupabaseConfig {
     audience: String,
-    default_org_id: String,
     issuer: String,
     jwks_ttl: Duration,
     jwks_url: String,
@@ -329,8 +321,6 @@ impl SupabaseConfig {
         SupabaseConfig {
             audience: env_value("SUPABASE_AUTH_AUDIENCE")
                 .unwrap_or_else(|| DEFAULT_AUDIENCE.to_string()),
-            default_org_id: env_value("FIDUCIA_DEFAULT_ORG_ID")
-                .unwrap_or_else(|| DEFAULT_ORG_ID.to_string()),
             issuer,
             jwks_ttl: Duration::from_secs(
                 env_value("SUPABASE_AUTH_JWKS_TTL_SECS")
@@ -350,7 +340,6 @@ impl SupabaseConfig {
         let issuer = format!("{url}/auth/v1");
         SupabaseConfig {
             audience: DEFAULT_AUDIENCE.to_string(),
-            default_org_id: DEFAULT_ORG_ID.to_string(),
             issuer: issuer.clone(),
             jwks_ttl: Duration::from_secs(DEFAULT_JWKS_TTL_SECS),
             jwks_url: format!("{issuer}/.well-known/jwks.json"),
@@ -397,7 +386,8 @@ struct SupabaseClaims {
     email: Option<String>,
     role: Option<String>,
     app_metadata: Option<Value>,
-    user_metadata: Option<Value>,
+    #[serde(rename = "user_metadata")]
+    _user_metadata: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -407,7 +397,8 @@ struct SupabaseUser {
     email: Option<String>,
     role: Option<String>,
     app_metadata: Option<Value>,
-    user_metadata: Option<Value>,
+    #[serde(rename = "user_metadata")]
+    _user_metadata: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -481,7 +472,6 @@ mod tests {
 
     #[test]
     fn metadata_orgs_accept_strings_arrays_and_dedupe() {
-        let config = SupabaseConfig::for_project("ruxctrzdvugxztbjcpoi");
         let app_metadata = json!({
             "orgs": ["org_a", "org_b", "org_a"],
             "tenant_id": "org_c"
@@ -489,7 +479,7 @@ mod tests {
         let user_metadata = json!({ "org_id": "org_d" });
 
         assert_eq!(
-            orgs_from_metadata(&[Some(&app_metadata), Some(&user_metadata)], &config),
+            orgs_from_metadata(&[Some(&app_metadata), Some(&user_metadata)]),
             vec![
                 "org_a".to_string(),
                 "org_b".to_string(),
@@ -500,28 +490,25 @@ mod tests {
     }
 
     #[test]
-    fn metadata_orgs_fall_back_to_default_org() {
-        let config = SupabaseConfig::for_project("ruxctrzdvugxztbjcpoi");
-
+    fn metadata_without_org_membership_stays_empty() {
         assert_eq!(
-            orgs_from_metadata(&[Some(&json!({ "name": "alex" }))], &config),
-            vec![DEFAULT_ORG_ID.to_string()]
+            orgs_from_metadata(&[Some(&json!({ "name": "alex" }))]),
+            Vec::<String>::new()
         );
     }
 
     #[test]
     fn claims_must_be_authenticated_user_tokens() {
-        let config = SupabaseConfig::for_project("ruxctrzdvugxztbjcpoi");
         let claims = SupabaseClaims {
             sub: "user_1".to_string(),
             email: Some("user@example.com".to_string()),
             role: Some("service_role".to_string()),
             app_metadata: None,
-            user_metadata: None,
+            _user_metadata: None,
         };
 
         assert!(matches!(
-            user_ctx_from_claims(claims, &config),
+            user_ctx_from_claims(claims),
             Err(VerifyError::UnexpectedRole(Some(role))) if role == "service_role"
         ));
     }
@@ -561,7 +548,7 @@ mod tests {
             email: Some("user@example.com".to_string()),
             role: Some(DEFAULT_AUDIENCE.to_string()),
             app_metadata: None,
-            user_metadata: None,
+            _user_metadata: None,
         };
 
         assert!(matches!(

@@ -2,8 +2,9 @@
 
 The auth server for [fiducia.cloud](https://fiducia.cloud). It authenticates two
 very different callers — and **neither hits Supabase (or the DB) on the hot
-path**. Routing, Supabase Auth verification, and the API-key store are real
-and file-backed; fiducia-issued JWT signing is env-backed. Supabase remains the
+path**. Routing, Supabase Auth verification, and the API-key store are real;
+API-key records are durable in Fiducia KV and JWT signing is env-backed.
+Supabase remains the
 source of truth for human identity and org membership.
 
 ## Two planes, two credentials
@@ -56,8 +57,8 @@ validation/caching and attaches a verified identity inward.
   constant-time comparison is sufficient for introspection.
 - Keys are scoped to an **org** and may be narrowed to a **project**; dashboard
   ops require a Supabase session whose user has the right org/project role.
-- API keys persist in a JSON store selected by `FIDUCIA_AUTH_STORE_PATH` or
-  `FIDUCIA_AUTH_STORE_DIR`; otherwise it defaults under the local data dir.
+- API keys persist in the Fiducia KV endpoint selected by `FIDUCIA_KV_URL`.
+  Startup fails if durable KV is not configured or cannot be used by a request.
 - Source of truth: **Supabase** for human login identity and org membership.
   `fiducia-auth` materializes the hot API-key state locally so edge/LB calls
   stay private and fast.
@@ -84,18 +85,20 @@ curl localhost:8097/healthz
 
 Env:
 
-- `SUPABASE_URL` or `SUPABASE_PROJECT_REF`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`, used by the required organization sync
 - `SUPABASE_PUBLISHABLE_KEY` for the `/auth/v1/user` fallback
 - `SUPABASE_AUTH_ISSUER`, optional override for `{SUPABASE_URL}/auth/v1`
 - `SUPABASE_AUTH_JWKS_URL`, optional override for the JWKS endpoint
 - `SUPABASE_AUTH_AUDIENCE`, defaults to `authenticated`
 - `SUPABASE_AUTH_ALLOW_REMOTE_USERINFO`, defaults to `true`
-- `FIDUCIA_DEFAULT_ORG_ID`, used until org membership moves into Supabase Postgres
-- `FIDUCIA_AUTH_STORE_PATH` or `FIDUCIA_AUTH_STORE_DIR`, optional API-key store location
-- `FIDUCIA_JWT_PRIVATE_KEY_PEM`, required for `POST /v1/token`
-- `FIDUCIA_JWT_PUBLIC_JWK`, published by `/.well-known/jwks.json`
-- `FIDUCIA_JWT_ALG`, one of `RS256` or `ES256` (default `RS256`)
-- `FIDUCIA_JWT_KID`, `FIDUCIA_JWT_ISSUER`, `FIDUCIA_JWT_AUDIENCE`
+- `FIDUCIA_KV_URL`, required durable API-key store (for example, a Fiducia node)
+- `FIDUCIA_INTROSPECT_SECRET`, required `x-server-auth` secret for internal routes
+- `FIDUCIA_JWT_SIGNING_KEY`, required PKCS#8 P-256 private-key PEM shared by replicas
+- `FIDUCIA_JWT_ISSUER` and `FIDUCIA_JWT_AUDIENCE`, optional claim overrides
+
+Organization access comes only from Supabase `app_metadata`; user-editable
+metadata and a synthetic default organization are never trusted.
 
 ## Related
 
