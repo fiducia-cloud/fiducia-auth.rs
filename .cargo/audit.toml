@@ -2,11 +2,6 @@
 # `cargo audit` should not fail on. Each MUST carry a justification.
 [advisories]
 ignore = [
-    # rsa 0.9.x — Marvin timing side-channel. Pulled in transitively (via the
-    # Supabase/JWT verification stack); there is NO fixed upstream release yet.
-    # fiducia-auth does not use RSA decryption oracles on attacker-timed paths,
-    # so the practical exposure is low. Revisit when a patched rsa ships.
-    "RUSTSEC-2023-0071",
     # proc-macro-error — unmaintained. Build-time proc-macro dependency only;
     # never linked into or reachable from the running service. No runtime risk.
     "RUSTSEC-2024-0370",

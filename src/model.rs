@@ -53,6 +53,13 @@ pub struct ApiKeyRecord {
     /// `argon2`/`sha256` of the secret half. Never the raw key.
     #[serde(skip)]
     pub secret_hash: String,
+    /// Server-only HMAC of the create request's idempotency identity. It lets a
+    /// retry recover the original one-time secret without persisting that secret.
+    #[serde(skip)]
+    pub create_idempotency_hash: String,
+    /// Server-only HMAC of the most recently applied rotation request.
+    #[serde(skip)]
+    pub last_rotation_idempotency_hash: Option<String>,
     pub scopes: Vec<String>,
     pub created_ms: u64,
     pub last_used_ms: Option<u64>,

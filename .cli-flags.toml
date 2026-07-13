@@ -1,6 +1,5 @@
-# flags-2-env flag schema for the fiducia-auth server: maps command-line flags to
-# the FIDUCIA_*/SUPABASE_* env vars the binary reads. Consumed by
-# scripts/with-flags2env.sh and audited in CI (cli-flags.yml).
+# Non-secret command-line configuration for fiducia-auth. Keys and signing
+# material remain environment-only and are deliberately not accepted as flags.
 [help]
 url = "https://github.com/fiducia-cloud/fiducia-auth.rs"
 columns = ["options", "env", "type", "description"]
@@ -8,44 +7,54 @@ columns = ["options", "env", "type", "description"]
 [parse]
 allow_unknown = false
 
+[env]
+ignore = ["FIDUCIA_INTROSPECT_SECRET", "FIDUCIA_JWT_SIGNING_KEY", "SUPABASE_SERVICE_ROLE_KEY"]
+
 [flags.port]
 env = "PORT"
 aliases = ["port"]
+short = "p"
 type = "integer"
-help = "HTTP listen port (defaults to 8097)."
-
-[flags.jwt-signing-key]
-env = "FIDUCIA_JWT_SIGNING_KEY"
-aliases = ["jwt-signing-key"]
-type = "string"
-help = "SECRET: PKCS#8 EC P-256 private-key PEM used to sign fiducia JWTs (shared across replicas)."
-
-[flags.key-cache-ttl-ms]
-env = "FIDUCIA_KEY_CACHE_TTL_MS"
-aliases = ["key-cache-ttl-ms"]
-type = "integer"
-help = "Introspection hot-cache TTL in milliseconds (defaults to 30000)."
+help = "HTTP listen port."
 
 [flags.kv-url]
 env = "FIDUCIA_KV_URL"
 aliases = ["kv-url"]
 type = "string"
-help = "Durable fiducia KV endpoint backing the API-key store (required)."
+help = "Durable Fiducia KV endpoint for API keys."
+
+[flags.rotation-overlap-seconds]
+env = "FIDUCIA_ROTATION_OVERLAP_SECONDS"
+aliases = ["rotation-overlap-seconds"]
+type = "integer"
+help = "Maximum positive-introspection cache overlap after rotation, in seconds."
+
+[flags.jwt-issuer]
+env = "FIDUCIA_JWT_ISSUER"
+aliases = ["jwt-issuer"]
+type = "string"
+help = "JWT issuer claim."
+
+[flags.jwt-audience]
+env = "FIDUCIA_JWT_AUDIENCE"
+aliases = ["jwt-audience"]
+type = "string"
+help = "JWT audience claim."
 
 [flags.supabase-url]
 env = "SUPABASE_URL"
 aliases = ["supabase-url"]
 type = "string"
-help = "Supabase project URL — the system of record for org membership (required)."
-
-[flags.supabase-service-role-key]
-env = "SUPABASE_SERVICE_ROLE_KEY"
-aliases = ["supabase-service-role-key"]
-type = "string"
-help = "SECRET: Supabase service-role key used by the required org sync (required)."
+help = "Optional Supabase project URL."
 
 [flags.supabase-sync-interval-secs]
 env = "SUPABASE_SYNC_INTERVAL_SECS"
 aliases = ["supabase-sync-interval-secs"]
 type = "integer"
-help = "Interval between Supabase org syncs in seconds (defaults to 60)."
+help = "Supabase synchronization interval in seconds."
+
+[flags.log]
+env = "RUST_LOG"
+aliases = ["log"]
+type = "string"
+help = "Rust tracing filter."

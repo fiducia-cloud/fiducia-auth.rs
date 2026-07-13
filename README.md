@@ -115,7 +115,7 @@ traffic with a half-initialized identity.
 | `PORT` | integer | no | HTTP listen port | `8097` |
 | `FIDUCIA_JWT_SIGNING_KEY` | string (PEM) | **yes** | PKCS#8 EC P-256 private key that signs fiducia JWTs; shared across replicas via a k8s secret | — (required) |
 | `FIDUCIA_KV_URL` | string (URL) | no | Durable fiducia KV endpoint backing the API-key store | — (required) |
-| `FIDUCIA_ROTATION_OVERLAP_SECONDS` | integer | no | Maximum positive-introspection cache TTL across edge/LB consumers; reported to clients after rotation | `60` |
+| `FIDUCIA_ROTATION_OVERLAP_SECONDS` | positive integer | no | Maximum positive-introspection cache TTL across edge/LB consumers; reported to clients after rotation. Invalid or zero values abort startup. | `60` |
 | `FIDUCIA_INTROSPECT_SECRET` | string | **yes** | `x-server-auth` shared secret required on the internal `POST /v1/introspect` route | — (required) |
 | `SUPABASE_URL` | string (URL) | no | Supabase project URL — the system of record for org membership | derived from project ref |
 | `SUPABASE_SERVICE_ROLE_KEY` | string | **yes** | Supabase service-role key used by the required org sync | — (required) |
@@ -155,25 +155,29 @@ There is **no** flag that disables authentication, accepts unsigned tokens, or
 grants a synthetic "all orgs" identity. Org access is derived solely from
 admin-controlled Supabase `app_metadata`; user-writable `user_metadata` is never
 trusted for org membership or operator roles. API-key scopes intentionally do
-not include admin-dashboard permissions; human operator access is a verified
-Supabase role, never a customer-minted key scope.
+not include admin-dashboard permissions, and introspection strips any such scope
+from legacy durable records. Human operator access is a verified Supabase role,
+never a customer-minted key scope.
 
 ## CLI flags → env (flags-2-env)
 
-The `FIDUCIA_*` / `SUPABASE_*` variables above can be supplied as CLI flags via the
-pinned [`ORESoftware/flags-2-env`](https://github.com/ORESoftware/flags-2-env)
-parser (schema in `.cli-flags.toml`, audited in CI by `.github/workflows/cli-flags.yml`):
+The non-secret `FIDUCIA_*` / `SUPABASE_*` variables above can be supplied as CLI
+flags via the pinned
+[`ORESoftware/flags-2-env`](https://github.com/ORESoftware/flags-2-env) parser
+(schema in `.cli-flags.toml`, audited in CI by `.github/workflows/cli-flags.yml`):
 
 ```bash
 git submodule update --init --recursive
-make -C vendor/flags-2-env all
+make -B -C vendor/flags-2-env all
 scripts/with-flags2env.sh \
   --port=8097 --kv-url=http://fiducia-node.fiducia.svc:8090 \
   --supabase-url=https://<ref>.supabase.co -- cargo run
 ```
 
-Secrets (`--jwt-signing-key`, `--supabase-service-role-key`) are best injected from
-your secret store rather than typed on a command line.
+Secrets such as `FIDUCIA_JWT_SIGNING_KEY`, `FIDUCIA_INTROSPECT_SECRET`, and
+`SUPABASE_SERVICE_ROLE_KEY` are intentionally excluded from the CLI schema. Inject
+them only through the environment or your secret store so they cannot leak through
+shell history or process listings.
 
 ## Security
 
@@ -196,6 +200,14 @@ Hardening in place:
   key already learns nothing from it.
 - Only a **SHA-256 hash** of a 256-bit API-key secret is ever stored; each raw key
   is returned only by the create/rotate response that minted it.
+- **API-key lifecycle is monotonic and race-safe.** Key records and per-org
+  indexes use Fiducia KV compare-and-set. Concurrent index additions are merged;
+  rotate/revoke retry from the latest revision; a revoked key can never rotate
+  back to active; and malformed or mismatched durable records fail closed.
+- **No authoritative introspection cache in auth.** Production introspection
+  reads durable KV on every request and returns `503` on storage failure rather
+  than accepting a stale local value. Edge/LB positive caches remain bounded by
+  `FIDUCIA_ROTATION_OVERLAP_SECONDS`.
 - **Fail-fast startup**: missing `FIDUCIA_JWT_SIGNING_KEY`,
   `FIDUCIA_INTROSPECT_SECRET`, `FIDUCIA_KV_URL`, `SUPABASE_URL`, or
   `SUPABASE_SERVICE_ROLE_KEY` aborts boot; the org cache completes one sync before
@@ -207,12 +219,10 @@ Hardening in place:
   and **panic-catching** (`CatchPanicLayer`) so a handler panic becomes a 500
   rather than a dropped connection. No permissive CORS layer is configured.
 
-Accepted advisories (`cargo audit`, ignore list documented in `.cargo/audit.toml`):
+`jsonwebtoken` uses the AWS-LC backend rather than its RustCrypto default, so the
+active runtime dependency graph is free of the vulnerable `rsa` crate and passes
+`cargo audit`. The only accepted advisory is documented in `.cargo/audit.toml`:
 
-- **`rsa` — RUSTSEC-2023-0071** (Marvin timing side-channel). Transitive; **no
-  fixed upstream release exists**. fiducia-auth performs no RSA private-key
-  operations on attacker-timed paths, so practical exposure is low. Revisit when a
-  patched `rsa` ships.
 - **`proc-macro-error` — RUSTSEC-2024-0370** (unmaintained). Build-time proc-macro
   dependency only; never linked into the running service, so no runtime risk.
 

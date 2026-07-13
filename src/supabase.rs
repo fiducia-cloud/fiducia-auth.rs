@@ -27,6 +27,14 @@ const DEFAULT_PROJECT_REF: &str = "ruxctrzdvugxztbjcpoi";
 const DEFAULT_AUDIENCE: &str = "authenticated";
 const DEFAULT_JWKS_TTL_SECS: u64 = 10 * 60;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 5;
+/// Minimum age of the cached JWKS before an unknown `kid` may force a refetch.
+/// Without this floor, an unauthenticated caller can mint junk JWTs with random
+/// `kid`s and turn every request into an outbound JWKS fetch (amplification and
+/// upstream rate-limit exhaustion, which would also starve legitimate
+/// refreshes). Real signing-key rotations still converge within this window,
+/// and the remote-userinfo fallback (when enabled) keeps freshly rotated
+/// tokens verifiable in the interim.
+const MIN_FORCED_JWKS_REFRESH_SECS: u64 = 30;
 
 static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
 static JWKS_CACHE: OnceCell<RwLock<Option<CachedJwks>>> = OnceCell::const_new();
@@ -546,6 +554,27 @@ mod tests {
                 "auditor".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn verified_claims_ignore_user_writable_orgs_and_roles() {
+        let claims = SupabaseClaims {
+            sub: "user_1".to_string(),
+            email: Some("user@example.com".to_string()),
+            role: Some(DEFAULT_AUDIENCE.to_string()),
+            app_metadata: Some(json!({
+                "orgs": ["org_trusted"],
+                "fiducia_roles": ["operator"]
+            })),
+            _user_metadata: Some(json!({
+                "orgs": ["org_victim"],
+                "fiducia_roles": ["admin"]
+            })),
+        };
+
+        let user = user_ctx_from_claims(claims).unwrap();
+        assert_eq!(user.orgs, vec!["org_trusted"]);
+        assert_eq!(user.roles, vec!["operator"]);
     }
 
     #[test]

@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -41,6 +41,7 @@ use tower_http::{
 
 use keys::KeyStore;
 use model::{CreateKeyBody, IntrospectBody, TokenBody, UserCtx};
+use store::StoreError;
 
 const SERVICE: &str = "fiducia-auth";
 /// Default positive-introspection cache bound used by the current edge/LB.
@@ -74,6 +75,7 @@ struct AppState {
     keys: KeyStore,
     orgs: Arc<sync::OrgCache>,
     introspect_secret: String,
+    rotation_overlap_seconds: u64,
 }
 
 #[tokio::main]
@@ -82,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     token::validate_config().map_err(std::io::Error::other)?;
     let introspect_secret = required_env("FIDUCIA_INTROSPECT_SECRET")?;
+    let rotation_overlap_seconds = rotation_overlap_seconds_from_env()?;
     let keys = KeyStore::from_env().map_err(std::io::Error::other)?;
 
     // Supabase is the durable system of record; complete one initial sync before
@@ -95,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         keys,
         orgs,
         introspect_secret,
+        rotation_overlap_seconds,
     });
 
     let app = Router::new()
@@ -253,6 +257,37 @@ fn storage_unavailable(error: &dyn std::fmt::Display) -> Response {
         .into_response()
 }
 
+fn key_store_error(error: StoreError) -> Response {
+    if matches!(error, StoreError::IdempotencyConflict) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "idempotency_conflict" })),
+        )
+            .into_response();
+    }
+    storage_unavailable(&error)
+}
+
+#[allow(clippy::result_large_err)]
+fn require_idempotency_key(headers: &HeaderMap) -> Result<String, Response> {
+    let Some(value) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    else {
+        return Err(bad_key_request("idempotency_key_required"));
+    };
+    if value.is_empty()
+        || value.len() > 128
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(bad_key_request("invalid_idempotency_key"));
+    }
+    Ok(value.to_string())
+}
+
 fn required_env(name: &str) -> Result<String, std::io::Error> {
     std::env::var(name)
         .ok()
@@ -311,6 +346,10 @@ async fn create_key(
         Ok(u) => u,
         Err(e) => return e,
     };
+    let idempotency_key = match require_idempotency_key(&headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let org = match select_user_org(&user, body.org_id.as_deref()) {
         Ok(org) => org,
         Err(response) => return response,
@@ -322,6 +361,8 @@ async fn create_key(
     let (raw, meta) = match s
         .keys
         .create(
+            &user.user_id,
+            &idempotency_key,
             org,
             input.name,
             input.scopes,
@@ -331,10 +372,14 @@ async fn create_key(
         .await
     {
         Ok(created) => created,
-        Err(error) => return storage_unavailable(&error),
+        Err(error) => return key_store_error(error),
     };
     // This raw value is returned only in the response that minted it.
-    Json(json!({ "api_key": raw, "key": meta })).into_response()
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "api_key": raw, "key": meta })),
+    )
+        .into_response()
 }
 
 /// `POST /v1/keys/{key_id}/rotate` — replace the authoritative secret and return
@@ -350,33 +395,62 @@ async fn rotate_key(
         Ok(u) => u,
         Err(e) => return e,
     };
+    let idempotency_key = match require_idempotency_key(&headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let org = match select_user_org(&user, query.org_id.as_deref()) {
         Ok(org) => org,
         Err(response) => return response,
     };
-    match s.keys.rotate(&org, &key_id).await {
-        Ok(Some((raw, meta))) => Json(json!({
-            "ok": true,
-            "api_key": raw,
-            "key": meta,
-            "secret_once": true,
-            "overlap_seconds": rotation_overlap_seconds(),
-        }))
-        .into_response(),
+    match s
+        .keys
+        .rotate(&user.user_id, &idempotency_key, &org, &key_id)
+        .await
+    {
+        Ok(Some((raw, meta))) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "ok": true,
+                "api_key": raw,
+                "key": meta,
+                "secret_once": true,
+                "overlap_seconds": s.rotation_overlap_seconds,
+            })),
+        )
+            .into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "ok": false, "error": "key_not_found" })),
         )
             .into_response(),
-        Err(error) => storage_unavailable(&error),
+        Err(error) => key_store_error(error),
     }
 }
 
-fn rotation_overlap_seconds() -> u64 {
-    std::env::var("FIDUCIA_ROTATION_OVERLAP_SECONDS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_ROTATION_OVERLAP_SECONDS)
+fn rotation_overlap_seconds_from_env() -> Result<u64, std::io::Error> {
+    match std::env::var("FIDUCIA_ROTATION_OVERLAP_SECONDS") {
+        Ok(value) => rotation_overlap_seconds_from(Some(&value)),
+        Err(std::env::VarError::NotPresent) => rotation_overlap_seconds_from(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::other(
+            "FIDUCIA_ROTATION_OVERLAP_SECONDS must be valid UTF-8",
+        )),
+    }
+}
+
+fn rotation_overlap_seconds_from(value: Option<&str>) -> Result<u64, std::io::Error> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_ROTATION_OVERLAP_SECONDS);
+    };
+    let seconds = value.trim().parse::<u64>().map_err(|_| {
+        std::io::Error::other("FIDUCIA_ROTATION_OVERLAP_SECONDS must be a positive integer")
+    })?;
+    if seconds == 0 {
+        return Err(std::io::Error::other(
+            "FIDUCIA_ROTATION_OVERLAP_SECONDS must be greater than zero",
+        ));
+    }
+    Ok(seconds)
 }
 
 /// `GET /v1/keys` — list the caller org's keys (masked).
@@ -503,7 +577,10 @@ mod constant_time_tests {
 
 #[cfg(test)]
 mod interface_contract_tests {
-    use super::{validated_key_create_input, CreateKeyBody};
+    use super::{
+        rotation_overlap_seconds_from, select_user_org, validated_key_create_input, CreateKeyBody,
+        UserCtx,
+    };
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 
     #[test]
@@ -593,5 +670,47 @@ mod interface_contract_tests {
         }))
         .unwrap();
         assert!(body.require_idempotency);
+    }
+
+    fn user(orgs: &[&str]) -> UserCtx {
+        UserCtx {
+            user_id: "user_1".to_string(),
+            email: None,
+            orgs: orgs.iter().map(|value| (*value).to_string()).collect(),
+            roles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn multi_org_key_operations_require_an_explicit_authorized_org() {
+        let multi = user(&["org_a", "org_b"]);
+        assert!(select_user_org(&multi, None).is_err());
+        assert_eq!(select_user_org(&multi, Some("org_b")).unwrap(), "org_b");
+        assert!(select_user_org(&multi, Some("org_c")).is_err());
+
+        let single = user(&["org_a"]);
+        assert_eq!(select_user_org(&single, None).unwrap(), "org_a");
+    }
+
+    #[test]
+    fn customer_key_creation_rejects_admin_scopes() {
+        for scope in ["admin:read", "admin:write", "admin:*"] {
+            assert!(validated_key_create_input(CreateKeyBody {
+                name: "worker".to_string(),
+                org_id: Some("org_a".to_string()),
+                scopes: vec![scope.to_string()],
+                env: None,
+                require_idempotency: true,
+            })
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn rotation_overlap_configuration_fails_closed_when_invalid() {
+        assert_eq!(rotation_overlap_seconds_from(None).unwrap(), 60);
+        assert_eq!(rotation_overlap_seconds_from(Some("120")).unwrap(), 120);
+        assert!(rotation_overlap_seconds_from(Some("0")).is_err());
+        assert!(rotation_overlap_seconds_from(Some("not-a-number")).is_err());
     }
 }
