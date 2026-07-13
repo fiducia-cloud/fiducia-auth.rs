@@ -83,6 +83,12 @@ async fn verify_with_jwks(
     let jwk = match jwks.find(kid).cloned() {
         Some(jwk) => jwk,
         None => {
+            // An unknown `kid` may force one refetch, but only when the cached
+            // set is old enough — otherwise attacker-minted kids would turn
+            // every request into an outbound JWKS fetch.
+            if !forced_refresh_allowed(config).await {
+                return Err(VerifyError::MissingJwk(kid.to_string()));
+            }
             jwks = refresh_jwks(config).await?;
             jwks.find(kid)
                 .cloned()
