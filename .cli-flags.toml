@@ -23,11 +23,11 @@ aliases = ["kv-url"]
 type = "string"
 help = "Durable Fiducia KV endpoint for API keys."
 
-[flags.key-cache-ttl-ms]
-env = "FIDUCIA_KEY_CACHE_TTL_MS"
-aliases = ["key-cache-ttl-ms"]
+[flags.rotation-overlap-seconds]
+env = "FIDUCIA_ROTATION_OVERLAP_SECONDS"
+aliases = ["rotation-overlap-seconds"]
 type = "integer"
-help = "API-key cache lifetime in milliseconds."
+help = "Maximum positive-introspection cache overlap after rotation, in seconds."
 
 [flags.jwt-issuer]
 env = "FIDUCIA_JWT_ISSUER"

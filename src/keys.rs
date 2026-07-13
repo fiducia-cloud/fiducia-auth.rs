@@ -2,56 +2,47 @@
 //!
 //! B2B *machines* authenticate to the coordination API with a static API key
 //! (`Authorization: Bearer fdc_live_<id>.<secret>`). We store only a **hash** of
-//! the secret; the raw key is shown to the user exactly once, at creation.
+//! the secret; a raw key is shown to the user only in the creation or rotation
+//! response that minted it.
 //!
-//! Storage is **cache-aside**: durable records live in fiducia's own KV (see
-//! `store.rs`) and an in-memory hot cache fronts it, so the steady-state
-//! [`introspect`](KeyStore::introspect) - the call the edge/LB make (and cache
-//! again, with a short TTL) - is a local map lookup, never a round trip, and
-//! never Supabase.
+//! Durable records live in fiducia's own KV (see `store.rs`). Production
+//! introspection reads that authority on every request so rotation/revocation is
+//! immediately visible across auth replicas; test-only in-memory stores use the
+//! local map.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::model::{ApiKeyMeta, ApiKeyRecord, Introspection, OrgId};
-use crate::store::{key_path, org_index_path, KvClient, StoreError, StoredKey};
+use crate::store::{
+    key_path, org_index_path, CasOutcome, KvClient, StoreError, StoredKey, VersionedValue,
+};
 
-/// Default hot-cache TTL: how long a cached introspection result may be served
-/// before it must be re-read from the authoritative KV. Bounds how long a
-/// *revocation issued on another replica* can go unseen here (see [`KeyStore`]).
-const DEFAULT_KEY_CACHE_TTL_MS: u64 = 30_000;
+/// Retrying a CAS is safe because every attempt re-reads and merges the latest
+/// authoritative value. Bound it so sustained contention fails closed instead
+/// of hanging a request indefinitely.
+const MAX_CAS_RETRIES: usize = 8;
 
-/// A cached key record plus when it was cached, so entries can expire (TTL).
 struct CacheEntry {
     record: ApiKeyRecord,
-    inserted: Instant,
 }
 
 impl CacheEntry {
     fn now(record: ApiKeyRecord) -> Self {
-        CacheEntry {
-            record,
-            inserted: Instant::now(),
-        }
+        CacheEntry { record }
     }
 }
 
-/// Cache-aside key store: an in-memory hot cache fronts durable fiducia KV.
-///
-/// Cache entries carry a **TTL** (`FIDUCIA_KEY_CACHE_TTL_MS`, default
-/// [`DEFAULT_KEY_CACHE_TTL_MS`]). A hit within the TTL short-circuits (the hot
-/// path, no round trip); an entry older than the TTL is a MISS, so `introspect`
-/// re-reads the authoritative KV and picks up revocations propagated from other
-/// replicas — without this, replica B would serve `valid:true` for a key revoked
-/// via replica A until it restarted.
+/// Durable KV is the production introspection authority. The local map supports
+/// lifecycle response caching and the in-memory test store, but never bypasses
+/// a production KV read during credential verification.
 pub struct KeyStore {
-    cache: Mutex<HashMap<String, CacheEntry>>, // key_id -> (record, inserted)
+    cache: Mutex<HashMap<String, CacheEntry>>,
     kv: Option<KvClient>,
-    ttl: Duration,
 }
 
 impl KeyStore {
@@ -61,17 +52,6 @@ impl KeyStore {
         KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: None,
-            ttl: Duration::from_millis(DEFAULT_KEY_CACHE_TTL_MS),
-        }
-    }
-
-    /// In-memory only with an explicit cache TTL - tests.
-    #[cfg(test)]
-    pub fn with_ttl(ttl: Duration) -> Self {
-        KeyStore {
-            cache: Mutex::new(HashMap::new()),
-            kv: None,
-            ttl,
         }
     }
 
@@ -80,20 +60,7 @@ impl KeyStore {
         Ok(KeyStore {
             cache: Mutex::new(HashMap::new()),
             kv: Some(KvClient::from_env()?),
-            ttl: key_cache_ttl_from_env(),
         })
-    }
-
-    /// Backdate a cached entry's insertion time so it reads as `age` old, to
-    /// exercise TTL expiry deterministically without sleeping.
-    #[cfg(test)]
-    fn test_age_entry(&self, key_id: &str, age: Duration) {
-        let mut cache = self.cache.lock().unwrap();
-        if let Some(e) = cache.get_mut(key_id) {
-            e.inserted = Instant::now()
-                .checked_sub(age)
-                .expect("age within Instant range");
-        }
     }
 
     /// Create a key for an org. Returns the **raw key (shown once)** + its meta.
@@ -103,6 +70,7 @@ impl KeyStore {
         name: String,
         scopes: Vec<String>,
         env: String,
+        require_idempotency: bool,
     ) -> Result<(String, ApiKeyMeta), StoreError> {
         let key_id = gen_id();
         let secret = gen_secret();
@@ -116,19 +84,17 @@ impl KeyStore {
             created_ms: now_ms(),
             last_used_ms: None,
             revoked: false,
+            version: 1,
             env,
-            // Opt-in: keys minted directly here default to not requiring a key.
-            // The customer-facing default lives with the backend key config.
-            require_idempotency: false,
+            require_idempotency,
         };
         let meta: ApiKeyMeta = (&rec).into();
         if let Some(kv) = &self.kv {
             let stored: StoredKey = (&rec).into();
-            kv.put(
-                &key_path(&key_id),
-                &serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?,
-            )
-            .await?;
+            let value = serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?;
+            if kv.put_if_revision(&key_path(&key_id), &value, 0).await? == CasOutcome::Mismatch {
+                return Err(StoreError::KeyIdCollision);
+            }
             self.index_add(kv, &org_id, &key_id).await?;
         }
         self.cache
@@ -165,57 +131,121 @@ impl KeyStore {
     /// Revoke a key (must belong to the caller's org). Returns whether it matched.
     pub async fn revoke(&self, org_id: &str, key_id: &str) -> Result<bool, StoreError> {
         if let Some(kv) = &self.kv {
-            if let Some(mut rec) = self.load(kv, key_id).await? {
-                if rec.org_id == org_id {
-                    rec.revoked = true;
-                    let stored: StoredKey = (&rec).into();
-                    kv.put(
-                        &key_path(key_id),
-                        &serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?,
-                    )
-                    .await?;
+            for _ in 0..MAX_CAS_RETRIES {
+                let Some((mut rec, mod_revision)) = self.load_versioned(kv, key_id).await? else {
+                    return Ok(false);
+                };
+                if rec.org_id != org_id {
+                    return Ok(false);
+                }
+                if rec.revoked {
                     self.cache
                         .lock()
                         .unwrap()
                         .insert(key_id.to_string(), CacheEntry::now(rec));
                     return Ok(true);
                 }
+                rec.revoked = true;
+                rec.version = next_version(rec.version)?;
+                let stored: StoredKey = (&rec).into();
+                let value = serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?;
+                match kv
+                    .put_if_revision(&key_path(key_id), &value, mod_revision)
+                    .await?
+                {
+                    CasOutcome::Applied => {
+                        self.cache
+                            .lock()
+                            .unwrap()
+                            .insert(key_id.to_string(), CacheEntry::now(rec));
+                        return Ok(true);
+                    }
+                    CasOutcome::Mismatch => continue,
+                }
             }
-            return Ok(false);
+            return Err(StoreError::CasRetriesExhausted);
         }
         let mut cache = self.cache.lock().unwrap();
         match cache.get_mut(key_id) {
             Some(e) if e.record.org_id == org_id => {
-                e.record.revoked = true;
-                e.inserted = Instant::now();
+                if !e.record.revoked {
+                    e.record.revoked = true;
+                    e.record.version = next_version(e.record.version)?;
+                }
                 Ok(true)
             }
             _ => Ok(false),
         }
     }
 
-    /// Validate a raw API key -> org + scopes. Called by the edge/LB (and cached).
-    /// Hot path: an in-memory cache hit avoids any KV round trip.
-    pub async fn introspect(&self, raw: &str) -> Result<Introspection, StoreError> {
-        // Parse `fdc_<env>_<key_id>.<secret>`.
-        let Some((left, secret)) = raw.split_once('.') else {
-            return Ok(Introspection::invalid());
+    /// Replace a key's secret without any overlap. Returns the raw replacement
+    /// exactly once plus the updated public metadata.
+    pub async fn rotate(
+        &self,
+        org_id: &str,
+        key_id: &str,
+    ) -> Result<Option<(String, ApiKeyMeta)>, StoreError> {
+        if let Some(kv) = &self.kv {
+            for _ in 0..MAX_CAS_RETRIES {
+                let Some((mut rec, mod_revision)) = self.load_versioned(kv, key_id).await? else {
+                    return Ok(None);
+                };
+                if rec.org_id != org_id {
+                    return Ok(None);
+                }
+                if rec.revoked {
+                    return Ok(None);
+                }
+                let secret = gen_secret();
+                rec.secret_hash = hash_secret(&secret);
+                rec.version = next_version(rec.version)?;
+                let raw = format!("fdc_{}_{}.{secret}", rec.env, rec.key_id);
+                let meta: ApiKeyMeta = (&rec).into();
+                let stored: StoredKey = (&rec).into();
+                let value = serde_json::to_value(&stored).map_err(|_| StoreError::InvalidValue)?;
+                match kv
+                    .put_if_revision(&key_path(key_id), &value, mod_revision)
+                    .await?
+                {
+                    CasOutcome::Applied => {
+                        self.cache
+                            .lock()
+                            .unwrap()
+                            .insert(key_id.to_string(), CacheEntry::now(rec));
+                        return Ok(Some((raw, meta)));
+                    }
+                    CasOutcome::Mismatch => continue,
+                }
+            }
+            return Err(StoreError::CasRetriesExhausted);
+        }
+
+        let mut cache = self.cache.lock().unwrap();
+        let Some(entry) = cache
+            .get_mut(key_id)
+            .filter(|entry| entry.record.org_id == org_id && !entry.record.revoked)
+        else {
+            return Ok(None);
         };
-        let Some(key_id) = left.rsplit('_').next() else {
+        let secret = gen_secret();
+        entry.record.secret_hash = hash_secret(&secret);
+        entry.record.version = next_version(entry.record.version)?;
+        let raw = format!("fdc_{}_{}.{secret}", entry.record.env, entry.record.key_id);
+        Ok(Some((raw, (&entry.record).into())))
+    }
+
+    /// Validate a raw API key -> org + scopes. Production reads authoritative KV
+    /// on every call so another auth replica's rotation/revocation is visible.
+    pub async fn introspect(&self, raw: &str) -> Result<Introspection, StoreError> {
+        let Some((env, key_id, secret)) = parse_raw_key(raw) else {
             return Ok(Introspection::invalid());
         };
 
-        // Hot path: a *fresh* cache hit (within the TTL) short-circuits with no
-        // round trip.
-        if let Some(intro) = self.introspect_cached(key_id, secret) {
-            return Ok(intro);
-        }
-        // Miss, or an entry past its TTL: re-read the authoritative KV so a
-        // revocation issued on another replica is seen within the TTL, then
-        // refresh the entry.
+        // Production never accepts a local cache hit without checking durable
+        // state. This prevents per-replica stale acceptance after rotation.
         if let Some(kv) = &self.kv {
             if let Some(rec) = self.load(kv, key_id).await? {
-                let intro = verify(&rec, secret);
+                let intro = verify(&rec, env, secret);
                 self.cache
                     .lock()
                     .unwrap()
@@ -230,20 +260,8 @@ impl KeyStore {
             .lock()
             .unwrap()
             .get(key_id)
-            .map(|e| verify(&e.record, secret))
+            .map(|e| verify(&e.record, env, secret))
             .unwrap_or_else(Introspection::invalid))
-    }
-
-    /// Fresh cache hit only. An entry older than `ttl` is treated as a MISS
-    /// (returns `None`) so the caller re-reads the authoritative KV — this is how
-    /// a revocation from another replica propagates here within the TTL.
-    fn introspect_cached(&self, key_id: &str, secret: &str) -> Option<Introspection> {
-        let cache = self.cache.lock().unwrap();
-        let entry = cache.get(key_id)?;
-        if entry.inserted.elapsed() >= self.ttl {
-            return None;
-        }
-        Some(verify(&entry.record, secret))
     }
 
     async fn load(&self, kv: &KvClient, key_id: &str) -> Result<Option<ApiKeyRecord>, StoreError> {
@@ -252,7 +270,30 @@ impl KeyStore {
         };
         let stored: StoredKey =
             serde_json::from_value(value).map_err(|_| StoreError::InvalidValue)?;
+        if stored.key_id != key_id {
+            return Err(StoreError::InvalidValue);
+        }
         Ok(Some((&stored).into()))
+    }
+
+    async fn load_versioned(
+        &self,
+        kv: &KvClient,
+        key_id: &str,
+    ) -> Result<Option<(ApiKeyRecord, u64)>, StoreError> {
+        let Some(VersionedValue {
+            value,
+            mod_revision,
+        }) = kv.get_versioned(&key_path(key_id)).await?
+        else {
+            return Ok(None);
+        };
+        let stored: StoredKey =
+            serde_json::from_value(value).map_err(|_| StoreError::InvalidValue)?;
+        if stored.key_id != key_id {
+            return Err(StoreError::InvalidValue);
+        }
+        Ok(Some(((&stored).into(), mod_revision)))
     }
 
     async fn index_get(&self, kv: &KvClient, org_id: &str) -> Result<Vec<String>, StoreError> {
@@ -263,23 +304,66 @@ impl KeyStore {
     }
 
     async fn index_add(&self, kv: &KvClient, org_id: &str, key_id: &str) -> Result<(), StoreError> {
-        let mut ids = self.index_get(kv, org_id).await?;
-        if !ids.iter().any(|id| id == key_id) {
+        let path = org_index_path(org_id);
+        for _ in 0..MAX_CAS_RETRIES {
+            let (mut ids, mod_revision) = match kv.get_versioned(&path).await? {
+                Some(entry) => (
+                    serde_json::from_value(entry.value).map_err(|_| StoreError::InvalidValue)?,
+                    entry.mod_revision,
+                ),
+                None => (Vec::<String>::new(), 0),
+            };
+            if ids.iter().any(|id| id == key_id) {
+                return Ok(());
+            }
             ids.push(key_id.to_string());
-            kv.put(&org_index_path(org_id), &json!(ids)).await?;
+            match kv.put_if_revision(&path, &json!(ids), mod_revision).await? {
+                CasOutcome::Applied => return Ok(()),
+                CasOutcome::Mismatch => continue,
+            }
         }
-        Ok(())
+        Err(StoreError::CasRetriesExhausted)
     }
 }
 
+fn next_version(version: u64) -> Result<u64, StoreError> {
+    version.checked_add(1).ok_or(StoreError::VersionOverflow)
+}
+
+/// Parse the only accepted API-key wire shape without touching durable storage
+/// for malformed attacker input.
+fn parse_raw_key(raw: &str) -> Option<(&str, &str, &str)> {
+    let (left, secret) = raw.split_once('.')?;
+    if secret.len() != 64 || !secret.bytes().all(is_lower_hex) {
+        return None;
+    }
+    let rest = left.strip_prefix("fdc_")?;
+    let (env, key_id) = rest.split_once('_')?;
+    if !matches!(env, "live" | "test") || key_id.len() != 16 || !key_id.bytes().all(is_lower_hex) {
+        return None;
+    }
+    Some((env, key_id, secret))
+}
+
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
 /// Read-only check of a record against a presented secret (constant-time).
-fn verify(rec: &ApiKeyRecord, secret: &str) -> Introspection {
-    if !rec.revoked && constant_time_eq(&rec.secret_hash, &hash_secret(secret)) {
+fn verify(rec: &ApiKeyRecord, env: &str, secret: &str) -> Introspection {
+    if !rec.revoked && rec.env == env && constant_time_eq(&rec.secret_hash, &hash_secret(secret)) {
         Introspection {
             valid: true,
             org_id: Some(rec.org_id.clone()),
             key_id: Some(rec.key_id.clone()),
-            scopes: rec.scopes.clone(),
+            // Defense in depth for durable records minted before customer/admin
+            // separation: an API key must never surface operator authority.
+            scopes: rec
+                .scopes
+                .iter()
+                .filter(|scope| !is_admin_scope(scope))
+                .cloned()
+                .collect(),
             require_idempotency: rec.require_idempotency,
         }
     } else {
@@ -287,14 +371,8 @@ fn verify(rec: &ApiKeyRecord, secret: &str) -> Introspection {
     }
 }
 
-/// Hot-cache TTL from `FIDUCIA_KEY_CACHE_TTL_MS` (milliseconds), defaulting to
-/// [`DEFAULT_KEY_CACHE_TTL_MS`] when unset or unparseable.
-fn key_cache_ttl_from_env() -> Duration {
-    let ms = std::env::var("FIDUCIA_KEY_CACHE_TTL_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_KEY_CACHE_TTL_MS);
-    Duration::from_millis(ms)
+fn is_admin_scope(scope: &str) -> bool {
+    scope == "admin" || scope.starts_with("admin:")
 }
 
 fn now_ms() -> u64 {
@@ -351,6 +429,66 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+    use serde_json::Value;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[derive(Clone, Default)]
+    struct IndexCasState {
+        reads: Arc<AtomicUsize>,
+        writes: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn mock_index_get(State(state): State<IndexCasState>) -> Json<Value> {
+        let read = state.reads.fetch_add(1, Ordering::SeqCst);
+        let (ids, mod_revision) = if read == 0 {
+            (json!(["existing"]), 7)
+        } else {
+            (json!(["existing", "concurrent"]), 8)
+        };
+        Json(json!({
+            "found": true,
+            "entry": {
+                "value": ids.to_string(),
+                "mod_revision": mod_revision,
+                "expires_at_ms": null
+            }
+        }))
+    }
+
+    async fn mock_index_put(
+        State(state): State<IndexCasState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let attempt = {
+            let mut writes = state.writes.lock().unwrap();
+            writes.push(body);
+            writes.len()
+        };
+        if attempt == 1 {
+            Json(json!({
+                "committed": true,
+                "result": { "output": {
+                    "ok": false,
+                    "reason": "cas_mismatch",
+                    "current_revision": 8,
+                    "revision": 8
+                } }
+            }))
+        } else {
+            Json(json!({
+                "committed": true,
+                "result": { "output": { "ok": true, "revision": 9 } }
+            }))
+        }
+    }
+
+    async fn mock_storage_failure() -> StatusCode {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 
     fn store() -> KeyStore {
         KeyStore::new()
@@ -378,6 +516,27 @@ mod tests {
         assert_ne!(h, hash_secret("super-secreu"));
     }
 
+    #[test]
+    fn raw_key_parser_accepts_only_the_minted_wire_shape() {
+        let key_id = "0123456789abcdef";
+        let secret = "a".repeat(64);
+        assert_eq!(
+            parse_raw_key(&format!("fdc_live_{key_id}.{secret}")),
+            Some(("live", key_id, secret.as_str()))
+        );
+        for invalid in [
+            format!("other_live_{key_id}.{secret}"),
+            format!("fdc_prod_{key_id}.{secret}"),
+            format!("fdc_live_short.{secret}"),
+            format!("fdc_live_{key_id}.short"),
+            format!("fdc_live_{key_id}.{}", "z".repeat(64)),
+            format!("fdc_live_{}.{}", key_id.to_ascii_uppercase(), secret),
+            format!("fdc_live_{key_id}.{}", secret.to_ascii_uppercase()),
+        ] {
+            assert!(parse_raw_key(&invalid).is_none(), "accepted {invalid}");
+        }
+    }
+
     #[tokio::test]
     async fn introspect_round_trips_a_created_key() {
         let s = store();
@@ -387,6 +546,7 @@ mod tests {
                 "ci".into(),
                 vec!["kv:read".into()],
                 "live".into(),
+                true,
             )
             .await
             .unwrap();
@@ -397,6 +557,10 @@ mod tests {
         assert_eq!(intro.org_id.as_deref(), Some("org_1"));
         assert_eq!(intro.key_id.as_deref(), Some(meta.key_id.as_str()));
         assert_eq!(intro.scopes, vec!["kv:read".to_string()]);
+        assert_eq!(meta.version, 1);
+        assert!(meta.require_idempotency);
+        let wrong_env = raw.replacen("fdc_live_", "fdc_test_", 1);
+        assert!(!s.introspect(&wrong_env).await.unwrap().valid);
     }
 
     #[tokio::test]
@@ -408,6 +572,7 @@ mod tests {
                 "ci".into(),
                 vec!["kv:read".into()],
                 "live".into(),
+                true,
             )
             .await
             .unwrap();
@@ -423,10 +588,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_customer_keys_never_surface_admin_scopes() {
+        let s = store();
+        let (raw, _) = s
+            .create(
+                "org_1".into(),
+                "legacy".into(),
+                vec!["admin:read".into(), "kv:read".into()],
+                "live".into(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let intro = s.introspect(&raw).await.unwrap();
+        assert!(intro.valid);
+        assert_eq!(intro.scopes, vec!["kv:read"]);
+    }
+
+    #[tokio::test]
     async fn introspect_rejects_tampered_secret_and_revoked_keys() {
         let s = store();
         let (raw, meta) = s
-            .create("org_1".into(), "ci".into(), vec![], "live".into())
+            .create("org_1".into(), "ci".into(), vec![], "live".into(), true)
             .await
             .unwrap();
 
@@ -448,58 +632,161 @@ mod tests {
         );
     }
 
-    #[test]
-    fn default_cache_ttl_is_the_safe_default() {
-        assert_eq!(
-            store().ttl,
-            Duration::from_millis(DEFAULT_KEY_CACHE_TTL_MS),
-            "unset FIDUCIA_KEY_CACHE_TTL_MS must fall back to the safe default"
-        );
-    }
-
     #[tokio::test]
-    async fn a_cache_entry_past_its_ttl_is_a_miss_and_triggers_a_reread() {
-        // Tiny TTL so an aged entry is unambiguously stale.
-        let s = KeyStore::with_ttl(Duration::from_millis(50));
-        let (raw, meta) = s
-            .create("org_1".into(), "ci".into(), vec![], "live".into())
+    async fn production_introspection_never_falls_back_to_a_stale_local_record() {
+        let app = Router::new().route("/v1/kv", get(mock_storage_failure));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
-        let key_id = meta.key_id.as_str();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
 
-        // Split `fdc_<env>_<key_id>.<secret>` back into its pieces.
-        let (_left, secret) = raw.split_once('.').unwrap();
+        let key_id = "0123456789abcdef";
+        let secret = "a".repeat(64);
+        let rec = ApiKeyRecord {
+            key_id: key_id.to_string(),
+            org_id: "org_1".to_string(),
+            name: "cached".to_string(),
+            secret_hash: hash_secret(&secret),
+            scopes: vec!["kv:read".to_string()],
+            created_ms: 1,
+            last_used_ms: None,
+            revoked: false,
+            version: 1,
+            env: "live".to_string(),
+            require_idempotency: true,
+        };
+        let store = KeyStore {
+            cache: Mutex::new(HashMap::from([(key_id.to_string(), CacheEntry::now(rec))])),
+            kv: Some(KvClient::for_test(format!("http://{address}"))),
+        };
 
-        // Fresh: a hit within the TTL short-circuits (authoritative, still valid).
+        let result = store
+            .introspect(&format!("fdc_live_{key_id}.{secret}"))
+            .await;
         assert!(
-            s.introspect_cached(key_id, secret).is_some(),
-            "a fresh entry must short-circuit the hot path"
+            matches!(result, Err(StoreError::Http(status)) if status == StatusCode::SERVICE_UNAVAILABLE)
         );
-
-        // Age the entry beyond the TTL: the cache layer now reports a MISS, which
-        // is what forces `introspect` to re-read the authoritative KV (and thus
-        // observe revocations propagated from another replica).
-        s.test_age_entry(key_id, Duration::from_millis(500));
-        assert!(
-            s.introspect_cached(key_id, secret).is_none(),
-            "an entry past its TTL must be a MISS so KV is re-read"
-        );
-
-        // No durable KV here, so `introspect` still honors the (only) local record
-        // rather than spuriously 401-ing a valid key — existing behavior preserved.
-        assert!(
-            s.introspect(&raw).await.unwrap().valid,
-            "with no KV to re-read, a stale-but-valid key must stay valid"
-        );
+        server.abort();
     }
 
     #[tokio::test]
     async fn revoke_is_scoped_to_the_owning_org() {
         let s = store();
         let (_raw, meta) = s
-            .create("org_1".into(), "k".into(), vec![], "live".into())
+            .create("org_1".into(), "k".into(), vec![], "live".into(), true)
             .await
             .unwrap();
         assert!(!s.revoke("org_2", &meta.key_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rotate_replaces_secret_increments_version_and_preserves_policy() {
+        let s = store();
+        let (old_raw, created) = s
+            .create(
+                "org_1".into(),
+                "worker".into(),
+                vec!["requests:write".into()],
+                "test".into(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let (new_raw, rotated) = s
+            .rotate("org_1", &created.key_id)
+            .await
+            .unwrap()
+            .expect("owning org can rotate");
+
+        assert_ne!(new_raw, old_raw);
+        assert!(new_raw.starts_with("fdc_test_"));
+        assert!(!s.introspect(&old_raw).await.unwrap().valid);
+        assert!(s.introspect(&new_raw).await.unwrap().valid);
+        assert_eq!(rotated.version, created.version + 1);
+        assert!(rotated.require_idempotency);
+        assert!(!rotated.revoked);
+    }
+
+    #[tokio::test]
+    async fn revoke_versions_only_the_first_state_transition() {
+        let s = store();
+        let (_raw, created) = s
+            .create(
+                "org_1".into(),
+                "worker".into(),
+                vec![],
+                "live".into(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(s.revoke("org_1", &created.key_id).await.unwrap());
+        let once = s.list("org_1").await.unwrap().pop().unwrap();
+        assert_eq!(once.version, created.version + 1);
+        assert!(once.revoked);
+        assert!(!once.require_idempotency);
+
+        assert!(s.revoke("org_1", &created.key_id).await.unwrap());
+        let twice = s.list("org_1").await.unwrap().pop().unwrap();
+        assert_eq!(twice.version, once.version);
+    }
+
+    #[tokio::test]
+    async fn rotate_is_scoped_to_the_owning_org() {
+        let s = store();
+        let (_raw, created) = s
+            .create("org_1".into(), "worker".into(), vec![], "live".into(), true)
+            .await
+            .unwrap();
+
+        assert!(s.rotate("org_2", &created.key_id).await.unwrap().is_none());
+        let unchanged = s.list("org_1").await.unwrap().pop().unwrap();
+        assert_eq!(unchanged.version, created.version);
+    }
+
+    #[tokio::test]
+    async fn revoked_key_cannot_be_rotated() {
+        let s = store();
+        let (_raw, created) = s
+            .create("org_1".into(), "worker".into(), vec![], "live".into(), true)
+            .await
+            .unwrap();
+        assert!(s.revoke("org_1", &created.key_id).await.unwrap());
+        assert!(s.rotate("org_1", &created.key_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn org_index_cas_retries_and_merges_a_concurrent_insert() {
+        let state = IndexCasState::default();
+        let app = Router::new()
+            .route("/v1/kv", get(mock_index_get).put(mock_index_put))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let kv = KvClient::for_test(format!("http://{address}"));
+
+        store()
+            .index_add(&kv, "org_1", "ours")
+            .await
+            .expect("retry should merge the concurrent index entry");
+
+        let writes = state.writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0]["prev_revision"], json!(7));
+        assert_eq!(writes[1]["prev_revision"], json!(8));
+        let merged: Vec<String> =
+            serde_json::from_str(writes[1]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(merged, vec!["existing", "concurrent", "ours"]);
+        server.abort();
     }
 }

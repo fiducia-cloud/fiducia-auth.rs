@@ -1,9 +1,8 @@
 //! Durable API-key storage in fiducia's OWN KV (dogfooding the coordination
 //! cluster) — so the end-user data plane never touches Supabase. The auth server
 //! talks to a node's KV over HTTP (`FIDUCIA_KV_URL`, in-cluster); records live
-//! under the reserved `__auth/` keyspace. An in-memory hot cache (see `keys.rs`)
-//! fronts this so the steady-state introspect is a local map lookup, not a round
-//! trip.
+//! under the reserved `__auth/` keyspace. Production introspection reads these
+//! authoritative records so rotations and revocations cross replica boundaries.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -32,6 +31,11 @@ pub struct StoredKey {
     pub created_ms: u64,
     pub last_used_ms: Option<u64>,
     pub revoked: bool,
+    /// Monotonic customer-visible record version. Records written before this
+    /// field was introduced deserialize at version 0; their next mutation
+    /// advances them to 1.
+    #[serde(default)]
+    pub version: u64,
     pub env: String,
     /// When true, the edge/LB rejects keyless mutating calls. `#[serde(default)]`
     /// so records persisted before this field parse as `false` (opt-in control).
@@ -50,6 +54,7 @@ impl From<&ApiKeyRecord> for StoredKey {
             created_ms: r.created_ms,
             last_used_ms: r.last_used_ms,
             revoked: r.revoked,
+            version: r.version,
             env: r.env.clone(),
             require_idempotency: r.require_idempotency,
         }
@@ -67,6 +72,7 @@ impl From<&StoredKey> for ApiKeyRecord {
             created_ms: s.created_ms,
             last_used_ms: s.last_used_ms,
             revoked: s.revoked,
+            version: s.version,
             env: s.env.clone(),
             require_idempotency: s.require_idempotency,
         }
@@ -80,6 +86,18 @@ pub struct KvClient {
     http: reqwest::Client,
 }
 
+/// One decoded KV value together with the revision needed for compare-and-set.
+pub struct VersionedValue {
+    pub value: Value,
+    pub mod_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasOutcome {
+    Applied,
+    Mismatch,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("FIDUCIA_KV_URL must be set")]
@@ -90,6 +108,12 @@ pub enum StoreError {
     Http(reqwest::StatusCode),
     #[error("fiducia KV returned an invalid stored value")]
     InvalidValue,
+    #[error("fiducia KV compare-and-set retries exhausted")]
+    CasRetriesExhausted,
+    #[error("API-key record version overflow")]
+    VersionOverflow,
+    #[error("generated API-key id already exists")]
+    KeyIdCollision,
 }
 
 impl KvClient {
@@ -106,8 +130,8 @@ impl KvClient {
         })
     }
 
-    /// GET /v1/kv?key=… → the stored value parsed back from its JSON string.
-    pub async fn get(&self, key: &str) -> Result<Option<Value>, StoreError> {
+    /// GET /v1/kv?key=… → the stored value and its CAS revision.
+    pub async fn get_versioned(&self, key: &str) -> Result<Option<VersionedValue>, StoreError> {
         let resp = self
             .http
             .get(format!("{}/v1/kv", self.base))
@@ -123,19 +147,46 @@ impl KvClient {
             Some(true) => {}
             None => return Err(StoreError::InvalidValue),
         }
-        let raw = body
-            .get("entry")
-            .and_then(|entry| entry.get("value"))
+        let entry = body.get("entry").ok_or(StoreError::InvalidValue)?;
+        let raw = entry
+            .get("value")
             .and_then(Value::as_str)
             .ok_or(StoreError::InvalidValue)?;
-        Ok(Some(
-            serde_json::from_str(raw).map_err(|_| StoreError::InvalidValue)?,
-        ))
+        let mod_revision = entry
+            .get("mod_revision")
+            .and_then(Value::as_u64)
+            .ok_or(StoreError::InvalidValue)?;
+        Ok(Some(VersionedValue {
+            value: serde_json::from_str(raw).map_err(|_| StoreError::InvalidValue)?,
+            mod_revision,
+        }))
     }
 
-    /// PUT /v1/kv?key=… with the value as a JSON string. Returns commit success.
-    pub async fn put(&self, key: &str, value: &Value) -> Result<(), StoreError> {
-        let body = serde_json::json!({ "value": value.to_string() });
+    /// GET a decoded value when its revision is not needed.
+    pub async fn get(&self, key: &str) -> Result<Option<Value>, StoreError> {
+        Ok(self.get_versioned(key).await?.map(|entry| entry.value))
+    }
+
+    /// Compare-and-set PUT. A `prev_revision` of 0 means the key must not exist.
+    pub async fn put_if_revision(
+        &self,
+        key: &str,
+        value: &Value,
+        prev_revision: u64,
+    ) -> Result<CasOutcome, StoreError> {
+        self.put_inner(key, value, Some(prev_revision)).await
+    }
+
+    async fn put_inner(
+        &self,
+        key: &str,
+        value: &Value,
+        prev_revision: Option<u64>,
+    ) -> Result<CasOutcome, StoreError> {
+        let body = serde_json::json!({
+            "value": value.to_string(),
+            "prev_revision": prev_revision,
+        });
         let response = self
             .http
             .put(format!("{}/v1/kv", self.base))
@@ -146,6 +197,98 @@ impl KvClient {
         if !response.status().is_success() {
             return Err(StoreError::Http(response.status()));
         }
-        Ok(())
+        let response: Value = response.json().await?;
+        parse_put_response(&response)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(base: String) -> Self {
+        Self {
+            base,
+            http: reqwest::Client::new(),
+        }
+    }
+}
+
+fn parse_put_response(response: &Value) -> Result<CasOutcome, StoreError> {
+    if response.get("committed").and_then(Value::as_bool) != Some(true) {
+        return Err(StoreError::InvalidValue);
+    }
+    let output = response
+        .get("result")
+        .and_then(|result| result.get("output"))
+        .ok_or(StoreError::InvalidValue)?;
+    match output.get("ok").and_then(Value::as_bool) {
+        Some(true) => {
+            output
+                .get("revision")
+                .and_then(Value::as_u64)
+                .ok_or(StoreError::InvalidValue)?;
+            Ok(CasOutcome::Applied)
+        }
+        Some(false)
+            if output.get("reason").and_then(Value::as_str) == Some("cas_mismatch")
+                && output
+                    .get("current_revision")
+                    .and_then(Value::as_u64)
+                    .is_some() =>
+        {
+            Ok(CasOutcome::Mismatch)
+        }
+        _ => Err(StoreError::InvalidValue),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn old_stored_keys_default_version_and_idempotency_to_zero_and_false() {
+        let stored: StoredKey = serde_json::from_value(json!({
+            "key_id": "k1",
+            "org_id": "org_1",
+            "name": "legacy",
+            "secret_hash": "sha256:x",
+            "scopes": [],
+            "created_ms": 1,
+            "last_used_ms": null,
+            "revoked": false,
+            "env": "live"
+        }))
+        .unwrap();
+
+        assert_eq!(stored.version, 0);
+        assert!(!stored.require_idempotency);
+    }
+
+    #[test]
+    fn put_response_requires_committed_success_envelope() {
+        let applied = json!({
+            "committed": true,
+            "result": { "output": { "ok": true, "revision": 9 } }
+        });
+        assert_eq!(parse_put_response(&applied).unwrap(), CasOutcome::Applied);
+
+        let mismatch = json!({
+            "committed": true,
+            "result": { "output": {
+                "ok": false,
+                "reason": "cas_mismatch",
+                "current_revision": 8,
+                "revision": 9
+            } }
+        });
+        assert_eq!(parse_put_response(&mismatch).unwrap(), CasOutcome::Mismatch);
+
+        for invalid in [
+            json!({ "committed": false, "result": { "output": { "ok": true, "revision": 1 } } }),
+            json!({ "committed": true, "result": { "output": { "ok": true } } }),
+            json!({ "committed": true, "result": { "output": { "ok": false, "reason": "cas_mismatch" } } }),
+            json!({ "committed": true, "result": { "output": { "ok": false, "reason": "unknown" } } }),
+        ] {
+            assert!(parse_put_response(&invalid).is_err());
+        }
     }
 }

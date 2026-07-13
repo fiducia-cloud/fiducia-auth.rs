@@ -12,6 +12,10 @@ pub struct UserCtx {
     pub email: Option<String>,
     /// Orgs this user belongs to (from the org-membership table).
     pub orgs: Vec<OrgId>,
+    /// Application roles copied only from Supabase `app_metadata`, which is
+    /// controlled by trusted server-side administration. Browser-writable user
+    /// metadata is never an authorization source.
+    pub roles: Vec<String>,
 }
 
 /// What an API key resolves to (data plane). This is what the edge/LB caches.
@@ -38,8 +42,9 @@ impl Introspection {
     }
 }
 
-/// Stored API key record. **Only the hash of the secret is persisted** — the raw
-/// key is shown to the user exactly once, at creation.
+/// Stored API key record. **Only the hash of the secret is persisted** — a raw
+/// key is shown to the user only in the creation or rotation response that
+/// minted it.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiKeyRecord {
     pub key_id: String,
@@ -52,6 +57,9 @@ pub struct ApiKeyRecord {
     pub created_ms: u64,
     pub last_used_ms: Option<u64>,
     pub revoked: bool,
+    /// Durable per-key version. Starts at 1 and advances on each secret rotation
+    /// and on the first transition to revoked.
+    pub version: u64,
     /// "live" or "test".
     pub env: String,
     /// When true, mutating calls with this key must carry an `Idempotency-Key`.
@@ -68,7 +76,9 @@ pub struct ApiKeyMeta {
     pub created_ms: u64,
     pub last_used_ms: Option<u64>,
     pub revoked: bool,
+    pub version: u64,
     pub env: String,
+    pub require_idempotency: bool,
 }
 
 impl From<&ApiKeyRecord> for ApiKeyMeta {
@@ -81,9 +91,15 @@ impl From<&ApiKeyRecord> for ApiKeyMeta {
             created_ms: r.created_ms,
             last_used_ms: r.last_used_ms,
             revoked: r.revoked,
+            version: r.version,
             env: r.env.clone(),
+            require_idempotency: r.require_idempotency,
         }
     }
+}
+
+fn default_require_idempotency() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +111,11 @@ pub struct CreateKeyBody {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub env: Option<String>, // "live" | "test"
+    /// Customer-facing creates require mutation idempotency unless explicitly
+    /// disabled. This request default is intentionally stricter than the
+    /// backward-compatible default for old durable records.
+    #[serde(default = "default_require_idempotency")]
+    pub require_idempotency: bool,
 }
 
 #[derive(Debug, Deserialize)]
