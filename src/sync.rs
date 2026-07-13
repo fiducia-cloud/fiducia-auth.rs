@@ -3,9 +3,9 @@
 //! Supabase is the durable **system of record**; this pulls org rows periodically
 //! into memory so the hot path reads org metadata **locally** (~µs) instead of a
 //! live Supabase round trip (~tens-hundreds of ms). Gated on
-//! `SUPABASE_SERVICE_ROLE_KEY` — absent → no-op (empty cache), so the data plane
-//! never depends on it. Wire `SUPABASE_URL` + the key + (optionally) the table /
-//! id-column names; the sync reads via PostgREST.
+//! `SUPABASE_SERVICE_ROLE_KEY`. Production startup requires the Supabase URL and
+//! service key and completes one initial pull before serving requests, so an
+//! empty cache is never mistaken for authoritative "org not found" state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,14 +43,16 @@ struct SyncConfig {
 }
 
 impl SyncConfig {
-    fn from_env() -> Option<Self> {
+    fn from_env() -> Result<Self, String> {
         let service_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY")
             .ok()
-            .filter(|k| !k.trim().is_empty())?;
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| "SUPABASE_SERVICE_ROLE_KEY must be configured".to_string())?;
         let base = std::env::var("SUPABASE_URL")
             .ok()
-            .filter(|u| !u.trim().is_empty())?;
-        Some(SyncConfig {
+            .filter(|u| !u.trim().is_empty())
+            .ok_or_else(|| "SUPABASE_URL must be configured".to_string())?;
+        Ok(SyncConfig {
             base: base.trim_end_matches('/').to_string(),
             service_key,
             table: env_or("SUPABASE_ORGS_TABLE", "organizations"),
@@ -65,19 +67,23 @@ impl SyncConfig {
     }
 }
 
-/// Spawn the background sync if Supabase is configured; otherwise a logged no-op.
-pub fn spawn(cache: Arc<OrgCache>) {
-    let Some(config) = SyncConfig::from_env() else {
-        tracing::info!("Supabase sync disabled (no SUPABASE_SERVICE_ROLE_KEY); org cache stays empty");
-        return;
-    };
+/// Validate configuration, populate the cache once, then keep it refreshed.
+/// Startup fails if the system of record is unavailable instead of serving an
+/// authoritative-looking empty cache.
+pub async fn start(cache: Arc<OrgCache>) -> Result<(), String> {
+    let config = SyncConfig::from_env()?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| format!("Supabase HTTP client setup failed: {error}"))?;
+    let initial = pull(&http, &config).await?;
+    let initial_count = initial.len();
+    cache.replace(initial).await;
     tracing::info!(table = %config.table, every_s = config.interval.as_secs(), "Supabase org sync enabled");
     tokio::spawn(async move {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
         let mut tick = tokio::time::interval(config.interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
         loop {
             tick.tick().await;
             match pull(&http, &config).await {
@@ -86,13 +92,20 @@ pub fn spawn(cache: Arc<OrgCache>) {
                     cache.replace(rows).await;
                     tracing::debug!(orgs = n, "Supabase org sync refreshed cache");
                 }
-                Err(e) => tracing::warn!(error = %e, "Supabase org sync failed (serving stale cache)"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Supabase org sync failed (serving stale cache)")
+                }
             }
         }
     });
+    tracing::info!(orgs = initial_count, "Supabase org cache initialized");
+    Ok(())
 }
 
-async fn pull(http: &reqwest::Client, config: &SyncConfig) -> Result<HashMap<String, Value>, String> {
+async fn pull(
+    http: &reqwest::Client,
+    config: &SyncConfig,
+) -> Result<HashMap<String, Value>, String> {
     let url = format!("{}/rest/v1/{}?select=*", config.base, config.table);
     let resp = http
         .get(&url)
@@ -121,7 +134,10 @@ fn value_as_id(v: &Value) -> Option<String> {
 }
 
 fn env_or(name: &str, default: &str) -> String {
-    std::env::var(name).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string())
+    std::env::var(name)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 #[cfg(test)]
@@ -131,7 +147,7 @@ mod tests {
     #[test]
     fn disabled_without_service_key() {
         std::env::remove_var("SUPABASE_SERVICE_ROLE_KEY");
-        assert!(SyncConfig::from_env().is_none());
+        assert!(SyncConfig::from_env().is_err());
     }
 
     #[tokio::test]
@@ -139,7 +155,10 @@ mod tests {
         let c = OrgCache::default();
         assert_eq!(c.len().await, 0);
         let mut rows = HashMap::new();
-        rows.insert("org_1".to_string(), serde_json::json!({ "id": "org_1", "plan": "pro" }));
+        rows.insert(
+            "org_1".to_string(),
+            serde_json::json!({ "id": "org_1", "plan": "pro" }),
+        );
         c.replace(rows).await;
         assert_eq!(c.len().await, 1);
         assert_eq!(c.get("org_1").await.unwrap()["plan"], "pro");
@@ -147,7 +166,10 @@ mod tests {
 
     #[test]
     fn id_coercion_handles_string_and_int() {
-        assert_eq!(value_as_id(&serde_json::json!("abc")).as_deref(), Some("abc"));
+        assert_eq!(
+            value_as_id(&serde_json::json!("abc")).as_deref(),
+            Some("abc")
+        );
         assert_eq!(value_as_id(&serde_json::json!(42)).as_deref(), Some("42"));
         assert_eq!(value_as_id(&serde_json::json!(null)), None);
     }

@@ -55,19 +55,16 @@ static SIGNER: Lazy<Signer> = Lazy::new(Signer::load);
 
 impl Signer {
     /// Load the signing key from `FIDUCIA_JWT_SIGNING_KEY` (PKCS#8 EC P-256 PEM,
-    /// shared across replicas via a k8s secret). With no env key we generate an
-    /// EPHEMERAL one - fine for a single dev pod, but multi-replica MUST share a
-    /// key or each pod publishes a different JWKS and cross-pod verification fails.
+    /// shared across replicas via a k8s secret). Unit tests may generate an
+    /// isolated signer; production startup validates that this variable exists.
     fn load() -> Self {
         let secret = match std::env::var("FIDUCIA_JWT_SIGNING_KEY") {
             Ok(pem) if !pem.trim().is_empty() => SecretKey::from_pkcs8_pem(pem.trim())
                 .expect("FIDUCIA_JWT_SIGNING_KEY must be a PKCS#8 EC (P-256) private key PEM"),
-            _ => {
-                tracing::warn!(
-                    "FIDUCIA_JWT_SIGNING_KEY not set - generating an EPHEMERAL ES256 key (OK for a single dev pod; provide a shared key for multi-replica)"
-                );
-                generate_secret()
-            }
+            #[cfg(test)]
+            _ => generate_secret(),
+            #[cfg(not(test))]
+            _ => panic!("FIDUCIA_JWT_SIGNING_KEY must be configured"),
         };
         Self::from_secret(&secret)
     }
@@ -116,6 +113,20 @@ impl Signer {
             kid,
         }
     }
+}
+
+/// Validate and initialize the production signer before binding the HTTP port.
+/// This prevents a replica from starting with an identity that disappears on
+/// restart or differs from its peers.
+pub fn validate_config() -> Result<(), String> {
+    let pem = std::env::var("FIDUCIA_JWT_SIGNING_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "FIDUCIA_JWT_SIGNING_KEY must be configured".to_string())?;
+    SecretKey::from_pkcs8_pem(pem.trim())
+        .map_err(|error| format!("FIDUCIA_JWT_SIGNING_KEY is invalid: {error}"))?;
+    Lazy::force(&SIGNER);
+    Ok(())
 }
 
 /// Mint a short-lived JWT for an introspected key/session.

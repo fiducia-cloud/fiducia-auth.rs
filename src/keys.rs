@@ -18,7 +18,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::model::{ApiKeyMeta, ApiKeyRecord, Introspection, OrgId};
-use crate::store::{key_path, org_index_path, KvClient, StoredKey};
+use crate::store::{key_path, org_index_path, KvClient, KvError, StoredKey};
 
 /// Default hot-cache TTL: how long a cached introspection result may be served
 /// before it must be re-read from the authoritative KV. Bounds how long a
@@ -40,8 +40,9 @@ impl CacheEntry {
     }
 }
 
-/// Cache-aside key store: an in-memory hot cache fronts durable fiducia KV. With
-/// no `FIDUCIA_KV_URL` configured it is purely in-memory (dev / tests).
+/// Cache-aside key store: an in-memory hot cache fronts durable fiducia KV.
+/// Production construction requires `FIDUCIA_KV_URL`; the optional client exists
+/// only so isolated unit tests can exercise the cryptographic behavior.
 ///
 /// Cache entries carry a **TTL** (`FIDUCIA_KEY_CACHE_TTL_MS`, default
 /// [`DEFAULT_KEY_CACHE_TTL_MS`]). A hit within the TTL short-circuits (the hot
@@ -53,6 +54,35 @@ pub struct KeyStore {
     cache: Mutex<HashMap<String, CacheEntry>>, // key_id -> (record, inserted)
     kv: Option<KvClient>,
     ttl: Duration,
+}
+
+#[derive(Debug)]
+pub enum KeyStoreError {
+    Kv(KvError),
+    Serialization(serde_json::Error),
+}
+
+impl std::fmt::Display for KeyStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Kv(error) => write!(formatter, "{error}"),
+            Self::Serialization(error) => write!(formatter, "key serialization failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for KeyStoreError {}
+
+impl From<KvError> for KeyStoreError {
+    fn from(error: KvError) -> Self {
+        Self::Kv(error)
+    }
+}
+
+impl From<serde_json::Error> for KeyStoreError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serialization(error)
+    }
 }
 
 impl KeyStore {
@@ -76,13 +106,14 @@ impl KeyStore {
         }
     }
 
-    /// Durable when `FIDUCIA_KV_URL` is set, else in-memory.
-    pub fn from_env() -> Self {
-        KeyStore {
+    /// Construct the production store. Missing durable configuration is a
+    /// startup error rather than an implicit process-local credential database.
+    pub fn from_env() -> Result<Self, String> {
+        Ok(KeyStore {
             cache: Mutex::new(HashMap::new()),
-            kv: KvClient::from_env(),
+            kv: Some(KvClient::from_env()?),
             ttl: key_cache_ttl_from_env(),
-        }
+        })
     }
 
     /// Backdate a cached entry's insertion time so it reads as `age` old, to
@@ -104,7 +135,7 @@ impl KeyStore {
         name: String,
         scopes: Vec<String>,
         env: String,
-    ) -> (String, ApiKeyMeta) {
+    ) -> Result<(String, ApiKeyMeta), KeyStoreError> {
         let key_id = gen_id();
         let secret = gen_secret();
         let raw = format!("fdc_{env}_{key_id}.{secret}");
@@ -125,111 +156,108 @@ impl KeyStore {
         let meta: ApiKeyMeta = (&rec).into();
         if let Some(kv) = &self.kv {
             let stored: StoredKey = (&rec).into();
-            kv.put(
-                &key_path(&key_id),
-                &serde_json::to_value(&stored).unwrap_or_default(),
-            )
-            .await;
-            self.index_add(kv, &org_id, &key_id).await;
+            kv.put(&key_path(&key_id), &serde_json::to_value(&stored)?)
+                .await?;
+            self.index_add(kv, &org_id, &key_id).await?;
         }
-        self.cache.lock().unwrap().insert(key_id, CacheEntry::now(rec));
-        (raw, meta)
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(key_id, CacheEntry::now(rec));
+        Ok((raw, meta))
     }
 
     /// List an org's keys (masked - never returns secrets).
-    pub async fn list(&self, org_id: &str) -> Vec<ApiKeyMeta> {
+    pub async fn list(&self, org_id: &str) -> Result<Vec<ApiKeyMeta>, KeyStoreError> {
         if let Some(kv) = &self.kv {
             let mut out = Vec::new();
-            for id in self.index_get(kv, org_id).await {
-                if let Some(rec) = self.load(kv, &id).await {
+            for id in self.index_get(kv, org_id).await? {
+                if let Some(rec) = self.load(kv, &id).await? {
                     if rec.org_id == org_id {
                         out.push((&rec).into());
                     }
                 }
             }
-            return out;
+            return Ok(out);
         }
-        self.cache
+        Ok(self
+            .cache
             .lock()
             .unwrap()
             .values()
             .map(|e| &e.record)
             .filter(|r| r.org_id == org_id)
             .map(ApiKeyMeta::from)
-            .collect()
+            .collect())
     }
 
     /// Revoke a key (must belong to the caller's org). Returns whether it matched.
-    pub async fn revoke(&self, org_id: &str, key_id: &str) -> bool {
+    pub async fn revoke(&self, org_id: &str, key_id: &str) -> Result<bool, KeyStoreError> {
         if let Some(kv) = &self.kv {
-            if let Some(mut rec) = self.load(kv, key_id).await {
+            if let Some(mut rec) = self.load(kv, key_id).await? {
                 if rec.org_id == org_id {
                     rec.revoked = true;
                     let stored: StoredKey = (&rec).into();
-                    kv.put(
-                        &key_path(key_id),
-                        &serde_json::to_value(&stored).unwrap_or_default(),
-                    )
-                    .await;
+                    kv.put(&key_path(key_id), &serde_json::to_value(&stored)?)
+                        .await?;
                     self.cache
                         .lock()
                         .unwrap()
                         .insert(key_id.to_string(), CacheEntry::now(rec));
-                    return true;
+                    return Ok(true);
                 }
             }
-            return false;
+            return Ok(false);
         }
         let mut cache = self.cache.lock().unwrap();
-        match cache.get_mut(key_id) {
+        Ok(match cache.get_mut(key_id) {
             Some(e) if e.record.org_id == org_id => {
                 e.record.revoked = true;
                 e.inserted = Instant::now();
                 true
             }
             _ => false,
-        }
+        })
     }
 
     /// Validate a raw API key -> org + scopes. Called by the edge/LB (and cached).
     /// Hot path: an in-memory cache hit avoids any KV round trip.
-    pub async fn introspect(&self, raw: &str) -> Introspection {
+    pub async fn introspect(&self, raw: &str) -> Result<Introspection, KeyStoreError> {
         // Parse `fdc_<env>_<key_id>.<secret>`.
         let Some((left, secret)) = raw.split_once('.') else {
-            return Introspection::invalid();
+            return Ok(Introspection::invalid());
         };
         let Some(key_id) = left.rsplit('_').next() else {
-            return Introspection::invalid();
+            return Ok(Introspection::invalid());
         };
 
         // Hot path: a *fresh* cache hit (within the TTL) short-circuits with no
         // round trip.
         if let Some(intro) = self.introspect_cached(key_id, secret) {
-            return intro;
+            return Ok(intro);
         }
         // Miss, or an entry past its TTL: re-read the authoritative KV so a
         // revocation issued on another replica is seen within the TTL, then
         // refresh the entry.
         if let Some(kv) = &self.kv {
-            if let Some(rec) = self.load(kv, key_id).await {
+            if let Some(rec) = self.load(kv, key_id).await? {
                 let intro = verify(&rec, secret);
                 self.cache
                     .lock()
                     .unwrap()
                     .insert(key_id.to_string(), CacheEntry::now(rec));
-                return intro;
+                return Ok(intro);
             }
+            return Ok(Introspection::invalid());
         }
-        // No durable KV to re-read (dev / single-process), or the KV no longer
-        // holds it: the local cache is the only source of truth, so honor a
-        // still-present entry even past its TTL rather than spuriously rejecting
-        // it. (Revocation still sets `revoked` on that entry, so it stays 401.)
-        self.cache
+        // Test-only in-memory stores retain their local record past the TTL.
+        Ok(self
+            .cache
             .lock()
             .unwrap()
             .get(key_id)
             .map(|e| verify(&e.record, secret))
-            .unwrap_or_else(Introspection::invalid)
+            .unwrap_or_else(Introspection::invalid))
     }
 
     /// Fresh cache hit only. An entry older than `ttl` is treated as a MISS
@@ -244,24 +272,37 @@ impl KeyStore {
         Some(verify(&entry.record, secret))
     }
 
-    async fn load(&self, kv: &KvClient, key_id: &str) -> Option<ApiKeyRecord> {
-        let stored: StoredKey = serde_json::from_value(kv.get(&key_path(key_id)).await?).ok()?;
-        Some((&stored).into())
+    async fn load(
+        &self,
+        kv: &KvClient,
+        key_id: &str,
+    ) -> Result<Option<ApiKeyRecord>, KeyStoreError> {
+        let Some(value) = kv.get(&key_path(key_id)).await? else {
+            return Ok(None);
+        };
+        let stored: StoredKey = serde_json::from_value(value)?;
+        Ok(Some((&stored).into()))
     }
 
-    async fn index_get(&self, kv: &KvClient, org_id: &str) -> Vec<String> {
-        kv.get(&org_index_path(org_id))
-            .await
-            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
-            .unwrap_or_default()
+    async fn index_get(&self, kv: &KvClient, org_id: &str) -> Result<Vec<String>, KeyStoreError> {
+        match kv.get(&org_index_path(org_id)).await? {
+            Some(value) => Ok(serde_json::from_value(value)?),
+            None => Ok(Vec::new()),
+        }
     }
 
-    async fn index_add(&self, kv: &KvClient, org_id: &str, key_id: &str) {
-        let mut ids = self.index_get(kv, org_id).await;
+    async fn index_add(
+        &self,
+        kv: &KvClient,
+        org_id: &str,
+        key_id: &str,
+    ) -> Result<(), KeyStoreError> {
+        let mut ids = self.index_get(kv, org_id).await?;
         if !ids.iter().any(|id| id == key_id) {
             ids.push(key_id.to_string());
-            kv.put(&org_index_path(org_id), &json!(ids)).await;
+            kv.put(&org_index_path(org_id), &json!(ids)).await?;
         }
+        Ok(())
     }
 }
 
@@ -381,10 +422,11 @@ mod tests {
                 vec!["kv:read".into()],
                 "live".into(),
             )
-            .await;
+            .await
+            .unwrap();
         assert!(raw.starts_with("fdc_live_"));
 
-        let intro = s.introspect(&raw).await;
+        let intro = s.introspect(&raw).await.unwrap();
         assert!(intro.valid);
         assert_eq!(intro.org_id.as_deref(), Some("org_1"));
         assert_eq!(intro.key_id.as_deref(), Some(meta.key_id.as_str()));
@@ -401,9 +443,10 @@ mod tests {
                 vec!["kv:read".into()],
                 "live".into(),
             )
-            .await;
+            .await
+            .unwrap();
 
-        for intro in [s.introspect(&raw).await, Introspection::invalid()] {
+        for intro in [s.introspect(&raw).await.unwrap(), Introspection::invalid()] {
             let json = serde_json::to_value(&intro).unwrap();
             let shared: fiducia_interfaces::Introspection = serde_json::from_value(json).unwrap();
             assert_eq!(shared.valid, intro.valid);
@@ -418,22 +461,23 @@ mod tests {
         let s = store();
         let (raw, meta) = s
             .create("org_1".into(), "ci".into(), vec![], "live".into())
-            .await;
+            .await
+            .unwrap();
 
         let mut bad = raw.clone();
         let last = bad.pop().unwrap();
         bad.push(if last == 'a' { 'b' } else { 'a' });
         assert!(
-            !s.introspect(&bad).await.valid,
+            !s.introspect(&bad).await.unwrap().valid,
             "tampered secret must be invalid"
         );
 
-        assert!(!s.introspect("not-a-key").await.valid);
-        assert!(!s.introspect("fdc_live_deadbeef").await.valid); // no '.secret'
+        assert!(!s.introspect("not-a-key").await.unwrap().valid);
+        assert!(!s.introspect("fdc_live_deadbeef").await.unwrap().valid); // no '.secret'
 
-        assert!(s.revoke("org_1", &meta.key_id).await);
+        assert!(s.revoke("org_1", &meta.key_id).await.unwrap());
         assert!(
-            !s.introspect(&raw).await.valid,
+            !s.introspect(&raw).await.unwrap().valid,
             "revoked key must be invalid"
         );
     }
@@ -453,7 +497,8 @@ mod tests {
         let s = KeyStore::with_ttl(Duration::from_millis(50));
         let (raw, meta) = s
             .create("org_1".into(), "ci".into(), vec![], "live".into())
-            .await;
+            .await
+            .unwrap();
         let key_id = meta.key_id.as_str();
 
         // Split `fdc_<env>_<key_id>.<secret>` back into its pieces.
@@ -477,7 +522,7 @@ mod tests {
         // No durable KV here, so `introspect` still honors the (only) local record
         // rather than spuriously 401-ing a valid key — existing behavior preserved.
         assert!(
-            s.introspect(&raw).await.valid,
+            s.introspect(&raw).await.unwrap().valid,
             "with no KV to re-read, a stale-but-valid key must stay valid"
         );
     }
@@ -487,7 +532,8 @@ mod tests {
         let s = store();
         let (_raw, meta) = s
             .create("org_1".into(), "k".into(), vec![], "live".into())
-            .await;
-        assert!(!s.revoke("org_2", &meta.key_id).await);
+            .await
+            .unwrap();
+        assert!(!s.revoke("org_2", &meta.key_id).await.unwrap());
     }
 }

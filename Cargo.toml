@@ -40,5 +40,5 @@ p256 = { version = "0.13", features = ["pkcs8", "pem", "ecdsa"] }
 base64 = "0.22"
 once_cell = "1"
 
-# TODO(storage): back the keys/orgs store with fiducia KV (API keys) + a Supabase
-# sync into a local cache (orgs/plans) so the hot path never calls Supabase.
+# API keys are durably stored in fiducia KV; org/plan rows are populated from
+# Supabase before startup completes, keeping the hot path on local cache reads.
