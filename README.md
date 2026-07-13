@@ -101,8 +101,26 @@ validation/caching and attaches a verified identity inward.
 ## Run locally
 
 ```bash
-cargo run    # :8097 (override PORT)
+cargo run --locked    # :8097 (override PORT)
 curl localhost:8097/healthz
+```
+
+### Reproducible container and CI dependency
+
+This crate uses generated Rust contracts from the sibling
+`fiducia-interfaces` repository. CI and the Dockerfile both pin that dependency
+to commit `bbd8b52ce729ec34b0a9bff4dda6d0a448181797`; neither follows a moving
+branch. The Docker build checks the commit out detached and verifies that its
+full `HEAD` equals `INTERFACES_SHA`, so a branch, tag, or abbreviated hash fails
+closed. To upgrade the contracts, update the Dockerfile argument and the CI
+checkout `ref` together, then validate with the committed Cargo lockfile.
+
+An intentional local override must also be a full commit SHA:
+
+```bash
+docker build \
+  --build-arg INTERFACES_SHA=<40-character-commit-sha> \
+  -t fiducia-auth:local .
 ```
 
 Organization access and application roles come only from Supabase
@@ -192,7 +210,7 @@ make -B -C vendor/flags-2-env all
 scripts/with-flags2env.sh \
   --port=8097 --kv-url=http://fiducia-node.fiducia.svc:8090 \
   --kv-org-id=fiducia-auth --customer-origin=https://app.fiducia.cloud \
-  --supabase-url=https://<ref>.supabase.co -- cargo run
+  --supabase-url=https://<ref>.supabase.co -- cargo run --locked
 ```
 
 Secrets such as `FIDUCIA_JWT_SIGNING_KEY`, `FIDUCIA_INTERNAL_SECRET`,
