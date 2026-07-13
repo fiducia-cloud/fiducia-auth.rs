@@ -1,0 +1,8 @@
+# cargo-audit configuration. Advisories listed here are accepted risks that
+# `cargo audit` should not fail on. Each MUST carry a justification.
+[advisories]
+ignore = [
+    # proc-macro-error — unmaintained. Build-time proc-macro dependency only;
+    # never linked into or reachable from the running service. No runtime risk.
+    "RUSTSEC-2024-0370",
+]

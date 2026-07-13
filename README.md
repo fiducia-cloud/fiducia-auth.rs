@@ -83,33 +83,109 @@ cargo run    # :8097 (override PORT)
 curl localhost:8097/healthz
 ```
 
-For audited CLI-to-environment mapping, build the pinned parser and launch the
-service through the wrapper:
-
-```bash
-make -B -C vendor/flags-2-env all
-scripts/with-flags2env.sh --port=8097 --kv-url=http://localhost:8090 -- cargo run --locked
-```
-
-Secrets and signing material are intentionally environment-only and are not
-accepted as command-line flags.
-
-Env:
-
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`, used by the required organization sync
-- `SUPABASE_PUBLISHABLE_KEY` for the `/auth/v1/user` fallback
-- `SUPABASE_AUTH_ISSUER`, optional override for `{SUPABASE_URL}/auth/v1`
-- `SUPABASE_AUTH_JWKS_URL`, optional override for the JWKS endpoint
-- `SUPABASE_AUTH_AUDIENCE`, defaults to `authenticated`
-- `SUPABASE_AUTH_ALLOW_REMOTE_USERINFO`, defaults to `true`
-- `FIDUCIA_KV_URL`, required durable API-key store (for example, a Fiducia node)
-- `FIDUCIA_INTROSPECT_SECRET`, required `x-server-auth` secret for internal routes
-- `FIDUCIA_JWT_SIGNING_KEY`, required PKCS#8 P-256 private-key PEM shared by replicas
-- `FIDUCIA_JWT_ISSUER` and `FIDUCIA_JWT_AUDIENCE`, optional claim overrides
-
 Organization access comes only from Supabase `app_metadata`; user-editable
 metadata and a synthetic default organization are never trusted.
+
+## Configuration
+
+Everything is read from the environment at startup. Startup **fails fast** if a
+required secret or endpoint is missing, so a misconfigured replica never serves
+traffic with a half-initialized identity.
+
+### Core
+
+| Var | Type | Secret? | Meaning | Default |
+|-----|------|:------:|---------|---------|
+| `PORT` | integer | no | HTTP listen port | `8097` |
+| `FIDUCIA_JWT_SIGNING_KEY` | string (PEM) | **yes** | PKCS#8 EC P-256 private key that signs fiducia JWTs; shared across replicas via a k8s secret | — (required) |
+| `FIDUCIA_KV_URL` | string (URL) | no | Durable fiducia KV endpoint backing the API-key store | — (required) |
+| `FIDUCIA_KEY_CACHE_TTL_MS` | integer | no | Introspection hot-cache TTL in ms (bounds cross-replica revocation lag) | `30000` |
+| `FIDUCIA_INTROSPECT_SECRET` | string | **yes** | `x-server-auth` shared secret required on the internal `POST /v1/introspect` route | — (required) |
+| `SUPABASE_URL` | string (URL) | no | Supabase project URL — the system of record for org membership | derived from project ref |
+| `SUPABASE_SERVICE_ROLE_KEY` | string | **yes** | Supabase service-role key used by the required org sync | — (required) |
+| `SUPABASE_SYNC_INTERVAL_SECS` | integer | no | Interval between Supabase org syncs, in seconds | `60` |
+
+### Supabase session verification (optional overrides)
+
+| Var | Type | Secret? | Meaning | Default |
+|-----|------|:------:|---------|---------|
+| `SUPABASE_PUBLISHABLE_KEY` | string | no | Publishable key for the `/auth/v1/user` fallback (shared-secret projects) | none |
+| `SUPABASE_PROJECT_REF` / `SUPABASE_PROJECT_ID` | string | no | Project ref used to derive URLs when `SUPABASE_URL` is unset | built-in project ref |
+| `SUPABASE_AUTH_ISSUER` | string | no | Override for `{SUPABASE_URL}/auth/v1` | derived |
+| `SUPABASE_AUTH_JWKS_URL` | string | no | Override for the JWKS endpoint | `{issuer}/.well-known/jwks.json` |
+| `SUPABASE_AUTH_USER_URL` | string | no | Override for the `/auth/v1/user` endpoint | `{issuer}/user` |
+| `SUPABASE_AUTH_AUDIENCE` | string | no | Expected `aud` claim | `authenticated` |
+| `SUPABASE_AUTH_JWKS_TTL_SECS` | integer | no | JWKS cache TTL, in seconds | `600` |
+| `SUPABASE_AUTH_ALLOW_REMOTE_USERINFO` | bool | no | Allow the `/auth/v1/user` fallback for shared-secret projects (**see below**) | `true` |
+| `SUPABASE_ORGS_TABLE` | string | no | Table synced for org metadata | `organizations` |
+| `SUPABASE_ORGS_ID_COLUMN` | string | no | Id column in that table | `id` |
+
+### Verification-mode flag
+
+`SUPABASE_AUTH_ALLOW_REMOTE_USERINFO` is the one flag that changes how a session
+is verified, so treat it deliberately:
+
+- **`true` (default)** — for asymmetric (JWKS-signed) tokens, fiducia-auth still
+  verifies the signature **offline** first; the remote `/auth/v1/user` endpoint is
+  only a fallback. For shared-secret (HS256) projects with no public JWKS, the
+  token is validated by **Supabase itself** over that endpoint. Either way the
+  token is validated — this is fail-safe, not a bypass — but it adds a network
+  dependency on Supabase and requires `SUPABASE_PUBLISHABLE_KEY`.
+- **`false`** — offline JWKS verification only. Set this if every project uses
+  asymmetric signing keys and you want zero auth-time calls to Supabase; tokens
+  that aren't asymmetrically signed are rejected outright.
+
+There is **no** flag that disables authentication, accepts unsigned tokens, or
+grants a synthetic "all orgs" identity. Org access is derived solely from
+admin-controlled Supabase `app_metadata`; user-writable `user_metadata` is never
+trusted for org membership.
+
+## CLI flags → env (flags-2-env)
+
+The non-secret `FIDUCIA_*` / `SUPABASE_*` variables above can be supplied as CLI
+flags via the pinned
+[`ORESoftware/flags-2-env`](https://github.com/ORESoftware/flags-2-env) parser
+(schema in `.cli-flags.toml`, audited in CI by `.github/workflows/cli-flags.yml`):
+
+```bash
+git submodule update --init --recursive
+make -B -C vendor/flags-2-env all
+scripts/with-flags2env.sh \
+  --port=8097 --kv-url=http://fiducia-node.fiducia.svc:8090 \
+  --supabase-url=https://<ref>.supabase.co -- cargo run
+```
+
+Secrets such as `FIDUCIA_JWT_SIGNING_KEY`, `FIDUCIA_INTROSPECT_SECRET`, and
+`SUPABASE_SERVICE_ROLE_KEY` are intentionally excluded from the CLI schema. Inject
+them only through the environment or your secret store so they cannot leak through
+shell history or process listings.
+
+## Security
+
+Hardening in place:
+
+- **Constant-time** comparison of both the API-key secret hash (`keys.rs`) and the
+  internal `x-server-auth` secret (`main.rs`), so neither leaks byte-by-byte under
+  timing probes.
+- Only a **SHA-256 hash** of a 256-bit API-key secret is ever stored; the raw key
+  is returned exactly once.
+- **Fail-fast startup**: missing `FIDUCIA_JWT_SIGNING_KEY`,
+  `FIDUCIA_INTROSPECT_SECRET`, `FIDUCIA_KV_URL`, `SUPABASE_URL`, or
+  `SUPABASE_SERVICE_ROLE_KEY` aborts boot; the org cache completes one sync before
+  serving so an empty cache can't impersonate real state.
+- **Offline-first** Supabase JWT verification with symmetric-JWK rejection and
+  required `iss`/`aud`/`sub` claims; org membership only from admin-controlled
+  `app_metadata`.
+- Request hardening layers: **body-size cap** (64 KiB), **request timeout** (15 s),
+  and **panic-catching** (`CatchPanicLayer`) so a handler panic becomes a 500
+  rather than a dropped connection. No permissive CORS layer is configured.
+
+`jsonwebtoken` uses the AWS-LC backend rather than its RustCrypto default, so the
+active runtime dependency graph is free of the vulnerable `rsa` crate and passes
+`cargo audit`. The only accepted advisory is documented in `.cargo/audit.toml`:
+
+- **`proc-macro-error` — RUSTSEC-2024-0370** (unmaintained). Build-time proc-macro
+  dependency only; never linked into the running service, so no runtime risk.
 
 ## Related
 
