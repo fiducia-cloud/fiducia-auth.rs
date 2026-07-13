@@ -618,6 +618,81 @@ mod tests {
     }
 
     #[test]
+    fn forced_refresh_cooldown_gates_young_caches() {
+        assert!(!forced_refresh_cooldown_elapsed(Duration::from_secs(0)));
+        assert!(!forced_refresh_cooldown_elapsed(Duration::from_secs(
+            MIN_FORCED_JWKS_REFRESH_SECS - 1
+        )));
+        assert!(forced_refresh_cooldown_elapsed(Duration::from_secs(
+            MIN_FORCED_JWKS_REFRESH_SECS
+        )));
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_cannot_force_a_jwks_refetch_within_the_cooldown() {
+        use axum::{extract::State, routing::get, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/jwks.json",
+                get(|State(hits): State<Arc<AtomicUsize>>| async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(crate::token::jwks())
+                }),
+            )
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = SupabaseConfig::for_project("jwks-cooldown-test");
+        config.jwks_url = format!("http://{address}/jwks.json");
+
+        // Populate the cache once (one upstream fetch).
+        refresh_jwks(&config).await.expect("initial jwks fetch");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // A fresh cache means an attacker-controlled unknown `kid` must NOT
+        // trigger another upstream fetch — it fails fast instead.
+        let result = verify_with_jwks("junk-jwt", &config, Algorithm::ES256, "unknown-kid").await;
+        assert!(matches!(result, Err(VerifyError::MissingJwk(kid)) if kid == "unknown-kid"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "kid-miss within the cooldown must not refetch the JWKS"
+        );
+
+        // Once the cached set is older than the cooldown, a kid-miss may force
+        // exactly one refetch again (how genuine rotations are picked up).
+        {
+            let cache = JWKS_CACHE.get_or_init(|| async { RwLock::new(None) }).await;
+            let mut guard = cache.write().await;
+            let cached = guard.as_mut().expect("cache populated");
+            cached.fetched_at = Instant::now()
+                .checked_sub(Duration::from_secs(MIN_FORCED_JWKS_REFRESH_SECS + 1))
+                .expect("age within Instant range");
+        }
+        let result = verify_with_jwks("junk-jwt", &config, Algorithm::ES256, "unknown-kid").await;
+        assert!(matches!(result, Err(VerifyError::MissingJwk(_))));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "a stale cache allows one forced refetch on kid-miss"
+        );
+
+        server.abort();
+    }
+
+    #[test]
     fn normalize_url_trims_spaces_and_trailing_slashes() {
         assert_eq!(
             normalize_url("  https://example.supabase.co///  "),
