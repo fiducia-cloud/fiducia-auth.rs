@@ -45,8 +45,8 @@ validation/caching and attaches a verified identity inward.
 | `POST /v1/keys` | dashboard (Supabase JWT) | create a key (raw shown **once**) |
 | `GET /v1/keys` | dashboard | list keys (masked) |
 | `DELETE /v1/keys/{id}` | dashboard | revoke |
-| `POST /v1/introspect` | edge/LB (internal) | validate key → org + scopes (cache this) |
-| `POST /v1/token` | edge/LB (internal) | exchange key → short-lived JWT |
+| `POST /v1/introspect` | edge/LB (internal) | validate key → org + scopes (cache this); **requires `x-server-auth`** |
+| `POST /v1/token` | any valid API-key holder (public) | exchange key → short-lived JWT; authenticated by the key itself, **no `x-server-auth`** |
 | `GET /.well-known/jwks.json` | anyone | public keys for offline JWT verify |
 | `GET /healthz` | — | liveness |
 
