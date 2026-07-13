@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -41,6 +41,7 @@ use tower_http::{
 
 use keys::KeyStore;
 use model::{CreateKeyBody, IntrospectBody, TokenBody, UserCtx};
+use store::StoreError;
 
 const SERVICE: &str = "fiducia-auth";
 /// Default positive-introspection cache bound used by the current edge/LB.
@@ -256,6 +257,37 @@ fn storage_unavailable(error: &dyn std::fmt::Display) -> Response {
         .into_response()
 }
 
+fn key_store_error(error: StoreError) -> Response {
+    if matches!(error, StoreError::IdempotencyConflict) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "idempotency_conflict" })),
+        )
+            .into_response();
+    }
+    storage_unavailable(&error)
+}
+
+#[allow(clippy::result_large_err)]
+fn require_idempotency_key(headers: &HeaderMap) -> Result<String, Response> {
+    let Some(value) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    else {
+        return Err(bad_key_request("idempotency_key_required"));
+    };
+    if value.is_empty()
+        || value.len() > 128
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(bad_key_request("invalid_idempotency_key"));
+    }
+    Ok(value.to_string())
+}
+
 fn required_env(name: &str) -> Result<String, std::io::Error> {
     std::env::var(name)
         .ok()
@@ -314,6 +346,10 @@ async fn create_key(
         Ok(u) => u,
         Err(e) => return e,
     };
+    let idempotency_key = match require_idempotency_key(&headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let org = match select_user_org(&user, body.org_id.as_deref()) {
         Ok(org) => org,
         Err(response) => return response,
@@ -325,6 +361,8 @@ async fn create_key(
     let (raw, meta) = match s
         .keys
         .create(
+            &user.user_id,
+            &idempotency_key,
             org,
             input.name,
             input.scopes,
@@ -334,10 +372,14 @@ async fn create_key(
         .await
     {
         Ok(created) => created,
-        Err(error) => return storage_unavailable(&error),
+        Err(error) => return key_store_error(error),
     };
     // This raw value is returned only in the response that minted it.
-    Json(json!({ "api_key": raw, "key": meta })).into_response()
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({ "api_key": raw, "key": meta })),
+    )
+        .into_response()
 }
 
 /// `POST /v1/keys/{key_id}/rotate` — replace the authoritative secret and return
@@ -353,25 +395,36 @@ async fn rotate_key(
         Ok(u) => u,
         Err(e) => return e,
     };
+    let idempotency_key = match require_idempotency_key(&headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let org = match select_user_org(&user, query.org_id.as_deref()) {
         Ok(org) => org,
         Err(response) => return response,
     };
-    match s.keys.rotate(&org, &key_id).await {
-        Ok(Some((raw, meta))) => Json(json!({
-            "ok": true,
-            "api_key": raw,
-            "key": meta,
-            "secret_once": true,
-            "overlap_seconds": s.rotation_overlap_seconds,
-        }))
-        .into_response(),
+    match s
+        .keys
+        .rotate(&user.user_id, &idempotency_key, &org, &key_id)
+        .await
+    {
+        Ok(Some((raw, meta))) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "ok": true,
+                "api_key": raw,
+                "key": meta,
+                "secret_once": true,
+                "overlap_seconds": s.rotation_overlap_seconds,
+            })),
+        )
+            .into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "ok": false, "error": "key_not_found" })),
         )
             .into_response(),
-        Err(error) => storage_unavailable(&error),
+        Err(error) => key_store_error(error),
     }
 }
 

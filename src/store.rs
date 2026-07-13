@@ -27,6 +27,12 @@ pub struct StoredKey {
     pub org_id: OrgId,
     pub name: String,
     pub secret_hash: String,
+    /// Server-only idempotency markers. Defaults preserve records created before
+    /// durable lifecycle idempotency was introduced.
+    #[serde(default)]
+    pub create_idempotency_hash: String,
+    #[serde(default)]
+    pub last_rotation_idempotency_hash: Option<String>,
     pub scopes: Vec<String>,
     pub created_ms: u64,
     pub last_used_ms: Option<u64>,
@@ -50,6 +56,8 @@ impl From<&ApiKeyRecord> for StoredKey {
             org_id: r.org_id.clone(),
             name: r.name.clone(),
             secret_hash: r.secret_hash.clone(),
+            create_idempotency_hash: r.create_idempotency_hash.clone(),
+            last_rotation_idempotency_hash: r.last_rotation_idempotency_hash.clone(),
             scopes: r.scopes.clone(),
             created_ms: r.created_ms,
             last_used_ms: r.last_used_ms,
@@ -68,6 +76,8 @@ impl From<&StoredKey> for ApiKeyRecord {
             org_id: s.org_id.clone(),
             name: s.name.clone(),
             secret_hash: s.secret_hash.clone(),
+            create_idempotency_hash: s.create_idempotency_hash.clone(),
+            last_rotation_idempotency_hash: s.last_rotation_idempotency_hash.clone(),
             scopes: s.scopes.clone(),
             created_ms: s.created_ms,
             last_used_ms: s.last_used_ms,
@@ -84,6 +94,8 @@ impl From<&StoredKey> for ApiKeyRecord {
 pub struct KvClient {
     base: String,
     http: reqwest::Client,
+    internal_secret: String,
+    storage_org: String,
 }
 
 /// One decoded KV value together with the revision needed for compare-and-set.
@@ -102,6 +114,12 @@ pub enum CasOutcome {
 pub enum StoreError {
     #[error("FIDUCIA_KV_URL must be set")]
     MissingUrl,
+    #[error("FIDUCIA_INTERNAL_SECRET must be set for fiducia KV access")]
+    MissingInternalSecret,
+    #[error("FIDUCIA_KEY_IDEMPOTENCY_SECRET must be set")]
+    MissingIdempotencySecret,
+    #[error("FIDUCIA_KV_ORG_ID must be non-empty and contain no whitespace or control characters")]
+    InvalidStorageOrg,
     #[error("fiducia KV request failed: {0}")]
     Transport(#[from] reqwest::Error),
     #[error("fiducia KV returned HTTP {0}")]
@@ -114,6 +132,8 @@ pub enum StoreError {
     VersionOverflow,
     #[error("generated API-key id already exists")]
     KeyIdCollision,
+    #[error("idempotency key was already used with a different request")]
+    IdempotencyConflict,
 }
 
 impl KvClient {
@@ -124,18 +144,41 @@ impl KvClient {
             .ok()
             .filter(|u| !u.trim().is_empty())
             .ok_or(StoreError::MissingUrl)?;
+        let internal_secret = std::env::var("FIDUCIA_INTERNAL_SECRET")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(StoreError::MissingInternalSecret)?;
+        let storage_org =
+            std::env::var("FIDUCIA_KV_ORG_ID").unwrap_or_else(|_| "fiducia-auth".to_string());
+        if storage_org.is_empty()
+            || storage_org
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err(StoreError::InvalidStorageOrg);
+        }
         Ok(KvClient {
             base: base.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
+            internal_secret,
+            storage_org,
         })
+    }
+
+    fn trusted_request(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header("x-fiducia-internal-auth", &self.internal_secret)
+            .header("x-fiducia-org-id", &self.storage_org)
     }
 
     /// GET /v1/kv?key=… → the stored value and its CAS revision.
     pub async fn get_versioned(&self, key: &str) -> Result<Option<VersionedValue>, StoreError> {
         let resp = self
-            .http
-            .get(format!("{}/v1/kv", self.base))
-            .query(&[("key", key)])
+            .trusted_request(
+                self.http
+                    .get(format!("{}/v1/kv", self.base))
+                    .query(&[("key", key)]),
+            )
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -188,10 +231,12 @@ impl KvClient {
             "prev_revision": prev_revision,
         });
         let response = self
-            .http
-            .put(format!("{}/v1/kv", self.base))
-            .query(&[("key", key)])
-            .json(&body)
+            .trusted_request(
+                self.http
+                    .put(format!("{}/v1/kv", self.base))
+                    .query(&[("key", key)])
+                    .json(&body),
+            )
             .send()
             .await?;
         if !response.status().is_success() {
@@ -206,6 +251,8 @@ impl KvClient {
         Self {
             base,
             http: reqwest::Client::new(),
+            internal_secret: "test-internal-secret".to_string(),
+            storage_org: "fiducia-auth-test".to_string(),
         }
     }
 }
@@ -242,7 +289,41 @@ fn parse_put_response(response: &Value) -> Result<CasOutcome, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{http::HeaderMap, routing::get, Json, Router};
     use serde_json::json;
+
+    async fn trusted_get(headers: HeaderMap) -> Json<Value> {
+        assert_eq!(
+            headers
+                .get("x-fiducia-internal-auth")
+                .and_then(|value| value.to_str().ok()),
+            Some("test-internal-secret")
+        );
+        assert_eq!(
+            headers
+                .get("x-fiducia-org-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("fiducia-auth-test")
+        );
+        Json(json!({ "found": false }))
+    }
+
+    #[tokio::test]
+    async fn kv_requests_carry_internal_auth_and_the_service_org() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1/kv", get(trusted_get)))
+                .await
+                .unwrap();
+        });
+
+        let client = KvClient::for_test(format!("http://{address}"));
+        assert!(client.get("__auth/test").await.unwrap().is_none());
+        server.abort();
+    }
 
     #[test]
     fn old_stored_keys_default_version_and_idempotency_to_zero_and_false() {

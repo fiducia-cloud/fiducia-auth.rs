@@ -19,6 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # KDF, and hashes are constant-time compared on introspect.
 getrandom = "0.2"
 sha2 = "0.10"
+hmac = "0.12"
 
 # Shared OpenTelemetry + tracing setup (one init() for all services).
 fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.1.0" }
