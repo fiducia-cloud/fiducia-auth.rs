@@ -22,7 +22,7 @@ jobs:
         with:
           context: .
           build-args: |
-            INTERFACES_SHA=5f2c5279ee19941024455b2843256872485bac82
+            INTERFACES_SHA=487e470c45ab5851e8f6f3b1dc048fe067fbf408
           push: true
           tags: |
             ghcr.io/fiducia-cloud/fiducia-auth:latest
