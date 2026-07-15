@@ -1,5 +1,5 @@
-# Cargo configuration
+# .cargo
 
-Repository-local Cargo settings for the authentication service. Keep builds
-reproducible and never commit signing material, Supabase secrets, cookies, or
-other runtime credentials here.
+Cargo configuration scoped to this crate. `audit.toml` is the `cargo audit`
+advisory policy CI enforces — any accepted/ignored advisory must be recorded
+here with a justification, so the dependency-audit gate stays reviewable.
