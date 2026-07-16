@@ -230,6 +230,29 @@ mod tests {
     }
 
     #[test]
+    fn tampered_or_garbage_tokens_are_rejected() {
+        let s = signer();
+        let token = mint_with(&s, &"org_a".to_string(), &["kv:read".to_string()], 900);
+        assert!(verify_with(&s, &token).is_some(), "sanity: intact verifies");
+
+        // Corrupt one signature character: offline verification must fail
+        // closed rather than accept a forged/bit-flipped credential.
+        let (head, sig) = token.rsplit_once('.').expect("JWT has a signature");
+        let mut sig_bytes: Vec<u8> = sig.bytes().collect();
+        sig_bytes[0] = if sig_bytes[0] == b'A' { b'B' } else { b'A' };
+        let tampered = format!("{head}.{}", String::from_utf8(sig_bytes).unwrap());
+        assert!(
+            verify_with(&s, &tampered).is_none(),
+            "tampered signature must be rejected"
+        );
+
+        // Structurally-garbage inputs never verify either.
+        for garbage in ["", "not-a-jwt", "a.b", "a.b.c", &token[..token.len() - 20]] {
+            assert!(verify_with(&s, garbage).is_none(), "accepted {garbage:?}");
+        }
+    }
+
+    #[test]
     fn expired_token_is_rejected() {
         // Build a token that expired 2 min ago - beyond the verifier's default
         // 60s clock-skew leeway - and confirm it's rejected.

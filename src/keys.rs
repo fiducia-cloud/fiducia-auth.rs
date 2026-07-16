@@ -1025,6 +1025,81 @@ mod tests {
         server.abort();
     }
 
+    async fn mock_malformed_record(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+        // A stored value that is valid JSON but not a StoredKey record.
+        if query.get("key") == Some(&key_path("00000000aaaaaaaa")) {
+            return Json(json!({
+                "found": true,
+                "entry": {
+                    "value": json!({"unexpected": true}).to_string(),
+                    "mod_revision": 1,
+                    "expires_at_ms": null
+                }
+            }));
+        }
+        // A well-formed StoredKey whose key_id disagrees with the path it was
+        // fetched from (a swapped/corrupted record).
+        if query.get("key") == Some(&key_path("11111111bbbbbbbb")) {
+            let swapped = StoredKey {
+                key_id: "ffffffffcccccccc".to_string(),
+                org_id: "org_1".to_string(),
+                name: "swapped".to_string(),
+                secret_hash: hash_secret(&"a".repeat(64), TEST_API_KEY_PEPPER),
+                create_idempotency_hash: "create-marker".to_string(),
+                last_rotation_idempotency_hash: None,
+                scopes: vec![],
+                created_ms: 1,
+                last_used_ms: None,
+                revoked: false,
+                version: 1,
+                env: "live".to_string(),
+                require_idempotency: true,
+            };
+            return Json(json!({
+                "found": true,
+                "entry": {
+                    "value": serde_json::to_string(&swapped).unwrap(),
+                    "mod_revision": 1,
+                    "expires_at_ms": null
+                }
+            }));
+        }
+        Json(json!({ "found": false }))
+    }
+
+    #[tokio::test]
+    async fn production_introspection_fails_closed_on_malformed_stored_records() {
+        let app = Router::new().route("/v1/kv", get(mock_malformed_record));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let store = KeyStore {
+            cache: Mutex::new(HashMap::new()),
+            kv: Some(KvClient::for_test(format!("http://{address}"))),
+            idempotency_secret: b"fiducia-auth-test-idempotency-secret".to_vec(),
+            api_key_pepper: TEST_API_KEY_PEPPER.to_vec(),
+            allow_legacy_sha256: false,
+        };
+        let secret = "a".repeat(64);
+
+        // Both corruption shapes must surface a typed storage error - never a
+        // default record, and never a silently "valid" credential.
+        for key_id in ["00000000aaaaaaaa", "11111111bbbbbbbb"] {
+            let result = store
+                .introspect(&format!("fdc_live_{key_id}.{secret}"))
+                .await;
+            assert!(
+                matches!(result, Err(StoreError::InvalidValue)),
+                "stored corruption for {key_id} must fail closed, got {result:?}"
+            );
+        }
+        server.abort();
+    }
+
     #[tokio::test]
     async fn production_introspection_rejects_a_record_missing_from_its_org_index() {
         let key_id = "0123456789abcdef";
