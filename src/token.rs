@@ -29,6 +29,11 @@ use sha2::{Digest, Sha256};
 use crate::model::OrgId;
 
 const ISSUER: &str = "fiducia-auth";
+/// The data-plane verifiers (edge and load balancer) require this audience.
+/// Keep it a fixed issuer contract rather than an environment-controlled value:
+/// an accidental deployment mismatch must reject the token, not broaden where a
+/// credential is accepted.
+const AUDIENCE: &str = "fiducia-api";
 
 /// Claims in a fiducia-issued access token. `sub` = org id (the tenant the token
 /// acts for) so standard JWT tooling shows the org as the subject.
@@ -38,6 +43,7 @@ pub struct Claims {
     pub org_id: String,
     pub scopes: Vec<String>,
     pub iss: String,
+    pub aud: String,
     pub iat: u64,
     pub exp: u64,
 }
@@ -141,6 +147,7 @@ fn mint_with(signer: &Signer, org_id: &OrgId, scopes: &[String], ttl_secs: u64) 
         org_id: org_id.clone(),
         scopes: scopes.to_vec(),
         iss: ISSUER.to_string(),
+        aud: AUDIENCE.to_string(),
         iat: now,
         exp: now.saturating_add(ttl_secs),
     };
@@ -158,6 +165,7 @@ pub fn jwks() -> Value {
 fn verify_with(signer: &Signer, token: &str) -> Option<Claims> {
     let mut validation = Validation::new(Algorithm::ES256);
     validation.set_issuer(&[ISSUER]);
+    validation.set_audience(&[AUDIENCE]);
     validation.validate_exp = true;
     decode::<Claims>(token, &signer.decoding, &validation)
         .ok()
@@ -207,6 +215,7 @@ mod tests {
         assert_eq!(claims.sub, "org_123");
         assert_eq!(claims.scopes, scopes);
         assert_eq!(claims.iss, ISSUER);
+        assert_eq!(claims.aud, AUDIENCE);
         assert!(claims.exp > claims.iat);
     }
 
@@ -263,6 +272,7 @@ mod tests {
             org_id: "org_a".to_string(),
             scopes: vec![],
             iss: ISSUER.to_string(),
+            aud: AUDIENCE.to_string(),
             iat: now.saturating_sub(200),
             exp: now.saturating_sub(120),
         };

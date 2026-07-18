@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{OnceCell, RwLock};
 
-use crate::model::UserCtx;
+use crate::model::{AssuranceLevel, UserCtx};
 
 const DEFAULT_AUDIENCE: &str = "authenticated";
 const DEFAULT_JWKS_TTL_SECS: u64 = 10 * 60;
@@ -230,6 +230,7 @@ fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> 
 
     let orgs = orgs_from_metadata(&[claims.app_metadata.as_ref()]);
     let roles = roles_from_metadata(&[claims.app_metadata.as_ref()]);
+    let aal = assurance_level_from_claim(claims.aal.as_deref())?;
     Ok(UserCtx {
         user_id: claims.sub,
         email: claims.email,
@@ -239,6 +240,7 @@ fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> 
         // would let any user assign themselves into a victim org (tenant takeover).
         orgs,
         roles,
+        aal,
     })
 }
 
@@ -266,6 +268,7 @@ fn user_ctx_from_remote_user(
 
     let orgs = orgs_from_metadata(&[user.app_metadata.as_ref()]);
     let roles = roles_from_metadata(&[user.app_metadata.as_ref()]);
+    let aal = assurance_level_from_claim(user.aal.as_deref())?;
     Ok(UserCtx {
         user_id: user.id,
         email: user.email,
@@ -273,7 +276,19 @@ fn user_ctx_from_remote_user(
         // `user_metadata` — may grant org membership (see the note above).
         orgs,
         roles,
+        aal,
     })
+}
+
+/// Supabase encodes assurance directly in the JWT. Older tokens without the
+/// claim are single-factor (`aal1`); an unfamiliar value is never treated as a
+/// stronger assurance level.
+fn assurance_level_from_claim(value: Option<&str>) -> Result<AssuranceLevel, VerifyError> {
+    match value.unwrap_or("aal1") {
+        "aal1" => Ok(AssuranceLevel::Aal1),
+        "aal2" => Ok(AssuranceLevel::Aal2),
+        other => Err(VerifyError::UnexpectedAssurance(other.to_string())),
+    }
 }
 
 fn orgs_from_metadata(values: &[Option<&Value>]) -> Vec<String> {
@@ -465,6 +480,8 @@ struct SupabaseClaims {
     sub: String,
     email: Option<String>,
     role: Option<String>,
+    #[serde(default)]
+    aal: Option<String>,
     app_metadata: Option<Value>,
     #[serde(rename = "user_metadata")]
     _user_metadata: Option<Value>,
@@ -476,6 +493,8 @@ struct SupabaseUser {
     aud: Option<String>,
     email: Option<String>,
     role: Option<String>,
+    #[serde(default)]
+    aal: Option<String>,
     app_metadata: Option<Value>,
     #[serde(rename = "user_metadata")]
     _user_metadata: Option<Value>,
@@ -494,6 +513,7 @@ enum VerifyError {
     SupabaseStatus(StatusCode),
     SymmetricJwk,
     UnexpectedAudience(Option<String>),
+    UnexpectedAssurance(String),
     UnexpectedRole(Option<String>),
     UnsupportedAlgorithm(Algorithm),
 }
@@ -519,6 +539,9 @@ impl fmt::Display for VerifyError {
             }
             VerifyError::SymmetricJwk => write!(f, "refusing to verify JWT with symmetric jwk"),
             VerifyError::UnexpectedAudience(aud) => write!(f, "unexpected audience {aud:?}"),
+            VerifyError::UnexpectedAssurance(aal) => {
+                write!(f, "unexpected authenticator assurance level {aal:?}")
+            }
             VerifyError::UnexpectedRole(role) => write!(f, "unexpected role {role:?}"),
             VerifyError::UnsupportedAlgorithm(alg) => {
                 write!(f, "unsupported jwt signing algorithm {alg:?}")
@@ -603,6 +626,7 @@ mod tests {
             sub: "user_1".to_string(),
             email: Some("user@example.com".to_string()),
             role: Some(DEFAULT_AUDIENCE.to_string()),
+            aal: Some("aal2".to_string()),
             app_metadata: Some(json!({
                 "orgs": ["org_trusted"],
                 "fiducia_roles": ["operator"]
@@ -616,6 +640,7 @@ mod tests {
         let user = user_ctx_from_claims(claims).unwrap();
         assert_eq!(user.orgs, vec!["org_trusted"]);
         assert_eq!(user.roles, vec!["operator"]);
+        assert_eq!(user.aal, AssuranceLevel::Aal2);
     }
 
     #[test]
@@ -624,6 +649,7 @@ mod tests {
             sub: "user_1".to_string(),
             email: Some("user@example.com".to_string()),
             role: Some("service_role".to_string()),
+            aal: None,
             app_metadata: None,
             _user_metadata: None,
         };
@@ -631,6 +657,23 @@ mod tests {
         assert!(matches!(
             user_ctx_from_claims(claims),
             Err(VerifyError::UnexpectedRole(Some(role))) if role == "service_role"
+        ));
+    }
+
+    #[test]
+    fn missing_aal_is_single_factor_and_unknown_aal_is_rejected() {
+        assert_eq!(
+            assurance_level_from_claim(None).unwrap(),
+            AssuranceLevel::Aal1,
+            "older Supabase tokens without aal must never become MFA sessions"
+        );
+        assert_eq!(
+            assurance_level_from_claim(Some("aal2")).unwrap(),
+            AssuranceLevel::Aal2
+        );
+        assert!(matches!(
+            assurance_level_from_claim(Some("aal3")),
+            Err(VerifyError::UnexpectedAssurance(level)) if level == "aal3"
         ));
     }
 
@@ -743,6 +786,7 @@ mod tests {
             aud: Some("service_role".to_string()),
             email: Some("user@example.com".to_string()),
             role: Some(DEFAULT_AUDIENCE.to_string()),
+            aal: None,
             app_metadata: None,
             _user_metadata: None,
         };
