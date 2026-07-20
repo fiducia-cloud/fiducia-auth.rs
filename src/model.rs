@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 pub type OrgId = String;
 pub type UserId = String;
 
+/// The assurance level carried by a Supabase session JWT. Missing claims are
+/// treated as `aal1` by the verifier for backwards compatibility with tokens
+/// issued before Supabase added the claim; unknown levels are rejected.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AssuranceLevel {
+    #[default]
+    Aal1,
+    Aal2,
+}
+
 /// Identity proven by a Supabase session JWT (dashboard plane).
 #[derive(Debug, Clone, Serialize)]
 pub struct UserCtx {
@@ -14,8 +25,13 @@ pub struct UserCtx {
     pub orgs: Vec<OrgId>,
     /// Application roles copied only from Supabase `app_metadata`, which is
     /// controlled by trusted server-side administration. Browser-writable user
-    /// metadata is never an authorization source.
+    /// metadata is never an authorization source. Customer callers normally
+    /// have no roles; admin apps additionally require a recognized operator role.
     pub roles: Vec<String>,
+    /// Verified session assurance. Customer-facing consumers use this together
+    /// with the live factor list to reject a stale `aal1` session for an account
+    /// that has an enrolled MFA factor.
+    pub aal: AssuranceLevel,
 }
 
 /// What an API key resolves to (data plane). This is what the edge/LB caches.

@@ -145,10 +145,79 @@ fn env_or(name: &str, default: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The env-reading tests share process-global state; serialize them.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn disabled_without_service_key() {
+        let _env = ENV_LOCK.lock().unwrap();
         std::env::remove_var("SUPABASE_SERVICE_ROLE_KEY");
         assert!(SyncConfig::from_env().is_err());
+    }
+
+    /// The resilience story pinned end-to-end: one good initial pull, then the
+    /// system of record goes down — the cache must keep serving the last good
+    /// rows (stale beats empty for the hot auth path) instead of clearing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_cache_keeps_serving_through_a_sor_outage() {
+        use axum::response::IntoResponse;
+        use axum::{routing::get, Router};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static PULLS: AtomicU32 = AtomicU32::new(0);
+        async fn orgs() -> axum::response::Response {
+            if PULLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                axum::Json(serde_json::json!([{ "id": "org_1", "plan": "pro" }])).into_response()
+            } else {
+                // The outage: every refresh after the initial pull fails.
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        }
+        let app = Router::new().route("/rest/v1/organizations", get(orgs));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Hold the env lock across set-vars AND the initial pull so the other
+        // env-mutating test cannot interleave (block_in_place keeps the sync
+        // guard legal on a multi-thread runtime).
+        let cache = Arc::new(OrgCache::default());
+        let started = cache.clone();
+        tokio::task::block_in_place(move || {
+            let _env = ENV_LOCK.lock().unwrap();
+            std::env::set_var("SUPABASE_URL", &base);
+            std::env::set_var("SUPABASE_SERVICE_ROLE_KEY", "test-key");
+            std::env::set_var("SUPABASE_SYNC_INTERVAL_SECS", "1");
+            let result = tokio::runtime::Handle::current().block_on(start(started));
+            std::env::remove_var("SUPABASE_URL");
+            std::env::remove_var("SUPABASE_SERVICE_ROLE_KEY");
+            std::env::remove_var("SUPABASE_SYNC_INTERVAL_SECS");
+            result.expect("startup completes one good pull");
+        });
+        assert_eq!(
+            cache.get("org_1").await.unwrap()["plan"],
+            "pro",
+            "initial pull populated the cache"
+        );
+
+        // Wait (bounded) until at least two refreshes have FAILED.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while PULLS.load(Ordering::SeqCst) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "refresh loop never ran against the dead SoR"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // WRONG BEHAVIOR => FAIL: the cache must still serve the stale rows.
+        let row = cache
+            .get("org_1")
+            .await
+            .expect("stale cache must keep serving through the outage");
+        assert_eq!(row["plan"], "pro");
     }
 
     #[tokio::test]

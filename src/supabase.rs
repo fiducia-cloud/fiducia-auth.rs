@@ -21,9 +21,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{OnceCell, RwLock};
 
-use crate::model::UserCtx;
+use crate::model::{AssuranceLevel, UserCtx};
 
-const DEFAULT_PROJECT_REF: &str = "ruxctrzdvugxztbjcpoi";
 const DEFAULT_AUDIENCE: &str = "authenticated";
 const DEFAULT_JWKS_TTL_SECS: u64 = 10 * 60;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 5;
@@ -38,6 +37,14 @@ const MIN_FORCED_JWKS_REFRESH_SECS: u64 = 30;
 
 static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
 static JWKS_CACHE: OnceCell<RwLock<Option<CachedJwks>>> = OnceCell::const_new();
+
+/// Validate the project identity at startup so a missing deployment value can
+/// never silently select a real project or turn into per-request auth failure.
+pub fn validate_config() -> Result<(), String> {
+    SupabaseConfig::from_env()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
 
 /// Verifies a Supabase Auth access token and returns the caller identity.
 pub async fn verify_session(bearer_jwt: &str) -> Option<UserCtx> {
@@ -55,7 +62,7 @@ async fn verify_session_inner(jwt: &str) -> Result<UserCtx, VerifyError> {
         return Err(VerifyError::InvalidToken("empty bearer token"));
     }
 
-    let config = SupabaseConfig::from_env();
+    let config = SupabaseConfig::from_env()?;
     let header = decode_header(jwt).map_err(VerifyError::Jwt)?;
 
     if is_asymmetric_algorithm(header.alg) && header.kid.is_some() {
@@ -223,6 +230,7 @@ fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> 
 
     let orgs = orgs_from_metadata(&[claims.app_metadata.as_ref()]);
     let roles = roles_from_metadata(&[claims.app_metadata.as_ref()]);
+    let aal = assurance_level_from_claim(claims.aal.as_deref())?;
     Ok(UserCtx {
         user_id: claims.sub,
         email: claims.email,
@@ -232,6 +240,7 @@ fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> 
         // would let any user assign themselves into a victim org (tenant takeover).
         orgs,
         roles,
+        aal,
     })
 }
 
@@ -259,6 +268,7 @@ fn user_ctx_from_remote_user(
 
     let orgs = orgs_from_metadata(&[user.app_metadata.as_ref()]);
     let roles = roles_from_metadata(&[user.app_metadata.as_ref()]);
+    let aal = assurance_level_from_claim(user.aal.as_deref())?;
     Ok(UserCtx {
         user_id: user.id,
         email: user.email,
@@ -266,7 +276,19 @@ fn user_ctx_from_remote_user(
         // `user_metadata` — may grant org membership (see the note above).
         orgs,
         roles,
+        aal,
     })
+}
+
+/// Supabase encodes assurance directly in the JWT. Older tokens without the
+/// claim are single-factor (`aal1`); an unfamiliar value is never treated as a
+/// stronger assurance level.
+fn assurance_level_from_claim(value: Option<&str>) -> Result<AssuranceLevel, VerifyError> {
+    match value.unwrap_or("aal1") {
+        "aal1" => Ok(AssuranceLevel::Aal1),
+        "aal2" => Ok(AssuranceLevel::Aal2),
+        other => Err(VerifyError::UnexpectedAssurance(other.to_string())),
+    }
 }
 
 fn orgs_from_metadata(values: &[Option<&Value>]) -> Vec<String> {
@@ -312,7 +334,7 @@ fn push_org(orgs: &mut Vec<String>, org: &str) {
 fn roles_from_metadata(values: &[Option<&Value>]) -> Vec<String> {
     let mut roles = Vec::new();
     for value in values.iter().flatten() {
-        for key in ["fiducia_roles", "roles"] {
+        for key in ["fiducia_roles", "roles", "role"] {
             if let Some(role_value) = value.get(key) {
                 push_role_value(&mut roles, role_value);
             }
@@ -372,12 +394,18 @@ struct SupabaseConfig {
 }
 
 impl SupabaseConfig {
-    fn from_env() -> Self {
-        let project_ref = env_value("SUPABASE_PROJECT_REF")
-            .or_else(|| env_value("SUPABASE_PROJECT_ID"))
-            .unwrap_or_else(|| DEFAULT_PROJECT_REF.to_string());
-        let url =
-            env_value("SUPABASE_URL").unwrap_or_else(|| supabase_url_for_project(&project_ref));
+    fn from_env() -> Result<Self, VerifyError> {
+        let url = match env_value("SUPABASE_URL") {
+            Some(url) => url,
+            None => {
+                let project_ref = env_value("SUPABASE_PROJECT_REF")
+                    .or_else(|| env_value("SUPABASE_PROJECT_ID"))
+                    .ok_or(VerifyError::MissingConfiguration(
+                        "SUPABASE_URL or SUPABASE_PROJECT_REF must be set",
+                    ))?;
+                supabase_url_for_project(&project_ref)
+            }
+        };
         let url = normalize_url(&url);
         let issuer = env_value("SUPABASE_AUTH_ISSUER").unwrap_or_else(|| format!("{url}/auth/v1"));
         let jwks_url = env_value("SUPABASE_AUTH_JWKS_URL")
@@ -385,7 +413,7 @@ impl SupabaseConfig {
         let user_url =
             env_value("SUPABASE_AUTH_USER_URL").unwrap_or_else(|| format!("{issuer}/user"));
 
-        SupabaseConfig {
+        Ok(SupabaseConfig {
             audience: env_value("SUPABASE_AUTH_AUDIENCE")
                 .unwrap_or_else(|| DEFAULT_AUDIENCE.to_string()),
             issuer,
@@ -398,7 +426,7 @@ impl SupabaseConfig {
             publishable_key: env_value("SUPABASE_PUBLISHABLE_KEY"),
             user_url,
             allow_remote_userinfo: env_bool("SUPABASE_AUTH_ALLOW_REMOTE_USERINFO", true),
-        }
+        })
     }
 
     #[cfg(test)]
@@ -452,6 +480,8 @@ struct SupabaseClaims {
     sub: String,
     email: Option<String>,
     role: Option<String>,
+    #[serde(default)]
+    aal: Option<String>,
     app_metadata: Option<Value>,
     #[serde(rename = "user_metadata")]
     _user_metadata: Option<Value>,
@@ -463,6 +493,8 @@ struct SupabaseUser {
     aud: Option<String>,
     email: Option<String>,
     role: Option<String>,
+    #[serde(default)]
+    aal: Option<String>,
     app_metadata: Option<Value>,
     #[serde(rename = "user_metadata")]
     _user_metadata: Option<Value>,
@@ -476,10 +508,12 @@ enum VerifyError {
     Jwt(jsonwebtoken::errors::Error),
     MissingJwk(String),
     MissingPublishableKey,
+    MissingConfiguration(&'static str),
     RejectedBySupabase,
     SupabaseStatus(StatusCode),
     SymmetricJwk,
     UnexpectedAudience(Option<String>),
+    UnexpectedAssurance(String),
     UnexpectedRole(Option<String>),
     UnsupportedAlgorithm(Algorithm),
 }
@@ -498,12 +532,16 @@ impl fmt::Display for VerifyError {
                     "SUPABASE_PUBLISHABLE_KEY is required for remote auth verification"
                 )
             }
+            VerifyError::MissingConfiguration(message) => write!(f, "{message}"),
             VerifyError::RejectedBySupabase => write!(f, "supabase rejected bearer token"),
             VerifyError::SupabaseStatus(status) => {
                 write!(f, "supabase auth returned unexpected status {status}")
             }
             VerifyError::SymmetricJwk => write!(f, "refusing to verify JWT with symmetric jwk"),
             VerifyError::UnexpectedAudience(aud) => write!(f, "unexpected audience {aud:?}"),
+            VerifyError::UnexpectedAssurance(aal) => {
+                write!(f, "unexpected authenticator assurance level {aal:?}")
+            }
             VerifyError::UnexpectedRole(role) => write!(f, "unexpected role {role:?}"),
             VerifyError::UnsupportedAlgorithm(alg) => {
                 write!(f, "unsupported jwt signing algorithm {alg:?}")
@@ -568,14 +606,16 @@ mod tests {
     fn roles_come_only_from_trusted_app_metadata_shape() {
         let metadata = json!({
             "fiducia_roles": ["Admin", "operator", "admin"],
-            "roles": "auditor"
+            "roles": "auditor",
+            "role": "viewer"
         });
         assert_eq!(
             roles_from_metadata(&[Some(&metadata)]),
             vec![
                 "admin".to_string(),
                 "operator".to_string(),
-                "auditor".to_string()
+                "auditor".to_string(),
+                "viewer".to_string()
             ]
         );
     }
@@ -586,6 +626,7 @@ mod tests {
             sub: "user_1".to_string(),
             email: Some("user@example.com".to_string()),
             role: Some(DEFAULT_AUDIENCE.to_string()),
+            aal: Some("aal2".to_string()),
             app_metadata: Some(json!({
                 "orgs": ["org_trusted"],
                 "fiducia_roles": ["operator"]
@@ -599,6 +640,7 @@ mod tests {
         let user = user_ctx_from_claims(claims).unwrap();
         assert_eq!(user.orgs, vec!["org_trusted"]);
         assert_eq!(user.roles, vec!["operator"]);
+        assert_eq!(user.aal, AssuranceLevel::Aal2);
     }
 
     #[test]
@@ -607,6 +649,7 @@ mod tests {
             sub: "user_1".to_string(),
             email: Some("user@example.com".to_string()),
             role: Some("service_role".to_string()),
+            aal: None,
             app_metadata: None,
             _user_metadata: None,
         };
@@ -614,6 +657,23 @@ mod tests {
         assert!(matches!(
             user_ctx_from_claims(claims),
             Err(VerifyError::UnexpectedRole(Some(role))) if role == "service_role"
+        ));
+    }
+
+    #[test]
+    fn missing_aal_is_single_factor_and_unknown_aal_is_rejected() {
+        assert_eq!(
+            assurance_level_from_claim(None).unwrap(),
+            AssuranceLevel::Aal1,
+            "older Supabase tokens without aal must never become MFA sessions"
+        );
+        assert_eq!(
+            assurance_level_from_claim(Some("aal2")).unwrap(),
+            AssuranceLevel::Aal2
+        );
+        assert!(matches!(
+            assurance_level_from_claim(Some("aal3")),
+            Err(VerifyError::UnexpectedAssurance(level)) if level == "aal3"
         ));
     }
 
@@ -726,6 +786,7 @@ mod tests {
             aud: Some("service_role".to_string()),
             email: Some("user@example.com".to_string()),
             role: Some(DEFAULT_AUDIENCE.to_string()),
+            aal: None,
             app_metadata: None,
             _user_metadata: None,
         };

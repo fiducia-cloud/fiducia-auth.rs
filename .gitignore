@@ -12,3 +12,11 @@ tmp/
 
 # Local cargo target probe cache
 .cargo-target-check/
+
+# --- hardened baseline (auto) ---
+Thumbs.db
+*.swp
+*~
+.direnv/
+target/
+.cargo-target-*/
