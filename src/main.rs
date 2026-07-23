@@ -80,7 +80,11 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    fiducia_telemetry::init(SERVICE);
+    // Hold the guard for the whole of `main`: v0.2.1's `init` returns a
+    // `#[must_use]` TelemetryGuard that flushes and shuts down the OTLP trace +
+    // metric exporters on drop, so `let _ =` (or a bare statement) would tear
+    // telemetry down immediately. `_telemetry` keeps it alive until main exits.
+    let _telemetry = fiducia_telemetry::init(SERVICE);
 
     token::validate_config().map_err(std::io::Error::other)?;
     supabase::validate_config().map_err(std::io::Error::other)?;
