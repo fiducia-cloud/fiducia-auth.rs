@@ -24,7 +24,7 @@ sha2 = "0.10"
 hmac = "0.12"
 
 # Shared OpenTelemetry + tracing setup (one init() for all services).
-fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.1.0" }
+fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.2.1" }
 
 # Shared API payload/error contract. Auth produces `Introspection` (the key-
 # validation result the edge/LB caches), so it speaks the shared type directly.

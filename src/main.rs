@@ -80,7 +80,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    fiducia_telemetry::init(SERVICE);
+    let _telemetry = fiducia_telemetry::init(SERVICE);
 
     token::validate_config().map_err(std::io::Error::other)?;
     supabase::validate_config().map_err(std::io::Error::other)?;
