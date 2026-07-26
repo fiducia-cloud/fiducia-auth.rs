@@ -5,7 +5,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
 # Immutable cross-repository input. Bump this SHA together with the CI checkout.
-ARG INTERFACES_SHA=487e470c45ab5851e8f6f3b1dc048fe067fbf408
+ARG INTERFACES_SHA=2c5c806174e067fbe83ad48b724366323ba390a2
 RUN git init fiducia-interfaces \
     && git -C fiducia-interfaces remote add origin \
        https://github.com/fiducia-cloud/fiducia-interfaces.git \

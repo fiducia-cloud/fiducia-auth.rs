@@ -40,7 +40,7 @@ use tower_http::{
 };
 
 use keys::{KeyStore, MutationIdentity};
-use model::{AssuranceLevel, CreateKeyBody, IntrospectBody, TokenBody, UserCtx};
+use model::{CreateKeyBody, IntrospectBody, TokenBody, UserCtx};
 use store::StoreError;
 
 const SERVICE: &str = "fiducia-auth";
@@ -691,8 +691,9 @@ mod cors_tests {
 mod interface_contract_tests {
     use super::{
         customer_origin_from, rotation_overlap_seconds_from, select_user_org,
-        validated_key_create_input, AssuranceLevel, CreateKeyBody, UserCtx,
+        validated_key_create_input, CreateKeyBody, UserCtx,
     };
+    use crate::model::AssuranceLevel;
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 
     #[test]
