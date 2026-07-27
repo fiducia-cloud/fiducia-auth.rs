@@ -70,7 +70,12 @@ enum DeploymentMode {
 
 impl DeploymentMode {
     fn parse(value: Option<&str>) -> Result<Self, StartupPolicyError> {
-        match value.unwrap_or("production").trim().to_ascii_lowercase().as_str() {
+        match value
+            .unwrap_or("production")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "production" | "prod" => Ok(Self::Production),
             "staging" | "stage" => Ok(Self::Staging),
             "development" | "dev" => Ok(Self::Development),
