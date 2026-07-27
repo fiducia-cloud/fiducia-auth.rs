@@ -208,9 +208,7 @@ impl RevocationRecord {
         validate_audit_text("actor", &self.actor, 128)?;
         match &self.target {
             RevocationTarget::TokenId { jti } => validate_identifier("jti", jti)?,
-            RevocationTarget::Subject { subject } => {
-                validate_identifier("subject", subject)?
-            }
+            RevocationTarget::Subject { subject } => validate_identifier("subject", subject)?,
         }
         if self.expires_at <= self.created_at {
             return Err(RevocationRecordError::InvalidWindow);
@@ -394,8 +392,7 @@ fn mint_with(
     };
     let mut header = Header::new(Algorithm::ES256);
     header.kid = Some(signer.kid.clone());
-    encode(&header, &claims, &signer.encoding)
-        .map_err(|_| MintError::EntropyUnavailable)
+    encode(&header, &claims, &signer.encoding).map_err(|_| MintError::EntropyUnavailable)
 }
 
 fn validate_ttl(ttl_secs: u64) -> Result<(), MintError> {
@@ -443,10 +440,7 @@ fn generate_secret() -> SecretKey {
     }
 }
 
-fn validate_identifier(
-    field: &'static str,
-    value: &str,
-) -> Result<(), RevocationRecordError> {
+fn validate_identifier(field: &'static str, value: &str) -> Result<(), RevocationRecordError> {
     let value = value.trim();
     if value.is_empty()
         || value.len() > 256
@@ -465,10 +459,7 @@ fn validate_audit_text(
     max_len: usize,
 ) -> Result<(), RevocationRecordError> {
     let value = value.trim();
-    if value.is_empty()
-        || value.len() > max_len
-        || value.chars().any(char::is_control)
-    {
+    if value.is_empty() || value.len() > max_len || value.chars().any(char::is_control) {
         return Err(RevocationRecordError::InvalidField(field));
     }
     Ok(())
@@ -589,13 +580,8 @@ mod tests {
     #[test]
     fn tampered_or_garbage_tokens_are_rejected() {
         let signer = signer();
-        let token = mint_with(
-            &signer,
-            &"org_a".to_string(),
-            &["kv:read".to_string()],
-            900,
-        )
-        .unwrap();
+        let token =
+            mint_with(&signer, &"org_a".to_string(), &["kv:read".to_string()], 900).unwrap();
         assert!(
             verify_with(&signer, &token).is_some(),
             "sanity: intact verifies"
@@ -610,10 +596,7 @@ mod tests {
         } else {
             b'A'
         };
-        let tampered = format!(
-            "{head}.{}",
-            String::from_utf8(signature_bytes).unwrap()
-        );
+        let tampered = format!("{head}.{}", String::from_utf8(signature_bytes).unwrap());
         assert!(
             verify_with(&signer, &tampered).is_none(),
             "tampered signature must be rejected"
@@ -660,62 +643,29 @@ mod tests {
         assert!(record.matches(&token, 999));
         assert!(!record.matches(&token, 1_000));
         assert!(record.should_prune_at(1_000));
-        assert!(!record.matches(
-            &claims("org_a", "org_a", "token-2", 100, 1_000),
-            500,
-        ));
-        assert!(!record.matches(
-            &claims("org_b", "org_a", "token-1", 100, 1_000),
-            500,
-        ));
+        assert!(!record.matches(&claims("org_a", "org_a", "token-2", 100, 1_000), 500,));
+        assert!(!record.matches(&claims("org_b", "org_a", "token-1", 100, 1_000), 500,));
     }
 
     #[test]
     fn subject_revocation_never_crosses_tenants() {
-        let record = RevocationRecord::for_subject(
-            "org_a",
-            "user_1",
-            "session reset",
-            "admin:42",
-            100,
-            200,
-        )
-        .unwrap();
-        assert!(record.matches(
-            &claims("org_a", "user_1", "token-a", 50, 200),
-            150,
-        ));
-        assert!(!record.matches(
-            &claims("org_b", "user_1", "token-b", 50, 200),
-            150,
-        ));
-        assert!(!record.matches(
-            &claims("org_a", "user_2", "token-c", 50, 200),
-            150,
-        ));
+        let record =
+            RevocationRecord::for_subject("org_a", "user_1", "session reset", "admin:42", 100, 200)
+                .unwrap();
+        assert!(record.matches(&claims("org_a", "user_1", "token-a", 50, 200), 150,));
+        assert!(!record.matches(&claims("org_b", "user_1", "token-b", 50, 200), 150,));
+        assert!(!record.matches(&claims("org_a", "user_2", "token-c", 50, 200), 150,));
     }
 
     #[test]
     fn storage_keys_are_opaque_deterministic_and_collision_scoped() {
-        let first = RevocationRecord::for_subject(
-            "org_a",
-            "user_1",
-            "session reset",
-            "admin:42",
-            100,
-            200,
-        )
-        .unwrap();
+        let first =
+            RevocationRecord::for_subject("org_a", "user_1", "session reset", "admin:42", 100, 200)
+                .unwrap();
         let retry = first.clone();
-        let other_tenant = RevocationRecord::for_subject(
-            "org_b",
-            "user_1",
-            "session reset",
-            "admin:42",
-            100,
-            200,
-        )
-        .unwrap();
+        let other_tenant =
+            RevocationRecord::for_subject("org_b", "user_1", "session reset", "admin:42", 100, 200)
+                .unwrap();
 
         let key = first.storage_key().unwrap();
         assert_eq!(key, retry.storage_key().unwrap());
@@ -727,15 +677,9 @@ mod tests {
 
     #[test]
     fn records_are_versioned_serializable_and_bounded() {
-        let record = RevocationRecord::for_subject(
-            "org_a",
-            "user_1",
-            "session reset",
-            "admin:42",
-            100,
-            200,
-        )
-        .unwrap();
+        let record =
+            RevocationRecord::for_subject("org_a", "user_1", "session reset", "admin:42", 100, 200)
+                .unwrap();
         let encoded = serde_json::to_string(&record).unwrap();
         let decoded: RevocationRecord = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, record);
