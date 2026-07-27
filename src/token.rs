@@ -351,6 +351,52 @@ pub fn validate_config() -> Result<(), String> {
     SecretKey::from_pkcs8_pem(pem.trim())
         .map_err(|error| format!("FIDUCIA_JWT_SIGNING_KEY is invalid: {error}"))?;
     Lazy::force(&SIGNER);
+    validate_revocation_contract()?;
+    Ok(())
+}
+
+/// Exercise the versioned revocation contract during startup so a broken
+/// identity, scope, expiry, or storage-key invariant prevents the replica from
+/// accepting traffic. This uses synthetic content-free values only.
+fn validate_revocation_contract() -> Result<(), String> {
+    let claims = Claims {
+        sub: "__startup_subject".to_string(),
+        org_id: "__startup_tenant".to_string(),
+        scopes: Vec::new(),
+        iss: ISSUER.to_string(),
+        aud: AUDIENCE.to_string(),
+        iat: 0,
+        exp: 2,
+        jti: "startup-token".to_string(),
+    };
+    let exact =
+        RevocationRecord::for_token(&claims, "startup contract validation", "fiducia-auth", 1)
+            .map_err(|error| format!("revocation token contract is invalid: {error}"))?;
+    let subject = RevocationRecord::for_subject(
+        &claims.org_id,
+        &claims.sub,
+        "startup contract validation",
+        "fiducia-auth",
+        1,
+        2,
+    )
+    .map_err(|error| format!("revocation subject contract is invalid: {error}"))?;
+    let exact_key = exact
+        .storage_key()
+        .map_err(|error| format!("revocation token storage key is invalid: {error}"))?;
+    let subject_key = subject
+        .storage_key()
+        .map_err(|error| format!("revocation subject storage key is invalid: {error}"))?;
+
+    if exact_key == subject_key
+        || !exact.matches(&claims, 1)
+        || exact.matches(&claims, 2)
+        || exact.should_prune_at(1)
+        || !exact.should_prune_at(2)
+        || !subject.matches(&claims, 1)
+    {
+        return Err("revocation contract startup self-check failed".to_string());
+    }
     Ok(())
 }
 
