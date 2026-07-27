@@ -1,4 +1,4 @@
-name: DEN-252 one-shot clippy probe
+name: DEN-252 one-shot revocation contract integration
 
 on:
   push:
@@ -10,48 +10,111 @@ permissions:
   contents: write
 
 concurrency:
-  group: den-252-clippy-probe-${{ github.ref }}
+  group: den-252-revocation-contract-integration-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  capture-clippy-diagnostic:
+  integrate-contract:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: true
           ref: agent/den-252-token-revocation-contract
-          path: repo
-          submodules: recursive
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          repository: fiducia-cloud/fiducia-interfaces
-          ref: 2c5c806174e067fbe83ad48b724366323ba390a2
-          path: fiducia-interfaces
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: "1.95.0"
-          components: clippy
-      - name: Capture concise clippy output once
-        working-directory: repo
+          components: rustfmt
+      - name: Add a fail-closed startup contract self-check once
         shell: bash
         run: |
           set -euo pipefail
-          diagnostic=docs/den-252-clippy-diagnostics.txt
-          if [[ -f "$diagnostic" ]]; then
-            echo 'diagnostic already captured'
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/token.rs')
+          source = path.read_text()
+          if 'fn validate_revocation_contract()' in source:
+              print('revocation startup contract already integrated')
+              raise SystemExit(0)
+
+          old = '''    Lazy::force(&SIGNER);
+              Ok(())
+          }
+
+          /// Mint a short-lived JWT for an introspected key/session.'''
+          new = '''    Lazy::force(&SIGNER);
+              validate_revocation_contract()?;
+              Ok(())
+          }
+
+          /// Exercise the versioned revocation contract during startup so a broken
+          /// identity, scope, expiry, or storage-key invariant prevents the replica from
+          /// accepting traffic. This uses synthetic content-free values only.
+          fn validate_revocation_contract() -> Result<(), String> {
+              let claims = Claims {
+                  sub: "__startup_subject".to_string(),
+                  org_id: "__startup_tenant".to_string(),
+                  scopes: Vec::new(),
+                  iss: ISSUER.to_string(),
+                  aud: AUDIENCE.to_string(),
+                  iat: 0,
+                  exp: 2,
+                  jti: "startup-token".to_string(),
+              };
+              let exact = RevocationRecord::for_token(
+                  &claims,
+                  "startup contract validation",
+                  "fiducia-auth",
+                  1,
+              )
+              .map_err(|error| format!("revocation token contract is invalid: {error}"))?;
+              let subject = RevocationRecord::for_subject(
+                  &claims.org_id,
+                  &claims.sub,
+                  "startup contract validation",
+                  "fiducia-auth",
+                  1,
+                  2,
+              )
+              .map_err(|error| format!("revocation subject contract is invalid: {error}"))?;
+              let exact_key = exact
+                  .storage_key()
+                  .map_err(|error| format!("revocation token storage key is invalid: {error}"))?;
+              let subject_key = subject
+                  .storage_key()
+                  .map_err(|error| format!("revocation subject storage key is invalid: {error}"))?;
+
+              if exact_key == subject_key
+                  || !exact.matches(&claims, 1)
+                  || exact.matches(&claims, 2)
+                  || exact.should_prune_at(1)
+                  || !exact.should_prune_at(2)
+                  || !subject.matches(&claims, 1)
+              {
+                  return Err("revocation contract startup self-check failed".to_string());
+              }
+              Ok(())
+          }
+
+          /// Mint a short-lived JWT for an introspected key/session.'''
+          if source.count(old) != 1:
+              raise SystemExit('expected token.rs integration anchor exactly once')
+          path.write_text(source.replace(old, new))
+          PY
+          rustfmt --edition 2021 src/token.rs
+          if git diff --quiet -- src/token.rs; then
+            echo 'no token contract change required'
             exit 0
           fi
-          set +e
-          cargo clippy --locked --all-targets --message-format=short -- -D warnings > /tmp/clippy.log 2>&1
-          status=$?
-          set -e
-          tail -n 200 /tmp/clippy.log > "$diagnostic"
-          printf '\nexit_status=%s\n' "$status" >> "$diagnostic"
+          if ! git diff --quiet -- . ':(exclude)src/token.rs'; then
+            echo 'integration changed an unexpected path' >&2
+            git --no-pager diff -- . ':(exclude)src/token.rs'
+            exit 1
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add "$diagnostic"
-          git commit -m 'DEN-252 capture concise clippy diagnostic'
+          git add src/token.rs
+          git commit -m 'DEN-252 validate revocation contract at startup'
           git push origin HEAD:agent/den-252-token-revocation-contract
