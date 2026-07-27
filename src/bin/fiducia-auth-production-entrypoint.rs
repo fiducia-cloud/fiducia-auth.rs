@@ -43,8 +43,7 @@ fn run() -> Result<(), StartupPolicyError> {
 
     #[cfg(unix)]
     {
-        let error = command.exec();
-        return Err(StartupPolicyError::Exec(error));
+        Err(StartupPolicyError::Exec(command.exec()))
     }
 
     #[cfg(not(unix))]
