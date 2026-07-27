@@ -1,0 +1,617 @@
+name: DEN-251 core policy transform
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/den-251-core-transform.yml'
+  push:
+    branches:
+      - agent/den-251-core-jwks-metrics
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: den-251-core-transform-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  transform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout auth repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: repo
+
+      - name: Checkout pinned interfaces
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: 2c5c806174e067fbe83ad48b724366323ba390a2
+          path: fiducia-interfaces
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy
+
+      - name: Apply deterministic source transformation
+        working-directory: repo
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected one match, found {count}')
+              return text.replace(old, new, 1)
+
+          cargo_path = Path('Cargo.toml')
+          cargo = cargo_path.read_text()
+          cargo = replace_once(
+              cargo,
+              'tracing = "0.1"\ntracing-subscriber',
+              'tracing = "0.1"\nopentelemetry = "0.32"\ntracing-subscriber',
+              'Cargo.toml OpenTelemetry dependency',
+          )
+          cargo_path.write_text(cargo)
+
+          path = Path('src/supabase.rs')
+          source = path.read_text()
+          source = replace_once(
+              source,
+              '''//! project's cached JWKS. If the project still uses shared-secret signing and
+//! has no public JWKS, we fall back to Supabase's `/auth/v1/user` endpoint with
+//! the publishable key.
+''',
+              '''//! project's cached JWKS. Remote `/auth/v1/user` verification is disabled by
+//! default and forbidden in production; it exists only as an explicit,
+//! observable non-production migration path for shared-secret projects.
+''',
+              'module documentation',
+          )
+          source = replace_once(
+              source,
+              '''use std::{
+    env, fmt,
+    time::{Duration, Instant},
+};
+''',
+              '''use std::{
+    env, fmt,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
+''',
+              'std imports',
+          )
+          source = replace_once(
+              source,
+              '''use reqwest::StatusCode;
+''',
+              '''use opentelemetry::{global, metrics::Counter, KeyValue};
+use reqwest::StatusCode;
+''',
+              'OpenTelemetry import',
+          )
+          source = replace_once(
+              source,
+              '''const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 5;
+''',
+              '''const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 5;
+const DEPLOYMENT_MODE_ENV: &str = "FIDUCIA_DEPLOYMENT_MODE";
+const REMOTE_USERINFO_ENV: &str = "SUPABASE_AUTH_ALLOW_REMOTE_USERINFO";
+const PUBLISHABLE_KEY_ENV: &str = "SUPABASE_PUBLISHABLE_KEY";
+''',
+              'policy constants',
+          )
+          source = replace_once(
+              source,
+              '''static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
+static JWKS_CACHE: OnceCell<RwLock<Option<CachedJwks>>> = OnceCell::const_new();
+''',
+              '''static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
+static JWKS_CACHE: OnceCell<RwLock<Option<CachedJwks>>> = OnceCell::const_new();
+static UNKNOWN_KID_EVENTS: OnceLock<Counter<u64>> = OnceLock::new();
+static FORCED_REFRESH_EVENTS: OnceLock<Counter<u64>> = OnceLock::new();
+static REMOTE_USERINFO_EVENTS: OnceLock<Counter<u64>> = OnceLock::new();
+
+fn auth_counter(
+    cell: &'static OnceLock<Counter<u64>>,
+    name: &'static str,
+    description: &'static str,
+) -> &'static Counter<u64> {
+    cell.get_or_init(|| {
+        global::meter("fiducia-auth")
+            .u64_counter(name)
+            .with_description(description)
+            .with_unit("{event}")
+            .build()
+    })
+}
+
+fn record_unknown_kid(stage: &'static str) {
+    auth_counter(
+        &UNKNOWN_KID_EVENTS,
+        "fiducia.auth.supabase.unknown_kid",
+        "Unknown Supabase JWKS key-id events without recording the key id",
+    )
+    .add(1, &[KeyValue::new("stage", stage)]);
+}
+
+fn record_forced_refresh(outcome: &'static str) {
+    auth_counter(
+        &FORCED_REFRESH_EVENTS,
+        "fiducia.auth.supabase.forced_jwks_refresh",
+        "Forced Supabase JWKS refresh attempts and outcomes",
+    )
+    .add(1, &[KeyValue::new("outcome", outcome)]);
+}
+
+fn record_remote_userinfo(outcome: &'static str) {
+    auth_counter(
+        &REMOTE_USERINFO_EVENTS,
+        "fiducia.auth.supabase.remote_userinfo",
+        "Explicit non-production Supabase remote-userinfo fallback events",
+    )
+    .add(1, &[KeyValue::new("outcome", outcome)]);
+}
+''',
+              'metric instruments',
+          )
+          source = replace_once(
+              source,
+              '''    if is_asymmetric_algorithm(header.alg) && header.kid.is_some() {
+        match verify_with_jwks(jwt, &config, header.alg, header.kid.as_deref().unwrap()).await {
+            Ok(user) => return Ok(user),
+            Err(err) if !config.allow_remote_userinfo => return Err(err),
+            Err(err) => {
+                tracing::debug!(error = %err, "falling back to supabase auth user endpoint");
+            }
+        }
+    } else if !config.allow_remote_userinfo {
+        return Err(VerifyError::UnsupportedAlgorithm(header.alg));
+    }
+
+    verify_with_user_endpoint(jwt, &config).await
+''',
+              '''    if is_asymmetric_algorithm(header.alg) && header.kid.is_some() {
+        match verify_with_jwks(jwt, &config, header.alg, header.kid.as_deref().unwrap()).await {
+            Ok(user) => return Ok(user),
+            Err(err) if !config.allow_remote_userinfo => return Err(err),
+            Err(err) => {
+                record_remote_userinfo("attempted");
+                tracing::debug!(error = %err, "falling back to supabase auth user endpoint");
+            }
+        }
+    } else if !config.allow_remote_userinfo {
+        return Err(VerifyError::UnsupportedAlgorithm(header.alg));
+    } else {
+        record_remote_userinfo("attempted");
+    }
+
+    verify_with_user_endpoint(jwt, &config).await
+''',
+              'fallback attempt metric',
+          )
+          source = replace_once(
+              source,
+              '''        None => {
+            // An unknown `kid` may force one refetch, but only when the cached
+            // set is old enough — otherwise attacker-minted kids would turn
+            // every request into an outbound JWKS fetch.
+            if !forced_refresh_allowed(config).await {
+                return Err(VerifyError::MissingJwk(kid.to_string()));
+            }
+            jwks = refresh_jwks(config).await?;
+            jwks.find(kid)
+                .cloned()
+                .ok_or_else(|| VerifyError::MissingJwk(kid.to_string()))?
+        }
+''',
+              '''        None => {
+            record_unknown_kid("observed");
+            // An unknown `kid` may force one refetch, but only when the cached
+            // set is old enough — otherwise attacker-minted kids would turn
+            // every request into an outbound JWKS fetch.
+            if !forced_refresh_allowed(config).await {
+                record_unknown_kid("refresh_blocked");
+                return Err(VerifyError::MissingJwk);
+            }
+            record_forced_refresh("attempted");
+            jwks = match refresh_jwks(config).await {
+                Ok(jwks) => {
+                    record_forced_refresh("succeeded");
+                    jwks
+                }
+                Err(error) => {
+                    record_forced_refresh("failed");
+                    return Err(error);
+                }
+            };
+            match jwks.find(kid).cloned() {
+                Some(jwk) => jwk,
+                None => {
+                    record_unknown_kid("missing_after_refresh");
+                    return Err(VerifyError::MissingJwk);
+                }
+            }
+        }
+''',
+              'unknown kid instrumentation',
+          )
+          source = replace_once(
+              source,
+              '''    let response = http_client()
+        .await
+        .get(&config.user_url)
+        .header("apikey", publishable_key)
+        .bearer_auth(jwt)
+        .send()
+        .await
+        .map_err(VerifyError::Http)?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let user = response
+                .json::<SupabaseUser>()
+                .await
+                .map_err(VerifyError::Http)?;
+            user_ctx_from_remote_user(user, config)
+        }
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(VerifyError::RejectedBySupabase),
+        status => Err(VerifyError::SupabaseStatus(status)),
+    }
+''',
+              '''    let response = match http_client()
+        .await
+        .get(&config.user_url)
+        .header("apikey", publishable_key)
+        .bearer_auth(jwt)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            record_remote_userinfo("transport_error");
+            return Err(VerifyError::Http(error));
+        }
+    };
+
+    match response.status() {
+        StatusCode::OK => {
+            let user = match response.json::<SupabaseUser>().await {
+                Ok(user) => user,
+                Err(error) => {
+                    record_remote_userinfo("invalid_response");
+                    return Err(VerifyError::Http(error));
+                }
+            };
+            let result = user_ctx_from_remote_user(user, config);
+            record_remote_userinfo(if result.is_ok() {
+                "accepted"
+            } else {
+                "claim_rejected"
+            });
+            result
+        }
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            record_remote_userinfo("rejected");
+            Err(VerifyError::RejectedBySupabase)
+        }
+        status => {
+            record_remote_userinfo("upstream_status");
+            Err(VerifyError::SupabaseStatus(status))
+        }
+    }
+''',
+              'remote endpoint outcome metrics',
+          )
+          source = replace_once(
+              source,
+              '''        let user_url =
+            env_value("SUPABASE_AUTH_USER_URL").unwrap_or_else(|| format!("{issuer}/user"));
+
+        Ok(SupabaseConfig {
+''',
+              '''        let user_url =
+            env_value("SUPABASE_AUTH_USER_URL").unwrap_or_else(|| format!("{issuer}/user"));
+        let publishable_key = env_value(PUBLISHABLE_KEY_ENV);
+        let deployment_mode = DeploymentMode::parse(env_value(DEPLOYMENT_MODE_ENV).as_deref())?;
+        let requested_remote_userinfo =
+            parse_optional_bool(REMOTE_USERINFO_ENV, env_value(REMOTE_USERINFO_ENV).as_deref())?;
+        let allow_remote_userinfo = resolve_remote_userinfo_policy(
+            deployment_mode,
+            requested_remote_userinfo,
+            publishable_key.is_some(),
+        )?;
+
+        Ok(SupabaseConfig {
+''',
+              'configuration policy inputs',
+          )
+          source = replace_once(
+              source,
+              '''            jwks_url,
+            publishable_key: env_value("SUPABASE_PUBLISHABLE_KEY"),
+            user_url,
+            allow_remote_userinfo: env_bool("SUPABASE_AUTH_ALLOW_REMOTE_USERINFO", true),
+''',
+              '''            jwks_url,
+            publishable_key,
+            user_url,
+            allow_remote_userinfo,
+''',
+              'configuration policy result',
+          )
+          source = replace_once(
+              source,
+              '''            user_url: format!("{issuer}/user"),
+            allow_remote_userinfo: true,
+''',
+              '''            user_url: format!("{issuer}/user"),
+            allow_remote_userinfo: false,
+''',
+              'test configuration default',
+          )
+          source = replace_once(
+              source,
+              '''fn env_bool(name: &str, default: bool) -> bool {
+    match env_value(name).as_deref() {
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
+        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
+        _ => default,
+    }
+}
+''',
+              '''#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeploymentMode {
+    Production,
+    Staging,
+    Development,
+    Test,
+}
+
+impl DeploymentMode {
+    fn parse(value: Option<&str>) -> Result<Self, VerifyError> {
+        match value
+            .unwrap_or("production")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "production" | "prod" => Ok(Self::Production),
+            "staging" | "stage" => Ok(Self::Staging),
+            "development" | "dev" => Ok(Self::Development),
+            "test" => Ok(Self::Test),
+            other => Err(VerifyError::InvalidDeploymentMode(other.to_string())),
+        }
+    }
+}
+
+fn parse_optional_bool(
+    name: &'static str,
+    value: Option<&str>,
+) -> Result<Option<bool>, VerifyError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(Some(true)),
+        "0" | "false" | "no" | "off" => Ok(Some(false)),
+        other => Err(VerifyError::InvalidBoolean {
+            name,
+            value: other.to_string(),
+        }),
+    }
+}
+
+fn resolve_remote_userinfo_policy(
+    mode: DeploymentMode,
+    requested: Option<bool>,
+    has_publishable_key: bool,
+) -> Result<bool, VerifyError> {
+    let enabled = requested.unwrap_or(false);
+    if mode == DeploymentMode::Production && enabled {
+        return Err(VerifyError::RemoteUserinfoForbiddenInProduction);
+    }
+    if enabled && !has_publishable_key {
+        return Err(VerifyError::MissingPublishableKey);
+    }
+    Ok(enabled)
+}
+''',
+              'strict deployment policy helpers',
+          )
+          source = replace_once(
+              source,
+              '''    Http(reqwest::Error),
+    InvalidToken(&'static str),
+    Jwt(jsonwebtoken::errors::Error),
+    MissingJwk(String),
+''',
+              '''    Http(reqwest::Error),
+    InvalidBoolean {
+        name: &'static str,
+        value: String,
+    },
+    InvalidDeploymentMode(String),
+    InvalidToken(&'static str),
+    Jwt(jsonwebtoken::errors::Error),
+    MissingJwk,
+''',
+              'error variants',
+          )
+          source = replace_once(
+              source,
+              '''    MissingConfiguration(&'static str),
+    RejectedBySupabase,
+''',
+              '''    MissingConfiguration(&'static str),
+    RejectedBySupabase,
+    RemoteUserinfoForbiddenInProduction,
+''',
+              'production policy error',
+          )
+          source = replace_once(
+              source,
+              '''            VerifyError::Http(err) => write!(f, "supabase http error: {err}"),
+            VerifyError::InvalidToken(reason) => write!(f, "invalid token: {reason}"),
+            VerifyError::Jwt(err) => write!(f, "jwt verification error: {err}"),
+            VerifyError::MissingJwk(kid) => write!(f, "jwks key not found for kid {kid}"),
+''',
+              '''            VerifyError::Http(err) => write!(f, "supabase http error: {err}"),
+            VerifyError::InvalidBoolean { name, value } => {
+                write!(f, "{name} has invalid boolean value {value:?}")
+            }
+            VerifyError::InvalidDeploymentMode(value) => write!(
+                f,
+                "{DEPLOYMENT_MODE_ENV} must be production, staging, development, or test; got {value:?}",
+            ),
+            VerifyError::InvalidToken(reason) => write!(f, "invalid token: {reason}"),
+            VerifyError::Jwt(err) => write!(f, "jwt verification error: {err}"),
+            VerifyError::MissingJwk => write!(f, "jwks key not found for token key id"),
+''',
+              'display policy and safe key miss',
+          )
+          source = replace_once(
+              source,
+              '''            VerifyError::RejectedBySupabase => write!(f, "supabase rejected bearer token"),
+            VerifyError::SupabaseStatus(status) => {
+''',
+              '''            VerifyError::RejectedBySupabase => write!(f, "supabase rejected bearer token"),
+            VerifyError::RemoteUserinfoForbiddenInProduction => write!(
+                f,
+                "{REMOTE_USERINFO_ENV}=true is forbidden when {DEPLOYMENT_MODE_ENV}=production",
+            ),
+            VerifyError::SupabaseStatus(status) => {
+''',
+              'display production rejection',
+          )
+          source = source.replace(
+              'Err(VerifyError::MissingJwk(kid)) if kid == "unknown-kid"',
+              'Err(VerifyError::MissingJwk)',
+          )
+          source = source.replace(
+              'Err(VerifyError::MissingJwk(_))',
+              'Err(VerifyError::MissingJwk)',
+          )
+          marker = '''    #[test]
+    fn forced_refresh_cooldown_gates_young_caches() {
+'''
+          policy_tests = '''    #[test]
+    fn remote_userinfo_policy_is_default_off_and_production_fail_closed() {
+        assert_eq!(
+            resolve_remote_userinfo_policy(DeploymentMode::Production, None, false).unwrap(),
+            false,
+        );
+        assert!(matches!(
+            resolve_remote_userinfo_policy(DeploymentMode::Production, Some(true), true),
+            Err(VerifyError::RemoteUserinfoForbiddenInProduction),
+        ));
+        assert_eq!(
+            resolve_remote_userinfo_policy(DeploymentMode::Staging, None, false).unwrap(),
+            false,
+        );
+        assert!(matches!(
+            resolve_remote_userinfo_policy(DeploymentMode::Staging, Some(true), false),
+            Err(VerifyError::MissingPublishableKey),
+        ));
+        assert!(
+            resolve_remote_userinfo_policy(DeploymentMode::Staging, Some(true), true).unwrap(),
+        );
+    }
+
+    #[test]
+    fn malformed_deployment_policy_values_are_rejected() {
+        assert!(matches!(
+            DeploymentMode::parse(Some("maybe-production")),
+            Err(VerifyError::InvalidDeploymentMode(_)),
+        ));
+        assert!(matches!(
+            parse_optional_bool(REMOTE_USERINFO_ENV, Some("sometimes")),
+            Err(VerifyError::InvalidBoolean { .. }),
+        ));
+    }
+
+'''
+          source = replace_once(source, marker, policy_tests + marker, 'policy tests')
+          path.write_text(source)
+
+          readme_path = Path('README.md')
+          readme = readme_path.read_text()
+          readme = replace_once(
+              readme,
+              '| `SUPABASE_PUBLISHABLE_KEY` | string | no | Publishable key for the `/auth/v1/user` fallback (shared-secret projects) | none |',
+              '| `FIDUCIA_DEPLOYMENT_MODE` | enum | no | `production`, `staging`, `development`, or `test`; controls whether migration-only remote verification may be enabled | `production` |\n| `SUPABASE_PUBLISHABLE_KEY` | string | no | Publishable key for the `/auth/v1/user` fallback (shared-secret projects) | none |',
+              'README deployment mode row',
+          )
+          readme = replace_once(
+              readme,
+              '| `SUPABASE_AUTH_ALLOW_REMOTE_USERINFO` | bool | no | Allow the `/auth/v1/user` fallback for shared-secret projects (**see below**) | `true` |',
+              '| `SUPABASE_AUTH_ALLOW_REMOTE_USERINFO` | bool | no | Explicitly enable the `/auth/v1/user` migration fallback in a non-production environment (**see below**) | `false` |',
+              'README default',
+          )
+          readme = replace_once(
+              readme,
+              '''- **`true` (default)** — for asymmetric (JWKS-signed) tokens, fiducia-auth still
+  verifies the signature **offline** first; the remote `/auth/v1/user` endpoint is
+  only a fallback. For shared-secret (HS256) projects with no public JWKS, the
+  token is validated by **Supabase itself** over that endpoint. Either way the
+  token is validated — this is fail-safe, not a bypass — but it adds a network
+  dependency on Supabase and requires `SUPABASE_PUBLISHABLE_KEY`.
+- **`false`** — offline JWKS verification only. Set this if every project uses
+  asymmetric signing keys and you want zero auth-time calls to Supabase; tokens
+  that aren't asymmetrically signed are rejected outright.
+''',
+              '''- **`false` (default)** — offline JWKS verification only. Tokens that are not
+  asymmetrically signed, have an unknown key after a bounded refresh, or fail the
+  issuer/audience contract are rejected without a userinfo network call.
+- **`true`** — accepted only in `staging`, `development`, or `test`, and only when
+  `SUPABASE_PUBLISHABLE_KEY` is present. `production` rejects this setting during
+  startup. Use it only for a bounded shared-secret migration window.
+
+Content-free OpenTelemetry counters expose unknown-key observations, forced JWKS
+refresh attempts/outcomes, cooldown blocks, and remote-userinfo outcomes. They do
+not attach the raw `kid`, JWT, credential, subject, email, organization, or role.
+''',
+              'README verification semantics',
+          )
+          readme_path.write_text(readme)
+          PY
+
+      - name: Format and validate transformed source
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          git diff --binary --no-ext-diff > "${RUNNER_TEMP}/den-251.first.patch"
+          cargo fmt --all
+          git diff --binary --no-ext-diff > "${RUNNER_TEMP}/den-251.second.patch"
+          cmp "${RUNNER_TEMP}/den-251.first.patch" "${RUNNER_TEMP}/den-251.second.patch"
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+
+      - name: Collect transformed files
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/den-251-core"
+          mkdir -p "$out/src"
+          cp repo/Cargo.toml "$out/Cargo.toml"
+          cp repo/README.md "$out/README.md"
+          cp repo/src/supabase.rs "$out/src/supabase.rs"
+          cp "${RUNNER_TEMP}/den-251.first.patch" "$out/generated.patch"
+
+      - name: Upload validated transformation
+        uses: actions/upload-artifact@v6
+        with:
+          name: den-251-core-jwks-metrics
+          path: ${{ runner.temp }}/den-251-core
+          if-no-files-found: error
+          retention-days: 2
