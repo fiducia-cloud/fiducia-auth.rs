@@ -1,6 +1,10 @@
 name: DEN-251 rustfmt probe
 
 on:
+  pull_request:
+    paths:
+      - src/bin/fiducia-auth-production-entrypoint.rs
+      - .github/workflows/den-251-rustfmt-probe.yml
   push:
     branches:
       - agent/den-251-production-auth-entrypoint
@@ -10,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: den-251-rustfmt-${{ github.ref }}
+  group: den-251-rustfmt-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
