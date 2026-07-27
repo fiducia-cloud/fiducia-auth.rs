@@ -1,0 +1,48 @@
+name: DEN-252 one-shot clippy probe
+
+on:
+  push:
+    branches:
+      - agent/den-252-token-revocation-contract
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: den-252-clippy-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capture-clippy-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: true
+          ref: agent/den-252-token-revocation-contract
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Capture concise clippy output once
+        shell: bash
+        run: |
+          set -euo pipefail
+          diagnostic=docs/den-252-clippy-diagnostics.txt
+          if [[ -f "$diagnostic" ]]; then
+            echo 'diagnostic already captured'
+            exit 0
+          fi
+          set +e
+          cargo clippy --all-targets --message-format=short -- -D warnings > /tmp/clippy.log 2>&1
+          status=$?
+          set -e
+          tail -n 200 /tmp/clippy.log > "$diagnostic"
+          printf '\nexit_status=%s\n' "$status" >> "$diagnostic"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$diagnostic"
+          git commit -m 'DEN-252 capture concise clippy diagnostic'
+          git push origin HEAD:agent/den-252-token-revocation-contract
