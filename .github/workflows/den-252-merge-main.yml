@@ -1,0 +1,43 @@
+name: DEN-252 one-shot merge current main
+
+on:
+  push:
+    branches:
+      - agent/den-252-token-revocation-contract
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: den-252-merge-main-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  merge-main:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+          ref: agent/den-252-token-revocation-contract
+      - name: Merge current main without rebasing
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --no-tags origin main
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo 'current main is already an ancestor'
+            exit 0
+          fi
+          git merge --no-ff --no-edit origin/main
+          if git grep -n -E '^(<<<<<<<|>>>>>>>)( |$)|^=======$' -- .; then
+            echo 'merge conflict markers remain after merge' >&2
+            exit 1
+          fi
+          git diff --check HEAD^ HEAD
+          git push origin HEAD:agent/den-252-token-revocation-contract
