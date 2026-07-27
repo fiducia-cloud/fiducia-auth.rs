@@ -1,4 +1,4 @@
-name: DEN-252 format probe
+name: DEN-252 one-shot rustfmt
 
 on:
   push:
@@ -7,29 +7,41 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: den-252-format-probe-${{ github.ref }}
+  group: den-252-one-shot-rustfmt-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  rustfmt-diff:
+  format-token-module:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          persist-credentials: false
+          persist-credentials: true
+          ref: agent/den-252-token-revocation-contract
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: stable
           components: rustfmt
-      - name: Print exact rustfmt diff
+      - name: Format only the DEN-252 token module
         shell: bash
         run: |
           set -euo pipefail
-          cargo fmt --all
-          printf '%s\n' '--- BEGIN RUSTFMT DIFF ---'
-          git --no-pager diff -- src/token.rs
-          printf '%s\n' '--- END RUSTFMT DIFF ---'
+          rustfmt --edition 2021 src/token.rs
+          if git diff --quiet -- src/token.rs; then
+            echo 'src/token.rs already matches rustfmt'
+            exit 0
+          fi
+          if ! git diff --quiet -- . ':(exclude)src/token.rs'; then
+            echo 'rustfmt changed an unexpected path' >&2
+            git --no-pager diff -- . ':(exclude)src/token.rs'
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/token.rs
+          git commit -m 'DEN-252 apply rustfmt to token contract'
+          git push origin HEAD:agent/den-252-token-revocation-contract
