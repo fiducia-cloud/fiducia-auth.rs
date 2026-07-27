@@ -22,11 +22,20 @@ jobs:
         with:
           persist-credentials: true
           ref: agent/den-252-token-revocation-contract
+          path: repo
+          submodules: recursive
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: 2c5c806174e067fbe83ad48b724366323ba390a2
+          path: fiducia-interfaces
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
-          toolchain: stable
+          toolchain: "1.95.0"
           components: clippy
       - name: Capture concise clippy output once
+        working-directory: repo
         shell: bash
         run: |
           set -euo pipefail
@@ -36,7 +45,7 @@ jobs:
             exit 0
           fi
           set +e
-          cargo clippy --all-targets --message-format=short -- -D warnings > /tmp/clippy.log 2>&1
+          cargo clippy --locked --all-targets --message-format=short -- -D warnings > /tmp/clippy.log 2>&1
           status=$?
           set -e
           tail -n 200 /tmp/clippy.log > "$diagnostic"
