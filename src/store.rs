@@ -315,11 +315,7 @@ fn parse_put_response(response: &Value) -> Result<CasOutcome, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        http::HeaderMap,
-        routing::get,
-        Json, Router,
-    };
+    use axum::{http::HeaderMap, routing::get, Json, Router};
     use serde_json::json;
 
     fn assert_trusted_storage_identity(headers: &HeaderMap) {
@@ -437,8 +433,14 @@ mod tests {
         for invalid in [
             json!({ "committed": false, "result": { "output": { "ok": true, "revision": 1 } } }),
             json!({ "committed": true, "result": { "output": { "ok": true } } }),
-            json!({ "committed": true, "result": { "output": { "ok": false, "reason": "cas_mismatch" } } }),
-            json!({ "committed": true, "result": { "output": { "ok": false, "reason": "unknown" } } }),
+            json!({
+                "committed": true,
+                "result": { "output": { "ok": false, "reason": "cas_mismatch" } }
+            }),
+            json!({
+                "committed": true,
+                "result": { "output": { "ok": false, "reason": "unknown" } }
+            }),
         ] {
             assert!(parse_put_response(&invalid).is_err());
         }
