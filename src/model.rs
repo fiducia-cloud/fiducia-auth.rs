@@ -107,10 +107,7 @@ impl UserCtx {
         AuthorizationContext {
             version: AUTHORIZATION_CONTEXT_VERSION,
             surface_audiences,
-            roles: trusted_roles
-                .into_iter()
-                .map(TrustedRole::as_str)
-                .collect(),
+            roles: trusted_roles.into_iter().map(TrustedRole::as_str).collect(),
             capabilities,
         }
     }
@@ -330,8 +327,7 @@ mod tests {
 
     #[test]
     fn unknown_nonempty_roles_fail_closed_on_every_surface() {
-        let authorization = user(&["authenticated", "owner-from-browser"])
-            .authorization_context();
+        let authorization = user(&["authenticated", "owner-from-browser"]).authorization_context();
         assert!(authorization.surface_audiences.is_empty());
         assert!(authorization.roles.is_empty());
         assert!(authorization.capabilities.is_empty());
