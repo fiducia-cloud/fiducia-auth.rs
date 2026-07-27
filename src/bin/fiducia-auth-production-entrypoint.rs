@@ -32,16 +32,14 @@ fn run() -> Result<(), StartupPolicyError> {
     let policy = resolve_policy(mode, requested_remote_userinfo, has_publishable_key)?;
 
     let mut command = Command::new(AUTH_BINARY);
-    command
-        .env(DEPLOYMENT_MODE_ENV, policy.mode.as_str())
-        .env(
-            REMOTE_USERINFO_ENV,
-            if policy.allow_remote_userinfo {
-                "true"
-            } else {
-                "false"
-            },
-        );
+    command.env(DEPLOYMENT_MODE_ENV, policy.mode.as_str()).env(
+        REMOTE_USERINFO_ENV,
+        if policy.allow_remote_userinfo {
+            "true"
+        } else {
+            "false"
+        },
+    );
 
     #[cfg(unix)]
     {
@@ -194,8 +192,14 @@ mod tests {
 
     #[test]
     fn deployment_mode_defaults_to_production() {
-        assert_eq!(DeploymentMode::parse(None).unwrap(), DeploymentMode::Production);
-        assert_eq!(DeploymentMode::parse(Some("prod")).unwrap(), DeploymentMode::Production);
+        assert_eq!(
+            DeploymentMode::parse(None).unwrap(),
+            DeploymentMode::Production
+        );
+        assert_eq!(
+            DeploymentMode::parse(Some("prod")).unwrap(),
+            DeploymentMode::Production
+        );
     }
 
     #[test]
