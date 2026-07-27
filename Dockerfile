@@ -14,10 +14,15 @@ RUN git init fiducia-interfaces \
     && test "$(git -C fiducia-interfaces rev-parse HEAD)" = "$INTERFACES_SHA"
 COPY . fiducia-auth.rs
 WORKDIR /build/fiducia-auth.rs
-RUN cargo build --locked --release && strip target/release/fiducia-auth
+RUN cargo build --locked --release \
+       --bin fiducia-auth \
+       --bin fiducia-auth-production-entrypoint \
+    && strip target/release/fiducia-auth \
+       target/release/fiducia-auth-production-entrypoint
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
 COPY --from=build --chown=65532:65532 /build/fiducia-auth.rs/target/release/fiducia-auth /usr/local/bin/fiducia-auth
+COPY --from=build --chown=65532:65532 /build/fiducia-auth.rs/target/release/fiducia-auth-production-entrypoint /usr/local/bin/fiducia-auth-production-entrypoint
 EXPOSE 8097
 USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/fiducia-auth"]
+ENTRYPOINT ["/usr/local/bin/fiducia-auth-production-entrypoint"]
