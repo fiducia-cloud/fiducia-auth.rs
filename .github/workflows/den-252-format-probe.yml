@@ -1,0 +1,35 @@
+name: DEN-252 format probe
+
+on:
+  push:
+    branches:
+      - agent/den-252-token-revocation-contract
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: den-252-format-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rustfmt-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Print exact rustfmt diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          printf '%s\n' '--- BEGIN RUSTFMT DIFF ---'
+          git --no-pager diff -- src/token.rs
+          printf '%s\n' '--- END RUSTFMT DIFF ---'
