@@ -1,24 +1,837 @@
-# DEN-251 landing validation diagnostic
+# DEN-251 corrected-branch validation diagnostic
 
 rustc 1.97.1 (8bab26f4f 2026-07-14)
 cargo 1.97.1 (c980f4866 2026-06-30)
 
 $ cargo fmt --all
-error: unknown start of token: \
- --> /home/runner/work/fiducia-auth.rs/fiducia-auth.rs/repo/src/bin/fiducia-auth-production-entrypoint.rs:1:1
-  |
-1 | \
-  | ^
+$ cargo check --all-targets
+[1m[92m    Updating[0m crates.io index
+[1m[92m    Updating[0m git repository `https://github.com/fiducia-cloud/fiducia-telemetry.rs`
+[1m[92m    Updating[0m git submodule `https://github.com/ORESoftware/flags-2-env.git`
+[1m[92m    Updating[0m git repository `https://github.com/fiducia-cloud/fiducia-interfaces`
+[1m[92m Downloading[0m crates ...
+[1m[92m  Downloaded[0m allocator-api2 v0.2.21
+[1m[92m  Downloaded[0m async-stream v0.3.6
+[1m[92m  Downloaded[0m cpufeatures v0.2.17
+[1m[92m  Downloaded[0m ahash v0.8.12
+[1m[92m  Downloaded[0m anyhow v1.0.103
+[1m[92m  Downloaded[0m lock_api v0.4.14
+[1m[92m  Downloaded[0m tinystr v0.8.3
+[1m[92m  Downloaded[0m aho-corasick v1.1.4
+[1m[92m  Downloaded[0m time-macros v0.2.30
+[1m[92m  Downloaded[0m bitflags v2.13.0
+[1m[92m  Downloaded[0m tinyvec_macros v0.1.1
+[1m[92m  Downloaded[0m const-oid v0.9.6
+[1m[92m  Downloaded[0m block-buffer v0.10.4
+[1m[92m  Downloaded[0m tinyvec v1.11.0
+[1m[92m  Downloaded[0m axum v0.7.9
+[1m[92m  Downloaded[0m cmake v0.1.58
+[1m[92m  Downloaded[0m crypto-bigint v0.5.5
+[1m[92m  Downloaded[0m crypto-common v0.1.7
+[1m[92m  Downloaded[0m heck v0.5.0
+[1m[92m  Downloaded[0m fluent-uri v0.4.1
+[1m[92m  Downloaded[0m generic-array v0.14.7
+[1m[92m  Downloaded[0m ecdsa v0.16.9
+[1m[92m  Downloaded[0m tracing-attributes v0.1.31
+[1m[92m  Downloaded[0m dunce v1.0.5
+[1m[92m  Downloaded[0m base64ct v1.8.3
+[1m[92m  Downloaded[0m bit-set v0.8.0
+[1m[92m  Downloaded[0m borrow-or-share v0.2.4
+[1m[92m  Downloaded[0m futures-util v0.3.32
+[1m[92m  Downloaded[0m atomic-waker v1.1.2
+[1m[92m  Downloaded[0m form_urlencoded v1.2.2
+[1m[92m  Downloaded[0m ff v0.13.1
+[1m[92m  Downloaded[0m fnv v1.0.7
+[1m[92m  Downloaded[0m want v0.3.1
+[1m[92m  Downloaded[0m tracing-serde v0.2.0
+[1m[92m  Downloaded[0m utf8_iter v1.0.4
+[1m[92m  Downloaded[0m zerofrom v0.1.8
+[1m[92m  Downloaded[0m bit-vec v0.8.0
+[1m[92m  Downloaded[0m digest v0.10.7
+[1m[92m  Downloaded[0m find-msvc-tools v0.1.9
+[1m[92m  Downloaded[0m foldhash v0.2.0
+[1m[92m  Downloaded[0m futures-macro v0.3.32
+[1m[92m  Downloaded[0m autocfg v1.5.1
+[1m[92m  Downloaded[0m axum-core v0.4.5
+[1m[92m  Downloaded[0m bytecount v0.6.9
+[1m[92m  Downloaded[0m email_address v0.2.9
+[1m[92m  Downloaded[0m fs_extra v1.3.0
+[1m[92m  Downloaded[0m futures-channel v0.3.32
+[1m[92m  Downloaded[0m httparse v1.10.1
+[1m[92m  Downloaded[0m fancy-regex v0.18.0
+[1m[92m  Downloaded[0m futures-task v0.3.32
+[1m[92m  Downloaded[0m litemap v0.8.2
+[1m[92m  Downloaded[0m elliptic-curve v0.13.8
+[1m[92m  Downloaded[0m zmij v1.0.21
+[1m[92m  Downloaded[0m httpdate v1.0.3
+[1m[92m  Downloaded[0m errno v0.3.14
+[1m[92m  Downloaded[0m lazy_static v1.5.0
+[1m[92m  Downloaded[0m async-trait v0.1.89
+[1m[92m  Downloaded[0m cfg_aliases v0.2.1
+[1m[92m  Downloaded[0m deranged v0.5.8
+[1m[92m  Downloaded[0m equivalent v1.0.2
+[1m[92m  Downloaded[0m ipnet v2.12.0
+[1m[92m  Downloaded[0m data-encoding v2.11.0
+[1m[92m  Downloaded[0m futures-executor v0.3.32
+[1m[92m  Downloaded[0m jsonschema-value v0.48.5
+[1m[92m  Downloaded[0m async-stream-impl v0.3.6
+[1m[92m  Downloaded[0m idna_adapter v1.2.2
+[1m[92m  Downloaded[0m jsonschema-regex v0.48.5
+[1m[92m  Downloaded[0m zerofrom-derive v0.1.7
+[1m[92m  Downloaded[0m http-body-util v0.1.3
+[1m[92m  Downloaded[0m hyper-rustls v0.27.9
+[1m[92m  Downloaded[0m hyper-timeout v0.5.2
+[1m[92m  Downloaded[0m icu_properties v2.2.0
+[1m[92m  Downloaded[0m tokio-rustls v0.26.4
+[1m[92m  Downloaded[0m try-lock v0.2.5
+[1m[92m  Downloaded[0m num-iter v0.1.46
+[1m[92m  Downloaded[0m displaydoc v0.2.6
+[1m[92m  Downloaded[0m futures-core v0.3.32
+[1m[92m  Downloaded[0m getrandom v0.2.17
+[1m[92m  Downloaded[0m group v0.13.0
+[1m[92m  Downloaded[0m rand_chacha v0.3.1
+[1m[92m  Downloaded[0m cfg-if v1.0.4
+[1m[92m  Downloaded[0m indexmap v1.9.3
+[1m[92m  Downloaded[0m base16ct v0.2.0
+[1m[92m  Downloaded[0m futures-sink v0.3.32
+[1m[92m  Downloaded[0m either v1.16.0
+[1m[92m  Downloaded[0m hashbrown v0.17.1
+[1m[92m  Downloaded[0m icu_collections v2.2.0
+[1m[92m  Downloaded[0m indexmap v2.14.0
+[1m[92m  Downloaded[0m hmac v0.12.1
+[1m[92m  Downloaded[0m http-body v1.0.1
+[1m[92m  Downloaded[0m itoa v1.0.18
+[1m[92m  Downloaded[0m potential_utf v0.1.5
+[1m[92m  Downloaded[0m num-cmp v0.1.0
+[1m[92m  Downloaded[0m ref-cast v1.0.26
+[1m[92m  Downloaded[0m untrusted v0.7.1
+[1m[92m  Downloaded[0m matchit v0.7.3
+[1m[92m  Downloaded[0m rand_core v0.9.5
+[1m[92m  Downloaded[0m der v0.7.10
+[1m[92m  Downloaded[0m getrandom v0.3.4
+[1m[92m  Downloaded[0m icu_provider v2.2.0
+[1m[92m  Downloaded[0m num-conv v0.2.2
+[1m[92m  Downloaded[0m glob v0.3.3
+[1m[92m  Downloaded[0m rustversion v1.0.22
+[1m[92m  Downloaded[0m h2 v0.4.15
+[1m[92m  Downloaded[0m icu_normalizer v2.2.0
+[1m[92m  Downloaded[0m jobserver v0.1.34
+[1m[92m  Downloaded[0m base64 v0.22.1
+[1m[92m  Downloaded[0m http v1.4.2
+[1m[92m  Downloaded[0m strum_macros v0.28.0
+[1m[92m  Downloaded[0m thiserror-impl v1.0.69
+[1m[92m  Downloaded[0m bytes v1.12.0
+[1m[92m  Downloaded[0m time-core v0.1.9
+[1m[92m  Downloaded[0m fraction v0.15.4
+[1m[92m  Downloaded[0m icu_normalizer_data v2.2.0
+[1m[92m  Downloaded[0m tokio-macros v2.7.0
+[1m[92m  Downloaded[0m untrusted v0.9.0
+[1m[92m  Downloaded[0m cc v1.2.65
+[1m[92m  Downloaded[0m icu_locale_core v2.2.0
+[1m[92m  Downloaded[0m jsonwebtoken v10.4.0
+[1m[92m  Downloaded[0m powerfmt v0.2.0
+[1m[92m  Downloaded[0m tower-service v0.3.3
+[1m[92m  Downloaded[0m hyper-util v0.1.20
+[1m[92m  Downloaded[0m prost-derive v0.13.5
+[1m[92m  Downloaded[0m rand_chacha v0.9.0
+[1m[92m  Downloaded[0m zerotrie v0.2.4
+[1m[92m  Downloaded[0m pin-project-internal v1.1.13
+[1m[92m  Downloaded[0m ref-cast-impl v1.0.26
+[1m[92m  Downloaded[0m hashbrown v0.12.3
+[1m[92m  Downloaded[0m idna v1.1.0
+[1m[92m  Downloaded[0m serde_urlencoded v0.7.1
+[1m[92m  Downloaded[0m signal-hook-registry v1.4.8
+[1m[92m  Downloaded[0m simple_asn1 v0.6.4
+[1m[92m  Downloaded[0m thiserror v1.0.69
+[1m[92m  Downloaded[0m zeroize_derive v1.5.0
+[1m[92m  Downloaded[0m hyper v1.10.1
+[1m[92m  Downloaded[0m icu_properties_data v2.2.0
+[1m[92m  Downloaded[0m itertools v0.14.0
+[1m[92m  Downloaded[0m mime v0.3.17
+[1m[92m  Downloaded[0m rustls-webpki v0.103.13
+[1m[92m  Downloaded[0m ryu v1.0.23
+[1m[92m  Downloaded[0m sec1 v0.7.3
+[1m[92m  Downloaded[0m serde v1.0.228
+[1m[92m  Downloaded[0m serde_core v1.0.228
+[1m[92m  Downloaded[0m sha2 v0.10.9
+[1m[92m  Downloaded[0m socket2 v0.5.10
+[1m[92m  Downloaded[0m aws-lc-rs v1.17.0
+[1m[92m  Downloaded[0m jsonschema v0.48.5
+[1m[92m  Downloaded[0m shlex v2.0.1
+[1m[92m  Downloaded[0m subtle v2.6.1
+[1m[92m  Downloaded[0m serde_path_to_error v0.1.20
+[1m[92m  Downloaded[0m outref v0.5.2
+[1m[92m  Downloaded[0m vsimd v0.8.0
+[1m[92m  Downloaded[0m zerovec-derive v0.11.3
+[1m[92m  Downloaded[0m lru-slab v0.1.2
+[1m[92m  Downloaded[0m micromap v0.3.0
+[1m[92m  Downloaded[0m num-integer v0.1.46
+[1m[92m  Downloaded[0m pem-rfc7468 v0.7.0
+[1m[92m  Downloaded[0m pkcs8 v0.10.2
+[1m[92m  Downloaded[0m rustls v0.23.41
+[1m[92m  Downloaded[0m time v0.3.51
+[1m[92m  Downloaded[0m signature v2.2.0
+[1m[92m  Downloaded[0m synstructure v0.13.2
+[1m[92m  Downloaded[0m libc v0.2.186
+[1m[92m  Downloaded[0m rustc-hash v2.1.2
+[1m[92m  Downloaded[0m thiserror v2.0.18
+[1m[92m  Downloaded[0m regex-automata v0.4.14
+[1m[92m  Downloaded[0m spki v0.7.3
+[1m[92m  Downloaded[0m stable_deref_trait v1.2.1
+[1m[92m  Downloaded[0m strum v0.28.0
+[1m[92m  Downloaded[0m rfc6979 v0.4.0
+[1m[92m  Downloaded[0m thread_local v1.1.9
+[1m[92m  Downloaded[0m ring v0.17.14
+[1m[92m  Downloaded[0m thiserror-impl v2.0.18
+[1m[92m  Downloaded[0m rustls-pki-types v1.14.1
+[1m[92m  Downloaded[0m yoke v0.8.3
+[1m[92m  Downloaded[0m p256 v0.13.2
+[1m[92m  Downloaded[0m slab v0.4.12
+[1m[92m  Downloaded[0m yoke-derive v0.8.2
+[1m[92m  Downloaded[0m num v0.4.3
+[1m[92m  Downloaded[0m version_check v0.9.5
+[1m[92m  Downloaded[0m scopeguard v1.2.0
+[1m[92m  Downloaded[0m num-complex v0.4.6
+[1m[92m  Downloaded[0m once_cell v1.21.4
+[1m[92m  Downloaded[0m rand_core v0.6.4
+[1m[92m  Downloaded[0m zeroize v1.9.0
+[1m[92m  Downloaded[0m tracing-core v0.1.36
+[1m[92m  Downloaded[0m zerovec v0.11.6
+[1m[92m  Downloaded[0m typenum v1.20.1
+[1m[92m  Downloaded[0m quote v1.0.46
+[1m[92m  Downloaded[0m sync_wrapper v1.0.2
+[1m[92m  Downloaded[0m pin-project v1.1.13
+[1m[92m  Downloaded[0m primeorder v0.13.6
+[1m[92m  Downloaded[0m serde_derive v1.0.228
+[1m[92m  Downloaded[0m smallvec v1.15.2
+[1m[92m  Downloaded[0m quinn-udp v0.5.14
+[1m[92m  Downloaded[0m socket2 v0.6.4
+[1m[92m  Downloaded[0m nu-ansi-term v0.50.3
+[1m[92m  Downloaded[0m parking_lot v0.12.5
+[1m[92m  Downloaded[0m tokio-stream v0.1.18
+[1m[92m  Downloaded[0m unicode-ident v1.0.24
+[1m[92m  Downloaded[0m tower-layer v0.3.3
+[1m[92m  Downloaded[0m num-traits v0.2.19
+[1m[92m  Downloaded[0m rand v0.8.6
+[1m[92m  Downloaded[0m sharded-slab v0.1.7
+[1m[92m  Downloaded[0m url v2.5.8
+[1m[92m  Downloaded[0m writeable v0.6.3
+[1m[92m  Downloaded[0m referencing v0.48.5
+[1m[92m  Downloaded[0m uuid-simd v0.8.0
+[1m[92m  Downloaded[0m tower v0.5.3
+[1m[92m  Downloaded[0m num-rational v0.4.2
+[1m[92m  Downloaded[0m ppv-lite86 v0.2.21
+[1m[92m  Downloaded[0m num-bigint v0.4.6
+[1m[92m  Downloaded[0m unicode-general-category v1.1.0
+[1m[92m  Downloaded[0m prost v0.13.5
+[1m[92m  Downloaded[0m tokio-util v0.7.18
+[1m[92m  Downloaded[0m tower v0.4.13
+[1m[92m  Downloaded[0m tracing-log v0.2.0
+[1m[92m  Downloaded[0m matchers v0.2.0
+[1m[92m  Downloaded[0m mio v1.2.1
+[1m[92m  Downloaded[0m opentelemetry v0.27.1
+[1m[92m  Downloaded[0m opentelemetry-otlp v0.27.0
+[1m[92m  Downloaded[0m pem v3.0.6
+[1m[92m  Downloaded[0m percent-encoding v2.3.2
+[1m[92m  Downloaded[0m pin-project-lite v0.2.17
+[1m[92m  Downloaded[0m rand v0.9.4
+[1m[92m  Downloaded[0m tonic v0.12.3
+[1m[92m  Downloaded[0m quinn v0.11.11
+[1m[92m  Downloaded[0m tower-http v0.5.2
+[1m[92m  Downloaded[0m tracing-opentelemetry v0.28.0
+[1m[92m  Downloaded[0m log v0.4.33
+[1m[92m  Downloaded[0m parking_lot_core v0.9.12
+[1m[92m  Downloaded[0m opentelemetry-proto v0.27.0
+[1m[92m  Downloaded[0m proc-macro2 v1.0.106
+[1m[92m  Downloaded[0m memchr v2.8.2
+[1m[92m  Downloaded[0m tracing v0.1.44
+[1m[92m  Downloaded[0m opentelemetry_sdk v0.27.1
+[1m[92m  Downloaded[0m regex v1.13.0
+[1m[92m  Downloaded[0m tower-http v0.6.11
+[1m[92m  Downloaded[0m reqwest v0.12.28
+[1m[92m  Downloaded[0m webpki-roots v1.0.8
+[1m[92m  Downloaded[0m serde_json v1.0.150
+[1m[92m  Downloaded[0m tracing-subscriber v0.3.23
+[1m[92m  Downloaded[0m quinn-proto v0.11.15
+[1m[92m  Downloaded[0m syn v2.0.118
+[1m[92m  Downloaded[0m syn v3.0.3
+[1m[92m  Downloaded[0m zerocopy v0.8.52
+[1m[92m  Downloaded[0m regex-syntax v0.8.11
+[1m[92m  Downloaded[0m tokio v1.52.3
+[1m[92m  Downloaded[0m aws-lc-sys v0.41.0
+[1m[92m   Compiling[0m proc-macro2 v1.0.106
+[1m[92m   Compiling[0m quote v1.0.46
+[1m[92m   Compiling[0m unicode-ident v1.0.24
+[1m[92m   Compiling[0m libc v0.2.186
+[1m[92m    Checking[0m cfg-if v1.0.4
+[1m[92m    Checking[0m smallvec v1.15.2
+[1m[92m    Checking[0m once_cell v1.21.4
+[1m[92m    Checking[0m pin-project-lite v0.2.17
+[1m[92m    Checking[0m itoa v1.0.18
+[1m[92m   Compiling[0m parking_lot_core v0.9.12
+[1m[92m    Checking[0m futures-core v0.3.32
+[1m[92m    Checking[0m bytes v1.12.0
+[1m[92m    Checking[0m scopeguard v1.2.0
+[1m[92m    Checking[0m lock_api v0.4.14
+[1m[92m   Compiling[0m serde_core v1.0.228
+[1m[92m   Compiling[0m version_check v0.9.5
+[1m[92m    Checking[0m tracing-core v0.1.36
+[1m[92m   Compiling[0m syn v2.0.118
+[1m[92m    Checking[0m getrandom v0.2.17
+[1m[92m   Compiling[0m autocfg v1.5.1
+[1m[92m    Checking[0m parking_lot v0.12.5
+[1m[92m    Checking[0m errno v0.3.14
+[1m[92m    Checking[0m log v0.4.33
+[1m[92m    Checking[0m futures-sink v0.3.32
+[1m[92m    Checking[0m signal-hook-registry v1.4.8
+[1m[92m    Checking[0m socket2 v0.6.4
+[1m[92m    Checking[0m mio v1.2.1
+[1m[92m    Checking[0m memchr v2.8.2
+[1m[92m   Compiling[0m serde v1.0.228
+[1m[92m    Checking[0m slab v0.4.12
+[1m[92m    Checking[0m rand_core v0.6.4
+[1m[92m    Checking[0m subtle v2.6.1
+[1m[92m    Checking[0m futures-task v0.3.32
+[1m[92m   Compiling[0m zmij v1.0.21
+[1m[92m    Checking[0m percent-encoding v2.3.2
+[1m[92m   Compiling[0m serde_json v1.0.150
+[1m[92m   Compiling[0m find-msvc-tools v0.1.9
+[1m[92m   Compiling[0m shlex v2.0.1
+[1m[92m   Compiling[0m zerocopy v0.8.52
+[1m[92m    Checking[0m stable_deref_trait v1.2.1
+[1m[92m   Compiling[0m generic-array v0.14.7
+[1m[92m   Compiling[0m jobserver v0.1.34
+[1m[92m    Checking[0m http v1.4.2
+[1m[92m    Checking[0m allocator-api2 v0.2.21
+[1m[92m   Compiling[0m cc v1.2.65
+[1m[92m    Checking[0m foldhash v0.2.0
+[1m[92m    Checking[0m equivalent v1.0.2
+[1m[92m    Checking[0m hashbrown v0.17.1
+[1m[92m   Compiling[0m synstructure v0.13.2
+[1m[92m    Checking[0m typenum v1.20.1
+[1m[92m    Checking[0m http-body v1.0.1
+[1m[92m   Compiling[0m num-traits v0.2.19
+[1m[92m    Checking[0m const-oid v0.9.6
+[1m[92m    Checking[0m tower-service v0.3.3
+[1m[92m    Checking[0m futures-channel v0.3.32
+[1m[92m   Compiling[0m httparse v1.10.1
+[1m[92m    Checking[0m indexmap v2.14.0
+[1m[92m   Compiling[0m zeroize_derive v1.5.0
+[1m[92m   Compiling[0m tokio-macros v2.7.0
+[1m[92m   Compiling[0m tracing-attributes v0.1.31
+[1m[92m    Checking[0m zeroize v1.9.0
+[1m[92m    Checking[0m tokio v1.52.3
+[1m[92m   Compiling[0m serde_derive v1.0.228
+[1m[92m   Compiling[0m futures-macro v0.3.32
+[1m[92m    Checking[0m tracing v0.1.44
+[1m[92m   Compiling[0m zerofrom-derive v0.1.7
+[1m[92m    Checking[0m futures-util v0.3.32
+[1m[92m    Checking[0m zerofrom v0.1.8
+[1m[92m   Compiling[0m yoke-derive v0.8.2
+[1m[92m    Checking[0m yoke v0.8.3
+[1m[92m   Compiling[0m zerovec-derive v0.11.3
+[1m[92m   Compiling[0m displaydoc v0.2.6
+[1m[92m    Checking[0m tokio-util v0.7.18
+[1m[92m    Checking[0m base64 v0.22.1
+[1m[92m    Checking[0m litemap v0.8.2
+[1m[92m    Checking[0m atomic-waker v1.1.2
+[1m[92m    Checking[0m try-lock v0.2.5
+[1m[92m    Checking[0m tower-layer v0.3.3
+[1m[92m    Checking[0m fnv v1.0.7
+[1m[92m    Checking[0m writeable v0.6.3
+[1m[92m    Checking[0m h2 v0.4.15
+[1m[92m    Checking[0m zerovec v0.11.6
+[1m[92m    Checking[0m want v0.3.1
+[1m[92m    Checking[0m zerotrie v0.2.4
+[1m[92m    Checking[0m block-buffer v0.10.4
+[1m[92m    Checking[0m crypto-common v0.1.7
+[1m[92m    Checking[0m num-integer v0.1.46
+[1m[92m    Checking[0m httpdate v1.0.3
+[1m[92m    Checking[0m regex-syntax v0.8.11
+[1m[92m   Compiling[0m icu_properties_data v2.2.0
+[1m[92m    Checking[0m tinystr v0.8.3
+[1m[92m    Checking[0m potential_utf v0.1.5
+[1m[92m    Checking[0m utf8_iter v1.0.4
+[1m[92m    Checking[0m icu_locale_core v2.2.0
+[1m[92m   Compiling[0m icu_normalizer_data v2.2.0
+[1m[92m    Checking[0m icu_collections v2.2.0
+[1m[92m    Checking[0m digest v0.10.7
+[1m[92m    Checking[0m ppv-lite86 v0.2.21
+[1m[92m    Checking[0m icu_provider v2.2.0
+[1m[92m    Checking[0m form_urlencoded v1.2.2
+[1m[92m    Checking[0m aho-corasick v1.1.4
+[1m[92m    Checking[0m sync_wrapper v1.0.2
+[1m[92m    Checking[0m ipnet v2.12.0
+[1m[92m    Checking[0m base64ct v1.8.3
+[1m[92m    Checking[0m rand_chacha v0.3.1
+[1m[92m    Checking[0m pem-rfc7468 v0.7.0
+[1m[92m    Checking[0m num-bigint v0.4.6
+[1m[92m   Compiling[0m async-trait v0.1.89
+[1m[92m    Checking[0m regex-automata v0.4.14
+[1m[92m    Checking[0m http-body-util v0.1.3
+[1m[92m   Compiling[0m ring v0.17.14
+[1m[92m   Compiling[0m thiserror v1.0.69
+[1m[92m    Checking[0m hyper v1.10.1
+[1m[92m   Compiling[0m anyhow v1.0.103
+[1m[92m    Checking[0m lazy_static v1.5.0
+[1m[92m   Compiling[0m rustversion v1.0.22
+[1m[92m    Checking[0m icu_properties v2.2.0
+[1m[92m    Checking[0m hyper-util v0.1.20
+[1m[92m    Checking[0m icu_normalizer v2.2.0
+[1m[92m    Checking[0m der v0.7.10
+[1m[92m    Checking[0m rand v0.8.6
+[1m[92m    Checking[0m tower v0.5.3
+[1m[92m   Compiling[0m thiserror-impl v1.0.69
+[1m[92m   Compiling[0m indexmap v1.9.3
+[1m[92m   Compiling[0m either v1.16.0
+[1m[92m   Compiling[0m getrandom v0.3.4
+[1m[92m    Checking[0m ryu v1.0.23
+[1m[92m    Checking[0m serde_urlencoded v0.7.1
+[1m[92m   Compiling[0m itertools v0.14.0
+[1m[92m    Checking[0m spki v0.7.3
+[1m[92m    Checking[0m idna_adapter v1.2.2
+[1m[92m    Checking[0m tokio-stream v0.1.18
+[1m[92m    Checking[0m rustls-pki-types v1.14.1
+[1m[92m   Compiling[0m pin-project-internal v1.1.13
+[1m[92m   Compiling[0m cmake v0.1.58
+[1m[92m   Compiling[0m syn v3.0.3
+[1m[92m   Compiling[0m ahash v0.8.12
+[1m[92m    Checking[0m mime v0.3.17
+[1m[92m    Checking[0m hashbrown v0.12.3
+[1m[92m   Compiling[0m fs_extra v1.3.0
+[1m[92m    Checking[0m untrusted v0.9.0
+[1m[92m   Compiling[0m dunce v1.0.5
+[1m[92m   Compiling[0m ref-cast v1.0.26
+[1m[92m   Compiling[0m aws-lc-sys v0.41.0
+[1m[92m    Checking[0m pin-project v1.1.13
+[1m[92m    Checking[0m axum-core v0.4.5
+[1m[92m   Compiling[0m prost-derive v0.13.5
+[1m[92m   Compiling[0m ref-cast-impl v1.0.26
+[1m[92m    Checking[0m opentelemetry v0.27.1
+[1m[92m    Checking[0m idna v1.1.0
+[1m[92m    Checking[0m pkcs8 v0.10.2
+[1m[92m    Checking[0m num-rational v0.4.2
+[1m[92m    Checking[0m num-iter v0.1.46
+[1m[92m    Checking[0m futures-executor v0.3.32
+[1m[92m    Checking[0m num-complex v0.4.6
+[1m[92m   Compiling[0m async-stream-impl v0.3.6
+[1m[92m    Checking[0m ff v0.13.1
+[1m[92m    Checking[0m serde_path_to_error v0.1.20
+[1m[92m   Compiling[0m rustls v0.23.41
+[1m[92m    Checking[0m glob v0.3.3
+[1m[92m    Checking[0m matchit v0.7.3
+[1m[92m    Checking[0m base16ct v0.2.0
+[1m[92m    Checking[0m opentelemetry_sdk v0.27.1
+[1m[92m    Checking[0m axum v0.7.9
+[1m[92m    Checking[0m sec1 v0.7.3
+[1m[92m    Checking[0m num v0.4.3
+[1m[92m    Checking[0m async-stream v0.3.6
+[1m[92m    Checking[0m group v0.13.0
+[1m[92m    Checking[0m prost v0.13.5
+[1m[92m    Checking[0m tower v0.4.13
+[1m[92m    Checking[0m hyper-timeout v0.5.2
+[1m[92m    Checking[0m crypto-bigint v0.5.5
+[1m[92m    Checking[0m socket2 v0.5.10
+[1m[92m   Compiling[0m unicode-general-category v1.1.0
+[1m[92m   Compiling[0m time-core v0.1.9
+[1m[92m   Compiling[0m heck v0.5.0
+[1m[92m   Compiling[0m thiserror v2.0.18
+[1m[92m    Checking[0m bit-vec v0.8.0
+[1m[92m    Checking[0m borrow-or-share v0.2.4
+[1m[92m   Compiling[0m num-conv v0.2.2
+[1m[92m    Checking[0m bit-set v0.8.0
+[1m[92m   Compiling[0m time-macros v0.2.30
+[1m[92m    Checking[0m fluent-uri v0.4.1
+[1m[92m   Compiling[0m strum_macros v0.28.0
+[1m[92m    Checking[0m tonic v0.12.3
+[1m[92m    Checking[0m elliptic-curve v0.13.8
+[1m[92m    Checking[0m fraction v0.15.4
+[1m[92m    Checking[0m matchers v0.2.0
+[1m[92m    Checking[0m sharded-slab v0.1.7
+[1m[92m    Checking[0m signature v2.2.0
+[1m[92m    Checking[0m hmac v0.12.1
+[1m[92m    Checking[0m tracing-serde v0.2.0
+[1m[92m   Compiling[0m thiserror-impl v2.0.18
+[1m[92m    Checking[0m tracing-log v0.2.0
+[1m[92m    Checking[0m thread_local v1.1.9
+[1m[92m    Checking[0m vsimd v0.8.0
+[1m[92m    Checking[0m bitflags v2.13.0
+[1m[92m    Checking[0m deranged v0.5.8
+[1m[92m    Checking[0m nu-ansi-term v0.50.3
+[1m[92m    Checking[0m powerfmt v0.2.0
+[1m[92m    Checking[0m rustls-webpki v0.103.13
+[1m[92m    Checking[0m outref v0.5.2
+[1m[92m    Checking[0m bytecount v0.6.9
+[1m[92m    Checking[0m num-cmp v0.1.0
+[1m[92m   Compiling[0m aws-lc-rs v1.17.0
+[1m[92m    Checking[0m micromap v0.3.0
+[1m[92m    Checking[0m time v0.3.51
+[1m[92m    Checking[0m referencing v0.48.5
+[1m[92m    Checking[0m jsonschema-value v0.48.5
+[1m[92m    Checking[0m uuid-simd v0.8.0
+[1m[92m    Checking[0m tracing-subscriber v0.3.23
+[1m[92m    Checking[0m rfc6979 v0.4.0
+[1m[92m    Checking[0m opentelemetry-proto v0.27.0
+[1m[92m    Checking[0m strum v0.28.0
+[1m[92m    Checking[0m tokio-rustls v0.26.4
+[1m[92m    Checking[0m fancy-regex v0.18.0
+[1m[92m    Checking[0m url v2.5.8
+[1m[92m    Checking[0m webpki-roots v1.0.8
+[1m[92m    Checking[0m regex v1.13.0
+[1m[92m    Checking[0m jsonschema-regex v0.48.5
+[1m[92m    Checking[0m email_address v0.2.9
+[1m[92m    Checking[0m cpufeatures v0.2.17
+[1m[92m    Checking[0m untrusted v0.7.1
+[1m[92m    Checking[0m data-encoding v2.11.0
+[1m[92m    Checking[0m sha2 v0.10.9
+[1m[92m    Checking[0m tower-http v0.6.11
+[1m[92m    Checking[0m jsonschema v0.48.5
+[1m[92m    Checking[0m hyper-rustls v0.27.9
+[1m[92m    Checking[0m opentelemetry-otlp v0.27.0
+[1m[92m    Checking[0m tracing-opentelemetry v0.28.0
+[1m[92m    Checking[0m ecdsa v0.16.9
+[1m[92m    Checking[0m simple_asn1 v0.6.4
+[1m[92m    Checking[0m primeorder v0.13.6
+[1m[92m    Checking[0m pem v3.0.6
+[1m[92m    Checking[0m fiducia-interfaces v0.1.0 (https://github.com/fiducia-cloud/fiducia-interfaces?rev=e3dba39566e036ad61de91e2e6c1d625ec2b5411#e3dba395)
+[1m[92m    Checking[0m p256 v0.13.2
+[1m[92m    Checking[0m reqwest v0.12.28
+[1m[92m    Checking[0m tower-http v0.5.2
+[1m[92m    Checking[0m fiducia-interfaces v0.1.0 (/home/runner/work/fiducia-auth.rs/fiducia-auth.rs/fiducia-interfaces/generated/rust)
+[1m[92m    Checking[0m fiducia-telemetry v0.2.1 (https://github.com/fiducia-cloud/fiducia-telemetry.rs?tag=v0.2.1#716853f4)
+[1m[92m    Checking[0m jsonwebtoken v10.4.0
+[1m[92m    Checking[0m fiducia-auth v0.1.0 (/home/runner/work/fiducia-auth.rs/fiducia-auth.rs/repo)
+[1m[33mwarning[0m[1m: method `as_str` is never used[0m
+  [1m[94m--> [0msrc/supabase_policy.rs:39:18
+   [1m[94m|[0m
+[1m[94m21[0m [1m[94m|[0m impl DeploymentMode {
+   [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m39[0m [1m[94m|[0m     pub const fn as_str(self) -> &'static str {
+   [1m[94m|[0m                  [1m[33m^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
-error: unknown start of token: \
- --> /home/runner/work/fiducia-auth.rs/fiducia-auth.rs/repo/src/supabase_policy.rs:1:1
-  |
-1 | \
-  | ^
+[1m[33mwarning[0m: `fiducia-auth` (bin "fiducia-auth") generated 1 warning
+[1m[33mwarning[0m: `fiducia-auth` (bin "fiducia-auth" test) generated 1 warning (1 duplicate)
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 56.98s
+$ cargo fmt --all -- --check
+$ cargo clippy --locked --all-targets -- -D warnings
+[1m[92m    Checking[0m fiducia-auth v0.1.0 (/home/runner/work/fiducia-auth.rs/fiducia-auth.rs/repo)
+[1m[91merror[0m[1m: method `as_str` is never used[0m
+  [1m[94m--> [0msrc/supabase_policy.rs:39:18
+   [1m[94m|[0m
+[1m[94m21[0m [1m[94m|[0m impl DeploymentMode {
+   [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m39[0m [1m[94m|[0m     pub const fn as_str(self) -> &'static str {
+   [1m[94m|[0m                  [1m[91m^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `-D dead-code` implied by `-D warnings`
+   [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
 
-Error writing files: failed to resolve mod `supabase_policy`: cannot parse /home/runner/work/fiducia-auth.rs/fiducia-auth.rs/repo/src/supabase_policy.rs
-fmt_status=1
-check_status=125
-fmt_check_status=125
-clippy_status=125
-test_status=125
+[1m[91merror[0m: could not compile `fiducia-auth` (bin "fiducia-auth") due to 1 previous error
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[1m[91merror[0m: could not compile `fiducia-auth` (bin "fiducia-auth" test) due to 1 previous error
+$ cargo test --locked --all-targets
+[1m[92m   Compiling[0m cfg-if v1.0.4
+[1m[92m   Compiling[0m libc v0.2.186
+[1m[92m   Compiling[0m smallvec v1.15.2
+[1m[92m   Compiling[0m once_cell v1.21.4
+[1m[92m   Compiling[0m itoa v1.0.18
+[1m[92m   Compiling[0m pin-project-lite v0.2.17
+[1m[92m   Compiling[0m futures-core v0.3.32
+[1m[92m   Compiling[0m zeroize v1.9.0
+[1m[92m   Compiling[0m scopeguard v1.2.0
+[1m[92m   Compiling[0m bytes v1.12.0
+[1m[92m   Compiling[0m lock_api v0.4.14
+[1m[92m   Compiling[0m serde_core v1.0.228
+[1m[92m   Compiling[0m tracing-core v0.1.36
+[1m[92m   Compiling[0m parking_lot_core v0.9.12
+[1m[92m   Compiling[0m getrandom v0.2.17
+[1m[92m   Compiling[0m parking_lot v0.12.5
+[1m[92m   Compiling[0m errno v0.3.14
+[1m[92m   Compiling[0m log v0.4.33
+[1m[92m   Compiling[0m futures-sink v0.3.32
+[1m[92m   Compiling[0m signal-hook-registry v1.4.8
+[1m[92m   Compiling[0m socket2 v0.6.4
+[1m[92m   Compiling[0m mio v1.2.1
+[1m[92m   Compiling[0m memchr v2.8.2
+[1m[92m   Compiling[0m tracing v0.1.44
+[1m[92m   Compiling[0m tokio v1.52.3
+[1m[92m   Compiling[0m slab v0.4.12
+[1m[92m   Compiling[0m rand_core v0.6.4
+[1m[92m   Compiling[0m futures-task v0.3.32
+[1m[92m   Compiling[0m subtle v2.6.1
+[1m[92m   Compiling[0m percent-encoding v2.3.2
+[1m[92m   Compiling[0m futures-util v0.3.32
+[1m[92m   Compiling[0m serde v1.0.228
+[1m[92m   Compiling[0m zerofrom v0.1.8
+[1m[92m   Compiling[0m jobserver v0.1.34
+[1m[92m   Compiling[0m stable_deref_trait v1.2.1
+[1m[92m   Compiling[0m cc v1.2.65
+[1m[92m   Compiling[0m yoke v0.8.3
+[1m[92m   Compiling[0m zmij v1.0.21
+[1m[92m   Compiling[0m http v1.4.2
+[1m[92m   Compiling[0m allocator-api2 v0.2.21
+[1m[92m   Compiling[0m foldhash v0.2.0
+[1m[92m   Compiling[0m equivalent v1.0.2
+[1m[92m   Compiling[0m serde_json v1.0.150
+[1m[92m   Compiling[0m zerocopy v0.8.52
+[1m[92m   Compiling[0m hashbrown v0.17.1
+[1m[92m   Compiling[0m typenum v1.20.1
+[1m[92m   Compiling[0m generic-array v0.14.7
+[1m[92m   Compiling[0m zerovec v0.11.6
+[1m[92m   Compiling[0m http-body v1.0.1
+[1m[92m   Compiling[0m tower-service v0.3.3
+[1m[92m   Compiling[0m const-oid v0.9.6
+[1m[92m   Compiling[0m num-traits v0.2.19
+[1m[92m   Compiling[0m tokio-util v0.7.18
+[1m[92m   Compiling[0m futures-channel v0.3.32
+[1m[92m   Compiling[0m tinystr v0.8.3
+[1m[92m   Compiling[0m indexmap v2.14.0
+[1m[92m   Compiling[0m fnv v1.0.7
+[1m[92m   Compiling[0m tower-layer v0.3.3
+[1m[92m   Compiling[0m litemap v0.8.2
+[1m[92m   Compiling[0m try-lock v0.2.5
+[1m[92m   Compiling[0m base64 v0.22.1
+[1m[92m   Compiling[0m atomic-waker v1.1.2
+[1m[92m   Compiling[0m writeable v0.6.3
+[1m[92m   Compiling[0m h2 v0.4.15
+[1m[92m   Compiling[0m want v0.3.1
+[1m[92m   Compiling[0m icu_locale_core v2.2.0
+[1m[92m   Compiling[0m httparse v1.10.1
+[1m[92m   Compiling[0m num-integer v0.1.46
+[1m[92m   Compiling[0m potential_utf v0.1.5
+[1m[92m   Compiling[0m zerotrie v0.2.4
+[1m[92m   Compiling[0m block-buffer v0.10.4
+[1m[92m   Compiling[0m crypto-common v0.1.7
+[1m[92m   Compiling[0m utf8_iter v1.0.4
+[1m[92m   Compiling[0m httpdate v1.0.3
+[1m[92m   Compiling[0m regex-syntax v0.8.11
+[1m[92m   Compiling[0m icu_collections v2.2.0
+[1m[92m   Compiling[0m digest v0.10.7
+[1m[92m   Compiling[0m icu_provider v2.2.0
+[1m[92m   Compiling[0m ppv-lite86 v0.2.21
+[1m[92m   Compiling[0m form_urlencoded v1.2.2
+[1m[92m   Compiling[0m aho-corasick v1.1.4
+[1m[92m   Compiling[0m sync_wrapper v1.0.2
+[1m[92m   Compiling[0m ipnet v2.12.0
+[1m[92m   Compiling[0m base64ct v1.8.3
+[1m[92m   Compiling[0m pem-rfc7468 v0.7.0
+[1m[92m   Compiling[0m regex-automata v0.4.14
+[1m[92m   Compiling[0m hyper v1.10.1
+[1m[92m   Compiling[0m rand_chacha v0.3.1
+[1m[92m   Compiling[0m icu_normalizer_data v2.2.0
+[1m[92m   Compiling[0m icu_properties_data v2.2.0
+[1m[92m   Compiling[0m num-bigint v0.4.6
+[1m[92m   Compiling[0m http-body-util v0.1.3
+[1m[92m   Compiling[0m hyper-util v0.1.20
+[1m[92m   Compiling[0m ring v0.17.14
+[1m[92m   Compiling[0m lazy_static v1.5.0
+[1m[92m   Compiling[0m icu_properties v2.2.0
+[1m[92m   Compiling[0m icu_normalizer v2.2.0
+[1m[92m   Compiling[0m rand v0.8.6
+[1m[92m   Compiling[0m der v0.7.10
+[1m[92m   Compiling[0m tower v0.5.3
+[1m[92m   Compiling[0m ryu v1.0.23
+[1m[92m   Compiling[0m serde_urlencoded v0.7.1
+[1m[92m   Compiling[0m spki v0.7.3
+[1m[92m   Compiling[0m thiserror v1.0.69
+[1m[92m   Compiling[0m idna_adapter v1.2.2
+[1m[92m   Compiling[0m tokio-stream v0.1.18
+[1m[92m   Compiling[0m cmake v0.1.58
+[1m[92m   Compiling[0m rustls-pki-types v1.14.1
+[1m[92m   Compiling[0m untrusted v0.9.0
+[1m[92m   Compiling[0m hashbrown v0.12.3
+[1m[92m   Compiling[0m mime v0.3.17
+[1m[92m   Compiling[0m aws-lc-sys v0.41.0
+[1m[92m   Compiling[0m axum-core v0.4.5
+[1m[92m   Compiling[0m indexmap v1.9.3
+[1m[92m   Compiling[0m pin-project v1.1.13
+[1m[92m   Compiling[0m idna v1.1.0
+[1m[92m   Compiling[0m opentelemetry v0.27.1
+[1m[92m   Compiling[0m pkcs8 v0.10.2
+[1m[92m   Compiling[0m getrandom v0.3.4
+[1m[92m   Compiling[0m num-rational v0.4.2
+[1m[92m   Compiling[0m num-iter v0.1.46
+[1m[92m   Compiling[0m num-complex v0.4.6
+[1m[92m   Compiling[0m futures-executor v0.3.32
+[1m[92m   Compiling[0m serde_path_to_error v0.1.20
+[1m[92m   Compiling[0m ff v0.13.1
+[1m[92m   Compiling[0m base16ct v0.2.0
+[1m[92m   Compiling[0m glob v0.3.3
+[1m[92m   Compiling[0m matchit v0.7.3
+[1m[92m   Compiling[0m rustls v0.23.41
+[1m[92m   Compiling[0m sec1 v0.7.3
+[1m[92m   Compiling[0m axum v0.7.9
+[1m[92m   Compiling[0m opentelemetry_sdk v0.27.1
+[1m[92m   Compiling[0m rustls-webpki v0.103.13
+[1m[92m   Compiling[0m group v0.13.0
+[1m[92m   Compiling[0m async-stream v0.3.6
+[1m[92m   Compiling[0m num v0.4.3
+[1m[92m   Compiling[0m ahash v0.8.12
+[1m[92m   Compiling[0m prost v0.13.5
+[1m[92m   Compiling[0m tower v0.4.13
+[1m[92m   Compiling[0m ref-cast v1.0.26
+[1m[92m   Compiling[0m hyper-timeout v0.5.2
+[1m[92m   Compiling[0m crypto-bigint v0.5.5
+[1m[92m   Compiling[0m socket2 v0.5.10
+[1m[92m   Compiling[0m bit-vec v0.8.0
+[1m[92m   Compiling[0m borrow-or-share v0.2.4
+[1m[92m   Compiling[0m time-core v0.1.9
+[1m[92m   Compiling[0m num-conv v0.2.2
+[1m[92m   Compiling[0m fluent-uri v0.4.1
+[1m[92m   Compiling[0m time-macros v0.2.30
+[1m[92m   Compiling[0m bit-set v0.8.0
+[1m[92m   Compiling[0m tonic v0.12.3
+[1m[92m   Compiling[0m elliptic-curve v0.13.8
+[1m[92m   Compiling[0m fraction v0.15.4
+[1m[92m   Compiling[0m sharded-slab v0.1.7
+[1m[92m   Compiling[0m matchers v0.2.0
+[1m[92m   Compiling[0m signature v2.2.0
+[1m[92m   Compiling[0m hmac v0.12.1
+[1m[92m   Compiling[0m tracing-serde v0.2.0
+[1m[92m   Compiling[0m tracing-log v0.2.0
+[1m[92m   Compiling[0m thread_local v1.1.9
+[1m[92m   Compiling[0m bytecount v0.6.9
+[1m[92m   Compiling[0m bitflags v2.13.0
+[1m[92m   Compiling[0m deranged v0.5.8
+[1m[92m   Compiling[0m outref v0.5.2
+[1m[92m   Compiling[0m nu-ansi-term v0.50.3
+[1m[92m   Compiling[0m powerfmt v0.2.0
+[1m[92m   Compiling[0m micromap v0.3.0
+[1m[92m   Compiling[0m num-cmp v0.1.0
+[1m[92m   Compiling[0m vsimd v0.8.0
+[1m[92m   Compiling[0m jsonschema-value v0.48.5
+[1m[92m   Compiling[0m uuid-simd v0.8.0
+[1m[92m   Compiling[0m referencing v0.48.5
+[1m[92m   Compiling[0m time v0.3.51
+[1m[92m   Compiling[0m tracing-subscriber v0.3.23
+[1m[92m   Compiling[0m tokio-rustls v0.26.4
+[1m[92m   Compiling[0m thiserror v2.0.18
+[1m[92m   Compiling[0m rfc6979 v0.4.0
+[1m[92m   Compiling[0m opentelemetry-proto v0.27.0
+[1m[92m   Compiling[0m fancy-regex v0.18.0
+[1m[92m   Compiling[0m unicode-general-category v1.1.0
+[1m[92m   Compiling[0m strum v0.28.0
+[1m[92m   Compiling[0m url v2.5.8
+[1m[92m   Compiling[0m webpki-roots v1.0.8
+[1m[92m   Compiling[0m regex v1.13.0
+[1m[92m   Compiling[0m jsonschema-regex v0.48.5
+[1m[92m   Compiling[0m email_address v0.2.9
+[1m[92m   Compiling[0m untrusted v0.7.1
+[1m[92m   Compiling[0m cpufeatures v0.2.17
+[1m[92m   Compiling[0m data-encoding v2.11.0
+[1m[92m   Compiling[0m sha2 v0.10.9
+[1m[92m   Compiling[0m tower-http v0.6.11
+[1m[92m   Compiling[0m jsonschema v0.48.5
+[1m[92m   Compiling[0m hyper-rustls v0.27.9
+[1m[92m   Compiling[0m opentelemetry-otlp v0.27.0
+[1m[92m   Compiling[0m tracing-opentelemetry v0.28.0
+[1m[92m   Compiling[0m ecdsa v0.16.9
+[1m[92m   Compiling[0m simple_asn1 v0.6.4
+[1m[92m   Compiling[0m primeorder v0.13.6
+[1m[92m   Compiling[0m pem v3.0.6
+[1m[92m   Compiling[0m fiducia-interfaces v0.1.0 (https://github.com/fiducia-cloud/fiducia-interfaces?rev=e3dba39566e036ad61de91e2e6c1d625ec2b5411#e3dba395)
+[1m[92m   Compiling[0m p256 v0.13.2
+[1m[92m   Compiling[0m reqwest v0.12.28
+[1m[92m   Compiling[0m fiducia-telemetry v0.2.1 (https://github.com/fiducia-cloud/fiducia-telemetry.rs?tag=v0.2.1#716853f4)
+[1m[92m   Compiling[0m fiducia-interfaces v0.1.0 (/home/runner/work/fiducia-auth.rs/fiducia-auth.rs/fiducia-interfaces/generated/rust)
+[1m[92m   Compiling[0m tower-http v0.5.2
+[1m[92m   Compiling[0m aws-lc-rs v1.17.0
+[1m[92m   Compiling[0m jsonwebtoken v10.4.0
+[1m[92m   Compiling[0m fiducia-auth v0.1.0 (/home/runner/work/fiducia-auth.rs/fiducia-auth.rs/repo)
+[1m[33mwarning[0m[1m: method `as_str` is never used[0m
+  [1m[94m--> [0msrc/supabase_policy.rs:39:18
+   [1m[94m|[0m
+[1m[94m21[0m [1m[94m|[0m impl DeploymentMode {
+   [1m[94m|[0m [1m[94m-------------------[0m [1m[94mmethod in this implementation[0m
+[1m[94m...[0m
+[1m[94m39[0m [1m[94m|[0m     pub const fn as_str(self) -> &'static str {
+   [1m[94m|[0m                  [1m[33m^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[33mwarning[0m: `fiducia-auth` (bin "fiducia-auth" test) generated 1 warning
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 59.52s
+[1m[92m     Running[0m unittests src/main.rs (target/debug/deps/fiducia_auth-6191ea0b2ffcd0f1)
+
+running 59 tests
+test constant_time_tests::matches_only_on_exact_equality ... ok
+test interface_contract_tests::customer_cors_origin_is_exact_and_normalized ... ok
+test interface_contract_tests::customer_key_creation_rejects_admin_scopes ... ok
+test interface_contract_tests::generated_interfaces_are_importable ... ok
+test interface_contract_tests::key_creation_defaults_and_dedupes_scopes ... ok
+test interface_contract_tests::key_creation_rejects_bad_name_env_and_scope ... ok
+test cors_tests::customer_origin_preflight_is_allowed_exactly ... ok
+test cors_tests::sibling_origin_never_receives_itself_as_an_allowed_origin ... ok
+test interface_contract_tests::key_request_defaults_idempotency_to_true ... ok
+test interface_contract_tests::multi_org_key_operations_require_an_explicit_authorized_org ... ok
+test interface_contract_tests::rotation_overlap_configuration_fails_closed_when_invalid ... ok
+test keys::tests::credential_derivation_secret_is_strong_and_unambiguous ... ok
+test keys::tests::hash_is_pepper_keyed_and_legacy_records_remain_verifiable ... ok
+test keys::tests::introspect_round_trips_a_created_key ... ok
+test keys::tests::introspect_rejects_tampered_secret_and_revoked_keys ... ok
+test keys::tests::create_replays_the_same_one_time_secret_for_the_same_idempotency_key ... ok
+test keys::tests::introspection_is_wire_compatible_with_the_shared_interface ... ok
+test keys::tests::legacy_customer_keys_never_surface_admin_scopes ... ok
+test keys::tests::production_introspection_fails_closed_on_malformed_stored_records ... ok
+test keys::tests::production_introspection_never_falls_back_to_a_stale_local_record ... ok
+test keys::tests::raw_key_parser_accepts_only_the_minted_wire_shape ... ok
+test keys::tests::revoke_is_scoped_to_the_owning_org ... ok
+test keys::tests::revoke_versions_only_the_first_state_transition ... ok
+test keys::tests::revoked_key_cannot_be_rotated ... ok
+test keys::tests::rotate_is_scoped_to_the_owning_org ... ok
+test keys::tests::org_index_cas_retries_and_merges_a_concurrent_insert ... ok
+test keys::tests::production_introspection_rejects_a_record_missing_from_its_org_index ... ok
+test keys::tests::rotate_replaces_secret_increments_version_and_preserves_policy ... ok
+test store::tests::old_stored_keys_default_version_and_idempotency_to_zero_and_false ... ok
+test supabase::tests::claims_must_be_authenticated_user_tokens ... ok
+test store::tests::put_response_requires_committed_success_envelope ... ok
+test supabase::tests::forced_refresh_cooldown_gates_young_caches ... ok
+test supabase::tests::metadata_orgs_accept_strings_arrays_and_dedupe ... ok
+test supabase::tests::metadata_without_org_membership_stays_empty ... ok
+test supabase::tests::metric_dimensions_are_fixed_and_content_free ... ok
+test supabase::tests::missing_aal_is_single_factor_and_unknown_aal_is_rejected ... ok
+test supabase::tests::normalize_url_trims_spaces_and_trailing_slashes ... ok
+test supabase::tests::project_ref_builds_supabase_auth_urls ... ok
+test supabase::tests::push_org_ignores_empty_and_duplicate_orgs ... ok
+test supabase::tests::remote_user_must_match_supabase_audience ... ok
+test supabase::tests::roles_come_only_from_trusted_app_metadata_shape ... ok
+test supabase::tests::symmetric_jwt_algorithms_are_not_accepted_for_offline_jwks ... ok
+test store::tests::kv_requests_carry_internal_auth_and_the_service_org ... ok
+test supabase::tests::verified_claims_ignore_user_writable_orgs_and_roles ... ok
+test supabase_policy::tests::deployment_mode_defaults_to_production ... ok
+test supabase_policy::tests::malformed_values_fail_closed ... ok
+test supabase_policy::tests::production_rejects_remote_userinfo_even_with_a_publishable_key ... ok
+test supabase_policy::tests::non_production_requires_explicit_opt_in_and_publishable_key ... ok
+test sync::tests::disabled_without_service_key ... ok
+test sync::tests::cache_get_and_replace ... ok
+test sync::tests::id_coercion_handles_string_and_int ... ok
+test keys::tests::secrets_are_high_entropy_and_unique ... ok
+test supabase::tests::unknown_kid_cannot_force_a_jwks_refetch_within_the_cooldown ... ok
+test token::tests::jwks_exposes_one_es256_signing_key ... ok
+test token::tests::expired_token_is_rejected ... ok
+test token::tests::mint_then_verify_offline_roundtrips ... ok
+test token::tests::a_token_from_a_different_key_is_rejected ... ok
+test token::tests::tampered_or_garbage_tokens_are_rejected ... ok
+test sync::tests::stale_cache_keeps_serving_through_a_sor_outage ... ok
+
+test result: ok. 59 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
+
+[1m[92m     Running[0m unittests src/bin/fiducia-auth-production-entrypoint.rs (target/debug/deps/fiducia_auth_production_entrypoint-fc77471cd76cd023)
+
+running 4 tests
+test supabase_policy::tests::deployment_mode_defaults_to_production ... ok
+test supabase_policy::tests::malformed_values_fail_closed ... ok
+test supabase_policy::tests::production_rejects_remote_userinfo_even_with_a_publishable_key ... ok
+test supabase_policy::tests::non_production_requires_explicit_opt_in_and_publishable_key ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+fmt_status=0
+check_status=0
+fmt_check_status=0
+clippy_status=101
+test_status=0

@@ -46,8 +46,8 @@ impl DeploymentMode {
     }
 }
 
-pub fn remote_userinfo_policy_from_env(
-) -> Result<(DeploymentMode, bool), RemoteUserinfoPolicyError> {
+pub fn remote_userinfo_policy_from_env() -> Result<(DeploymentMode, bool), RemoteUserinfoPolicyError>
+{
     let deployment_mode = env_value(DEPLOYMENT_MODE_ENV);
     let requested_remote_userinfo = env_value(REMOTE_USERINFO_ENV);
     remote_userinfo_policy_from_values(
@@ -103,10 +103,7 @@ fn parse_optional_bool(
 #[derive(Debug, Eq, PartialEq)]
 pub enum RemoteUserinfoPolicyError {
     InvalidDeploymentMode(String),
-    InvalidBoolean {
-        name: &'static str,
-        value: String,
-    },
+    InvalidBoolean { name: &'static str, value: String },
     ForbiddenInProduction,
     MissingPublishableKey,
 }
@@ -146,8 +143,7 @@ mod tests {
             (DeploymentMode::Production, false),
         );
         assert_eq!(
-            remote_userinfo_policy_from_values(Some("prod"), Some("false"), false)
-                .unwrap(),
+            remote_userinfo_policy_from_values(Some("prod"), Some("false"), false).unwrap(),
             (DeploymentMode::Production, false),
         );
     }
@@ -155,11 +151,7 @@ mod tests {
     #[test]
     fn production_rejects_remote_userinfo_even_with_a_publishable_key() {
         assert_eq!(
-            remote_userinfo_policy_from_values(
-                Some("production"),
-                Some("true"),
-                true,
-            ),
+            remote_userinfo_policy_from_values(Some("production"), Some("true"), true,),
             Err(RemoteUserinfoPolicyError::ForbiddenInProduction),
         );
     }
@@ -176,8 +168,7 @@ mod tests {
                 Err(RemoteUserinfoPolicyError::MissingPublishableKey),
             );
             assert_eq!(
-                remote_userinfo_policy_from_values(Some(mode), Some("true"), true)
-                    .unwrap(),
+                remote_userinfo_policy_from_values(Some(mode), Some("true"), true).unwrap(),
                 (DeploymentMode::parse(Some(mode)).unwrap(), true),
             );
         }
@@ -190,11 +181,7 @@ mod tests {
             Err(RemoteUserinfoPolicyError::InvalidDeploymentMode(_)),
         ));
         assert!(matches!(
-            remote_userinfo_policy_from_values(
-                Some("staging"),
-                Some("sometimes"),
-                true,
-            ),
+            remote_userinfo_policy_from_values(Some("staging"), Some("sometimes"), true,),
             Err(RemoteUserinfoPolicyError::InvalidBoolean { .. }),
         ));
     }

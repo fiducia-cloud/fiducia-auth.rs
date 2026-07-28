@@ -452,6 +452,7 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "once_cell",
+ "opentelemetry",
  "p256",
  "reqwest",
  "serde",
