@@ -2,12 +2,18 @@
 
 #[path = "../governance_ceremony.rs"]
 mod governance_ceremony;
+#[allow(dead_code)]
 #[path = "../model.rs"]
 mod model;
+#[allow(dead_code)]
 #[path = "../store.rs"]
 mod store;
+#[allow(dead_code)]
 #[path = "../supabase.rs"]
 mod supabase;
+#[allow(dead_code)]
+#[path = "../token.rs"]
+mod token;
 
 use std::net::SocketAddr;
 
