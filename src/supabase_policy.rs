@@ -63,6 +63,10 @@ pub fn remote_userinfo_policy_from_values(
     has_publishable_key: bool,
 ) -> Result<(DeploymentMode, bool), RemoteUserinfoPolicyError> {
     let mode = DeploymentMode::parse(deployment_mode)?;
+    debug_assert!(
+        !mode.as_str().is_empty(),
+        "every accepted deployment mode must have a canonical name",
+    );
     let requested = parse_optional_bool(REMOTE_USERINFO_ENV, requested_remote_userinfo)?;
     let allow_remote_userinfo = requested.unwrap_or(false);
 
