@@ -1,4 +1,3 @@
-\
 //! One fail-closed policy for every Supabase verification entrypoint.
 //!
 //! Both the production wrapper and the core verifier compile this file.
