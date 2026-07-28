@@ -2,12 +2,13 @@
 //!
 //! B2B humans log into the dashboard via Supabase Auth and send their Supabase
 //! access token to fiducia-auth. We prefer offline JWT verification against the
-//! project's cached JWKS. If the project still uses shared-secret signing and
-//! has no public JWKS, we fall back to Supabase's `/auth/v1/user` endpoint with
-//! the publishable key.
+//! project's cached JWKS. Remote `/auth/v1/user` verification is disabled by
+//! default and forbidden in production; it exists only as an explicit,
+//! observable non-production migration path for shared-secret projects.
 
 use std::{
     env, fmt,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -16,12 +17,19 @@ use jsonwebtoken::{
     jwk::{AlgorithmParameters, Jwk, JwkSet},
     Algorithm, DecodingKey, Validation,
 };
+use opentelemetry::{global, metrics::Counter, KeyValue};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{OnceCell, RwLock};
 
-use crate::model::{AssuranceLevel, UserCtx};
+use crate::{
+    model::{AssuranceLevel, UserCtx},
+    supabase_policy::{
+        remote_userinfo_policy_from_env, DeploymentMode, RemoteUserinfoPolicyError,
+        PUBLISHABLE_KEY_ENV,
+    },
+};
 
 const DEFAULT_AUDIENCE: &str = "authenticated";
 const DEFAULT_JWKS_TTL_SECS: u64 = 10 * 60;
@@ -37,6 +45,109 @@ const MIN_FORCED_JWKS_REFRESH_SECS: u64 = 30;
 
 static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
 static JWKS_CACHE: OnceCell<RwLock<Option<CachedJwks>>> = OnceCell::const_new();
+static UNKNOWN_KID_EVENTS: OnceLock<Counter<u64>> = OnceLock::new();
+static FORCED_REFRESH_EVENTS: OnceLock<Counter<u64>> = OnceLock::new();
+static REMOTE_USERINFO_EVENTS: OnceLock<Counter<u64>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnknownKidStage {
+    Observed,
+    RefreshBlocked,
+}
+
+impl UnknownKidStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::RefreshBlocked => "refresh_blocked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForcedRefreshOutcome {
+    Attempted,
+    Succeeded,
+    Failed,
+    MissingAfterRefresh,
+}
+
+impl ForcedRefreshOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Attempted => "attempted",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::MissingAfterRefresh => "missing_after_refresh",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteUserinfoOutcome {
+    Attempted,
+    Accepted,
+    ClaimRejected,
+    Rejected,
+    TransportError,
+    InvalidResponse,
+    UpstreamStatus,
+}
+
+impl RemoteUserinfoOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Attempted => "attempted",
+            Self::Accepted => "accepted",
+            Self::ClaimRejected => "claim_rejected",
+            Self::Rejected => "rejected",
+            Self::TransportError => "transport_error",
+            Self::InvalidResponse => "invalid_response",
+            Self::UpstreamStatus => "upstream_status",
+        }
+    }
+}
+
+fn auth_counter(
+    cell: &'static OnceLock<Counter<u64>>,
+    name: &'static str,
+    description: &'static str,
+) -> &'static Counter<u64> {
+    cell.get_or_init(|| {
+        global::meter("fiducia-auth")
+            .u64_counter(name)
+            .with_description(description)
+            .with_unit("{event}")
+            .build()
+    })
+}
+
+fn record_unknown_kid(stage: UnknownKidStage) {
+    auth_counter(
+        &UNKNOWN_KID_EVENTS,
+        "fiducia.auth.supabase.unknown_kid",
+        "Unknown Supabase JWKS key-id events without recording the key id",
+    )
+    .add(1, &[KeyValue::new("stage", stage.as_str())]);
+}
+
+fn record_forced_refresh(outcome: ForcedRefreshOutcome) {
+    auth_counter(
+        &FORCED_REFRESH_EVENTS,
+        "fiducia.auth.supabase.forced_jwks_refresh",
+        "Forced Supabase JWKS refresh attempts and bounded outcomes",
+    )
+    .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
+}
+
+fn record_remote_userinfo(outcome: RemoteUserinfoOutcome) {
+    auth_counter(
+        &REMOTE_USERINFO_EVENTS,
+        "fiducia.auth.supabase.remote_userinfo",
+        "Explicit non-production Supabase remote-userinfo compatibility events",
+    )
+    .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
+}
 
 /// Validate the project identity at startup so a missing deployment value can
 /// never silently select a real project or turn into per-request auth failure.
@@ -70,11 +181,14 @@ async fn verify_session_inner(jwt: &str) -> Result<UserCtx, VerifyError> {
             Ok(user) => return Ok(user),
             Err(err) if !config.allow_remote_userinfo => return Err(err),
             Err(err) => {
+                record_remote_userinfo(RemoteUserinfoOutcome::Attempted);
                 tracing::debug!(error = %err, "falling back to supabase auth user endpoint");
             }
         }
     } else if !config.allow_remote_userinfo {
         return Err(VerifyError::UnsupportedAlgorithm(header.alg));
+    } else {
+        record_remote_userinfo(RemoteUserinfoOutcome::Attempted);
     }
 
     verify_with_user_endpoint(jwt, &config).await
@@ -90,16 +204,33 @@ async fn verify_with_jwks(
     let jwk = match jwks.find(kid).cloned() {
         Some(jwk) => jwk,
         None => {
+            record_unknown_kid(UnknownKidStage::Observed);
             // An unknown `kid` may force one refetch, but only when the cached
             // set is old enough — otherwise attacker-minted kids would turn
             // every request into an outbound JWKS fetch.
             if !forced_refresh_allowed(config).await {
-                return Err(VerifyError::MissingJwk(kid.to_string()));
+                record_unknown_kid(UnknownKidStage::RefreshBlocked);
+                return Err(VerifyError::MissingJwk);
             }
-            jwks = refresh_jwks(config).await?;
-            jwks.find(kid)
-                .cloned()
-                .ok_or_else(|| VerifyError::MissingJwk(kid.to_string()))?
+
+            record_forced_refresh(ForcedRefreshOutcome::Attempted);
+            jwks = match refresh_jwks(config).await {
+                Ok(jwks) => jwks,
+                Err(error) => {
+                    record_forced_refresh(ForcedRefreshOutcome::Failed);
+                    return Err(error);
+                }
+            };
+            match jwks.find(kid).cloned() {
+                Some(jwk) => {
+                    record_forced_refresh(ForcedRefreshOutcome::Succeeded);
+                    jwk
+                }
+                None => {
+                    record_forced_refresh(ForcedRefreshOutcome::MissingAfterRefresh);
+                    return Err(VerifyError::MissingJwk);
+                }
+            }
         }
     };
 
@@ -127,25 +258,46 @@ async fn verify_with_user_endpoint(
         .as_deref()
         .ok_or(VerifyError::MissingPublishableKey)?;
 
-    let response = http_client()
+    let response = match http_client()
         .await
         .get(&config.user_url)
         .header("apikey", publishable_key)
         .bearer_auth(jwt)
         .send()
         .await
-        .map_err(VerifyError::Http)?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            record_remote_userinfo(RemoteUserinfoOutcome::TransportError);
+            return Err(VerifyError::Http(error));
+        }
+    };
 
     match response.status() {
         StatusCode::OK => {
-            let user = response
-                .json::<SupabaseUser>()
-                .await
-                .map_err(VerifyError::Http)?;
-            user_ctx_from_remote_user(user, config)
+            let user = match response.json::<SupabaseUser>().await {
+                Ok(user) => user,
+                Err(error) => {
+                    record_remote_userinfo(RemoteUserinfoOutcome::InvalidResponse);
+                    return Err(VerifyError::Http(error));
+                }
+            };
+            let result = user_ctx_from_remote_user(user, config);
+            record_remote_userinfo(if result.is_ok() {
+                RemoteUserinfoOutcome::Accepted
+            } else {
+                RemoteUserinfoOutcome::ClaimRejected
+            });
+            result
         }
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(VerifyError::RejectedBySupabase),
-        status => Err(VerifyError::SupabaseStatus(status)),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            record_remote_userinfo(RemoteUserinfoOutcome::Rejected);
+            Err(VerifyError::RejectedBySupabase)
+        }
+        status => {
+            record_remote_userinfo(RemoteUserinfoOutcome::UpstreamStatus);
+            Err(VerifyError::SupabaseStatus(status))
+        }
     }
 }
 
@@ -412,6 +564,17 @@ impl SupabaseConfig {
             .unwrap_or_else(|| format!("{issuer}/.well-known/jwks.json"));
         let user_url =
             env_value("SUPABASE_AUTH_USER_URL").unwrap_or_else(|| format!("{issuer}/user"));
+        let publishable_key = env_value(PUBLISHABLE_KEY_ENV);
+        let (deployment_mode, allow_remote_userinfo) =
+            remote_userinfo_policy_from_env().map_err(VerifyError::RemoteUserinfoPolicy)?;
+        debug_assert!(
+            deployment_mode != DeploymentMode::Production || !allow_remote_userinfo,
+            "shared production policy must forbid remote userinfo",
+        );
+        debug_assert!(
+            !allow_remote_userinfo || publishable_key.is_some(),
+            "shared compatibility policy must require a publishable key",
+        );
 
         Ok(SupabaseConfig {
             audience: env_value("SUPABASE_AUTH_AUDIENCE")
@@ -423,9 +586,9 @@ impl SupabaseConfig {
                     .unwrap_or(DEFAULT_JWKS_TTL_SECS),
             ),
             jwks_url,
-            publishable_key: env_value("SUPABASE_PUBLISHABLE_KEY"),
+            publishable_key,
             user_url,
-            allow_remote_userinfo: env_bool("SUPABASE_AUTH_ALLOW_REMOTE_USERINFO", true),
+            allow_remote_userinfo,
         })
     }
 
@@ -440,7 +603,7 @@ impl SupabaseConfig {
             jwks_url: format!("{issuer}/.well-known/jwks.json"),
             publishable_key: None,
             user_url: format!("{issuer}/user"),
-            allow_remote_userinfo: true,
+            allow_remote_userinfo: false,
         }
     }
 }
@@ -450,14 +613,6 @@ fn env_value(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn env_bool(name: &str, default: bool) -> bool {
-    match env_value(name).as_deref() {
-        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
-        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
-        _ => default,
-    }
 }
 
 fn supabase_url_for_project(project_ref: &str) -> String {
@@ -506,9 +661,10 @@ enum VerifyError {
     Http(reqwest::Error),
     InvalidToken(&'static str),
     Jwt(jsonwebtoken::errors::Error),
-    MissingJwk(String),
+    MissingJwk,
     MissingPublishableKey,
     MissingConfiguration(&'static str),
+    RemoteUserinfoPolicy(RemoteUserinfoPolicyError),
     RejectedBySupabase,
     SupabaseStatus(StatusCode),
     SymmetricJwk,
@@ -525,7 +681,7 @@ impl fmt::Display for VerifyError {
             VerifyError::Http(err) => write!(f, "supabase http error: {err}"),
             VerifyError::InvalidToken(reason) => write!(f, "invalid token: {reason}"),
             VerifyError::Jwt(err) => write!(f, "jwt verification error: {err}"),
-            VerifyError::MissingJwk(kid) => write!(f, "jwks key not found for kid {kid}"),
+            VerifyError::MissingJwk => write!(f, "jwks key not found"),
             VerifyError::MissingPublishableKey => {
                 write!(
                     f,
@@ -533,6 +689,7 @@ impl fmt::Display for VerifyError {
                 )
             }
             VerifyError::MissingConfiguration(message) => write!(f, "{message}"),
+            VerifyError::RemoteUserinfoPolicy(error) => error.fmt(f),
             VerifyError::RejectedBySupabase => write!(f, "supabase rejected bearer token"),
             VerifyError::SupabaseStatus(status) => {
                 write!(f, "supabase auth returned unexpected status {status}")
@@ -724,7 +881,7 @@ mod tests {
         // A fresh cache means an attacker-controlled unknown `kid` must NOT
         // trigger another upstream fetch — it fails fast instead.
         let result = verify_with_jwks("junk-jwt", &config, Algorithm::ES256, "unknown-kid").await;
-        assert!(matches!(result, Err(VerifyError::MissingJwk(kid)) if kid == "unknown-kid"));
+        assert!(matches!(result, Err(VerifyError::MissingJwk)));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             1,
@@ -742,7 +899,7 @@ mod tests {
                 .expect("age within Instant range");
         }
         let result = verify_with_jwks("junk-jwt", &config, Algorithm::ES256, "unknown-kid").await;
-        assert!(matches!(result, Err(VerifyError::MissingJwk(_))));
+        assert!(matches!(result, Err(VerifyError::MissingJwk)));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             2,
@@ -750,6 +907,39 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[test]
+    fn metric_dimensions_are_fixed_and_content_free() {
+        assert_eq!(UnknownKidStage::Observed.as_str(), "observed");
+        assert_eq!(UnknownKidStage::RefreshBlocked.as_str(), "refresh_blocked");
+        assert_eq!(ForcedRefreshOutcome::Attempted.as_str(), "attempted");
+        assert_eq!(ForcedRefreshOutcome::Succeeded.as_str(), "succeeded");
+        assert_eq!(ForcedRefreshOutcome::Failed.as_str(), "failed");
+        assert_eq!(
+            ForcedRefreshOutcome::MissingAfterRefresh.as_str(),
+            "missing_after_refresh",
+        );
+        assert_eq!(RemoteUserinfoOutcome::Attempted.as_str(), "attempted");
+        assert_eq!(RemoteUserinfoOutcome::Accepted.as_str(), "accepted");
+        assert_eq!(
+            RemoteUserinfoOutcome::ClaimRejected.as_str(),
+            "claim_rejected",
+        );
+        assert_eq!(RemoteUserinfoOutcome::Rejected.as_str(), "rejected");
+        assert_eq!(
+            RemoteUserinfoOutcome::TransportError.as_str(),
+            "transport_error",
+        );
+        assert_eq!(
+            RemoteUserinfoOutcome::InvalidResponse.as_str(),
+            "invalid_response",
+        );
+        assert_eq!(
+            RemoteUserinfoOutcome::UpstreamStatus.as_str(),
+            "upstream_status",
+        );
+        assert_eq!(VerifyError::MissingJwk.to_string(), "jwks key not found");
     }
 
     #[test]

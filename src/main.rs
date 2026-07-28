@@ -19,6 +19,7 @@ mod keys;
 mod model;
 mod store;
 mod supabase;
+mod supabase_policy;
 mod sync;
 mod token;
 
