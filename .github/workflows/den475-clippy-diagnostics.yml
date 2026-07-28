@@ -1,15 +1,12 @@
 name: den475-clippy-diagnostics
 
 on:
-  push:
-    branches:
-      - agent/den-475-durable-webauthn-ceremonies
   pull_request:
     branches:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: den475-clippy-${{ github.ref }}
@@ -17,15 +14,13 @@ concurrency:
 
 jobs:
   diagnose:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: agent/den-475-durable-webauthn-ceremonies
+          persist-credentials: false
           path: repo
-          fetch-depth: 0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -40,12 +35,14 @@ jobs:
         working-directory: repo
         run: |
           set +e
-          cargo clippy --locked --all-targets -- -D warnings > docs/den475-clippy.log 2>&1
+          cargo clippy --locked --all-targets -- -D warnings > den475-clippy.log 2>&1
           status=$?
           set -e
-          printf '\nexit_status=%s\n' "$status" >> docs/den475-clippy.log
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/den475-clippy.log
-          git commit -m "ci: capture DEN-475 clippy diagnostics"
-          git push origin HEAD:agent/den-475-durable-webauthn-ceremonies
+          printf '\nexit_status=%s\n' "$status" >> den475-clippy.log
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: den475-clippy-diagnostics
+          path: repo/den475-clippy.log
+          retention-days: 1
+          if-no-files-found: error
