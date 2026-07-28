@@ -1,14 +1,23 @@
 //! Durable API-key storage in fiducia's OWN KV (dogfooding the coordination
 //! cluster) — so the end-user data plane never touches Supabase. The auth server
-//! talks to a node's KV over HTTP (`FIDUCIA_KV_URL`, in-cluster); records live
-//! under the reserved `__auth/` keyspace. Production introspection reads these
-//! authoritative records so rotations and revocations cross replica boundaries.
+//! talks to Fiducia KV through the load balancer (`FIDUCIA_KV_URL`, in-cluster);
+//! records live under the reserved `__auth/` keyspace. Production introspection
+//! reads these authoritative records so rotations and revocations cross replica
+//! boundaries.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::model::{ApiKeyRecord, OrgId};
+
+const TRUSTED_HOP_HEADER: &str = "x-fiducia-edge-auth";
+const TRUSTED_AUTH_KIND_HEADER: &str = "x-fiducia-auth-kind";
+const TRUSTED_ORG_HEADER: &str = "x-fiducia-org-id";
+const TRUSTED_KEY_ID_HEADER: &str = "x-fiducia-key-id";
+const TRUSTED_SCOPES_HEADER: &str = "x-fiducia-scopes";
+const AUTH_STORAGE_SERVICE_ID: &str = "fiducia-auth-kv";
+const AUTH_STORAGE_SCOPES: &str = "kv:read kv:write";
 
 pub fn key_path(key_id: &str) -> String {
     format!("__auth/keys/{key_id}")
@@ -89,7 +98,7 @@ impl From<&StoredKey> for ApiKeyRecord {
     }
 }
 
-/// Thin HTTP client for fiducia KV. Values are opaque strings on the wire, so we
+/// Thin HTTP client for Fiducia KV. Values are opaque strings on the wire, so we
 /// store each record as a JSON string.
 pub struct KvClient {
     base: String,
@@ -145,7 +154,7 @@ pub enum StoreError {
 }
 
 impl KvClient {
-    /// Build from `FIDUCIA_KV_URL` (e.g. http://fiducia-node.fiducia.svc:8090).
+    /// Build from `FIDUCIA_KV_URL` (normally the in-cluster load balancer).
     /// Production requires a durable Fiducia KV endpoint.
     pub fn from_env() -> Result<Self, StoreError> {
         let base = std::env::var("FIDUCIA_KV_URL")
@@ -173,10 +182,19 @@ impl KvClient {
         })
     }
 
+    /// Present an explicit trusted service identity to the load balancer.
+    ///
+    /// The load balancer does not treat `x-fiducia-internal-auth` as a caller
+    /// identity; that header is reserved for the LB-to-node hop and is stripped
+    /// from inbound requests. Reuse the LB's authenticated trusted-hop contract
+    /// instead, with the minimum scopes required by the auth storage service.
     fn trusted_request(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         request
-            .header("x-fiducia-internal-auth", &self.internal_secret)
-            .header("x-fiducia-org-id", &self.storage_org)
+            .header(TRUSTED_HOP_HEADER, &self.internal_secret)
+            .header(TRUSTED_AUTH_KIND_HEADER, "api_key")
+            .header(TRUSTED_ORG_HEADER, &self.storage_org)
+            .header(TRUSTED_KEY_ID_HEADER, AUTH_STORAGE_SERVICE_ID)
+            .header(TRUSTED_SCOPES_HEADER, AUTH_STORAGE_SCOPES)
     }
 
     /// GET /v1/kv?key=… → the stored value and its CAS revision.
@@ -300,36 +318,77 @@ mod tests {
     use axum::{http::HeaderMap, routing::get, Json, Router};
     use serde_json::json;
 
-    async fn trusted_get(headers: HeaderMap) -> Json<Value> {
+    fn assert_trusted_storage_identity(headers: &HeaderMap) {
         assert_eq!(
             headers
-                .get("x-fiducia-internal-auth")
+                .get(TRUSTED_HOP_HEADER)
                 .and_then(|value| value.to_str().ok()),
             Some("test-internal-secret")
         );
         assert_eq!(
             headers
-                .get("x-fiducia-org-id")
+                .get(TRUSTED_AUTH_KIND_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("api_key")
+        );
+        assert_eq!(
+            headers
+                .get(TRUSTED_ORG_HEADER)
                 .and_then(|value| value.to_str().ok()),
             Some("fiducia-auth-test")
         );
+        assert_eq!(
+            headers
+                .get(TRUSTED_KEY_ID_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(AUTH_STORAGE_SERVICE_ID)
+        );
+        assert_eq!(
+            headers
+                .get(TRUSTED_SCOPES_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(AUTH_STORAGE_SCOPES)
+        );
+        assert!(headers.get("x-fiducia-internal-auth").is_none());
+    }
+
+    async fn trusted_get(headers: HeaderMap) -> Json<Value> {
+        assert_trusted_storage_identity(&headers);
         Json(json!({ "found": false }))
     }
 
+    async fn trusted_put(headers: HeaderMap) -> Json<Value> {
+        assert_trusted_storage_identity(&headers);
+        Json(json!({
+            "committed": true,
+            "result": { "output": { "ok": true, "revision": 1 } }
+        }))
+    }
+
     #[tokio::test]
-    async fn kv_requests_carry_internal_auth_and_the_service_org() {
+    async fn kv_requests_carry_scoped_trusted_service_identity() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            axum::serve(listener, Router::new().route("/v1/kv", get(trusted_get)))
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                Router::new().route("/v1/kv", get(trusted_get).put(trusted_put)),
+            )
+            .await
+            .unwrap();
         });
 
         let client = KvClient::for_test(format!("http://{address}"));
         assert!(client.get("__auth/test").await.unwrap().is_none());
+        assert_eq!(
+            client
+                .put_if_revision("__auth/test", &json!({ "key": "value" }), 0)
+                .await
+                .unwrap(),
+            CasOutcome::Applied
+        );
         server.abort();
     }
 
@@ -374,8 +433,14 @@ mod tests {
         for invalid in [
             json!({ "committed": false, "result": { "output": { "ok": true, "revision": 1 } } }),
             json!({ "committed": true, "result": { "output": { "ok": true } } }),
-            json!({ "committed": true, "result": { "output": { "ok": false, "reason": "cas_mismatch" } } }),
-            json!({ "committed": true, "result": { "output": { "ok": false, "reason": "unknown" } } }),
+            json!({
+                "committed": true,
+                "result": { "output": { "ok": false, "reason": "cas_mismatch" } }
+            }),
+            json!({
+                "committed": true,
+                "result": { "output": { "ok": false, "reason": "unknown" } }
+            }),
         ] {
             assert!(parse_put_response(&invalid).is_err());
         }
