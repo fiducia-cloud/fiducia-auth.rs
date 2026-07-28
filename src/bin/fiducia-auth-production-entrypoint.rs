@@ -1,4 +1,3 @@
-\
 //! Production container guard for Supabase session verification.
 //!
 //! The wrapper and core verifier compile the same policy module. The
