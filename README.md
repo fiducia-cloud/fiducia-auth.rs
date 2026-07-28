@@ -13,7 +13,7 @@ source of truth for human identity and org membership.
 
 | Plane | Who | Credential | Verified how |
 |-------|-----|-----------|--------------|
-| Dashboard | B2B humans | Supabase session **JWT** | **offline** signature check via Supabase JWKS (cached), with `/auth/v1/user` fallback for shared-secret projects |
+| Dashboard | B2B humans | Supabase session **JWT** | **offline** signature check via cached Supabase JWKS; remote userinfo is an explicit non-production migration mode |
 | Data API | their machines | static **API key** `fdc_live_<id>.<secret>` | edge/LB calls `introspect` **once** and caches it (short TTL) |
 
 ```
@@ -26,9 +26,9 @@ client → Authorization: Bearer fdc_live_… → edge/LB ──► POST /v1/int
 
 ### Why it never calls auth per request
 
-- **Supabase JWTs are signed** → verify the signature locally with the cached
-  JWKS when asymmetric signing keys are enabled. Projects still using
-  shared-secret signing fall back to Supabase's Auth user endpoint.
+- **Supabase JWTs are signed** → verify the signature locally with cached JWKS.
+  Remote userinfo is disabled by default, forbidden in production, and available
+  only through an explicit non-production migration opt-in with a publishable key.
 - **API keys** → the edge/LB caches `introspect` results for a short TTL, so the
   steady state is a local decision. Revocation lag = the TTL.
 - Optional: `POST /v1/token` **exchanges** a key for a short-lived JWT signed by
@@ -161,31 +161,34 @@ traffic with a half-initialized identity.
 
 | Var | Type | Secret? | Meaning | Default |
 |-----|------|:------:|---------|---------|
-| `SUPABASE_PUBLISHABLE_KEY` | string | no | Publishable key for the `/auth/v1/user` fallback (shared-secret projects) | none |
+| `FIDUCIA_DEPLOYMENT_MODE` | enum | no | Verification policy environment: `production`, `staging`, `development`, or `test`; malformed values abort startup | `production` |
+| `SUPABASE_PUBLISHABLE_KEY` | string | no | Publishable key required only for an explicitly enabled non-production `/auth/v1/user` migration path | none |
 | `SUPABASE_PROJECT_REF` / `SUPABASE_PROJECT_ID` | string | no | Project ref used to derive URLs when `SUPABASE_URL` is unset | none; one source is required |
 | `SUPABASE_AUTH_ISSUER` | string | no | Override for `{SUPABASE_URL}/auth/v1` | derived |
 | `SUPABASE_AUTH_JWKS_URL` | string | no | Override for the JWKS endpoint | `{issuer}/.well-known/jwks.json` |
 | `SUPABASE_AUTH_USER_URL` | string | no | Override for the `/auth/v1/user` endpoint | `{issuer}/user` |
 | `SUPABASE_AUTH_AUDIENCE` | string | no | Expected `aud` claim | `authenticated` |
 | `SUPABASE_AUTH_JWKS_TTL_SECS` | integer | no | JWKS cache TTL, in seconds | `600` |
-| `SUPABASE_AUTH_ALLOW_REMOTE_USERINFO` | bool | no | Allow the `/auth/v1/user` fallback for shared-secret projects (**see below**) | `true` |
+| `SUPABASE_AUTH_ALLOW_REMOTE_USERINFO` | bool | no | Explicitly enable non-production `/auth/v1/user` compatibility; production `true` aborts startup | `false` |
 | `SUPABASE_ORGS_TABLE` | string | no | Table synced for org metadata | `organizations` |
 | `SUPABASE_ORGS_ID_COLUMN` | string | no | Id column in that table | `id` |
 
 ### Verification-mode flag
 
-`SUPABASE_AUTH_ALLOW_REMOTE_USERINFO` is the one flag that changes how a session
-is verified, so treat it deliberately:
+`SUPABASE_AUTH_ALLOW_REMOTE_USERINFO` is a bounded compatibility flag. The
+production wrapper and core verifier compile the same policy module, so their
+configuration matrix cannot drift:
 
-- **`true` (default)** — for asymmetric (JWKS-signed) tokens, fiducia-auth still
-  verifies the signature **offline** first; the remote `/auth/v1/user` endpoint is
-  only a fallback. For shared-secret (HS256) projects with no public JWKS, the
-  token is validated by **Supabase itself** over that endpoint. Either way the
-  token is validated — this is fail-safe, not a bypass — but it adds a network
-  dependency on Supabase and requires `SUPABASE_PUBLISHABLE_KEY`.
-- **`false`** — offline JWKS verification only. Set this if every project uses
-  asymmetric signing keys and you want zero auth-time calls to Supabase; tokens
-  that aren't asymmetrically signed are rejected outright.
+- **Production or unset mode:** remote userinfo is off. Explicit `true` aborts
+  startup even when a publishable key exists.
+- **Staging, development, and test:** remote userinfo remains off unless explicitly
+  enabled. Explicit `true` also requires `SUPABASE_PUBLISHABLE_KEY`.
+- Unknown deployment modes and malformed booleans abort startup instead of
+  selecting a permissive default.
+
+Offline JWKS misses expose only bounded metric labels. Requested `kid` values,
+tokens, claims, publishable keys, and response bodies are never metric attributes
+or rejection text.
 
 There is **no** flag that disables authentication, accepts unsigned tokens, or
 grants a synthetic "all orgs" identity. Org access is derived solely from

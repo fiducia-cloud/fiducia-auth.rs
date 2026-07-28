@@ -12,6 +12,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tower-http = { version = "0.5", features = ["trace", "timeout", "limit", "catch-panic", "cors"] }
 tracing = "0.1"
+opentelemetry = "0.27"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # API-key crypto. Lifecycle secrets are domain-separated HMAC outputs derived
@@ -30,9 +31,9 @@ fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.
 # validation result the edge/LB caches), so it speaks the shared type directly.
 fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
 
-# Supabase Auth verification. Supabase exposes asymmetric signing keys via JWKS;
-# if a project still uses shared-secret JWT signing, we fall back to the Auth
-# user endpoint with the publishable key.
+# Supabase Auth verification. Supabase exposes asymmetric signing keys via JWKS.
+# Remote userinfo is a fail-closed, explicitly enabled non-production migration
+# path and is forbidden in production by the shared policy module.
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 

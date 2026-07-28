@@ -1,0 +1,24 @@
+# DEN-251 landing validation diagnostic
+
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo 1.97.1 (c980f4866 2026-06-30)
+
+$ cargo fmt --all
+error: unknown start of token: \
+ --> /home/runner/work/fiducia-auth.rs/fiducia-auth.rs/repo/src/bin/fiducia-auth-production-entrypoint.rs:1:1
+  |
+1 | \
+  | ^
+
+error: unknown start of token: \
+ --> /home/runner/work/fiducia-auth.rs/fiducia-auth.rs/repo/src/supabase_policy.rs:1:1
+  |
+1 | \
+  | ^
+
+Error writing files: failed to resolve mod `supabase_policy`: cannot parse /home/runner/work/fiducia-auth.rs/fiducia-auth.rs/repo/src/supabase_policy.rs
+fmt_status=1
+check_status=125
+fmt_check_status=125
+clippy_status=125
+test_status=125
