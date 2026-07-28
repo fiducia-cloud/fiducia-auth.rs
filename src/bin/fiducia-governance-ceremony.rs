@@ -1,13 +1,13 @@
 //! Disabled-by-default, non-production governance ceremony boundary.
 
+#[path = "../governance_ceremony.rs"]
+mod governance_ceremony;
 #[path = "../model.rs"]
 mod model;
 #[path = "../store.rs"]
 mod store;
 #[path = "../supabase.rs"]
 mod supabase;
-#[path = "../governance_ceremony.rs"]
-mod governance_ceremony;
 
 use std::net::SocketAddr;
 
