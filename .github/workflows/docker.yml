@@ -33,7 +33,7 @@ jobs:
         with:
           context: .
           build-args: |
-            INTERFACES_SHA=2c5c806174e067fbe83ad48b724366323ba390a2
+            INTERFACES_SHA=bd718cd72d72aa330534f3688f8fb1ce90c19d10
           push: true
           pull: true
           provenance: mode=max

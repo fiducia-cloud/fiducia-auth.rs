@@ -34,7 +34,7 @@ jobs:
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-interfaces
-          ref: 2c5c806174e067fbe83ad48b724366323ba390a2
+          ref: bd718cd72d72aa330534f3688f8fb1ce90c19d10
           path: fiducia-interfaces
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
