@@ -12,6 +12,9 @@ mod store;
 #[path = "../supabase.rs"]
 mod supabase;
 #[allow(dead_code)]
+#[path = "../supabase_policy.rs"]
+mod supabase_policy;
+#[allow(dead_code)]
 #[path = "../token.rs"]
 mod token;
 

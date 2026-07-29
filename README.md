@@ -109,7 +109,7 @@ curl localhost:8097/healthz
 
 This crate uses generated Rust contracts from the sibling
 `fiducia-interfaces` repository. CI and the Dockerfile both pin that dependency
-to commit `2c5c806174e067fbe83ad48b724366323ba390a2`; neither follows a moving
+to commit `bd718cd72d72aa330534f3688f8fb1ce90c19d10`; neither follows a moving
 branch. The Docker build checks the commit out detached and verifies that its
 full `HEAD` equals `INTERFACES_SHA`, so a branch, tag, or abbreviated hash fails
 closed. To upgrade the contracts, update the Dockerfile argument and the CI
