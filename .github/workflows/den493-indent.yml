@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: den493-indent-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   normalize:
     if: github.actor != 'github-actions[bot]'
@@ -25,15 +29,6 @@ jobs:
 
           path = Path('src/governance_ceremony/routes.inc.rs')
           text = path.read_text()
-          old = '''        CeremonyError::Webauthn(_) => {
-              error_response(StatusCode::BAD_REQUEST, "webauthn_verification_failed")
-          }
-          CeremonyError::ProtectedState(_) => error_response(
-              StatusCode::SERVICE_UNAVAILABLE,
-              "protected_ceremony_state_unavailable",
-          ),'''
-          # `include!` fragments are not rewritten by `cargo fmt`, so normalize
-          # the exact block explicitly and fail if the expected code moved.
           compact = '''        CeremonyError::Webauthn(_) => {
               error_response(StatusCode::BAD_REQUEST, "webauthn_verification_failed")
           }
@@ -41,26 +36,15 @@ jobs:
               StatusCode::SERVICE_UNAVAILABLE,
               "protected_ceremony_state_unavailable",
           ),'''
-          if old in text:
-              path.write_text(text.replace(old, compact, 1))
-              raise SystemExit(0)
-
           ugly = '''        CeremonyError::Webauthn(_) => {
-              error_response(StatusCode::BAD_REQUEST, "webauthn_verification_failed")
-          }
-          CeremonyError::ProtectedState(_) => error_response(
-              StatusCode::SERVICE_UNAVAILABLE,
-              "protected_ceremony_state_unavailable",
-          ),'''
-          if ugly not in text:
-              # Match the unindented generated block literally.
-              ugly = '''        CeremonyError::Webauthn(_) => {
     error_response(StatusCode::BAD_REQUEST, "webauthn_verification_failed")
 }
 CeremonyError::ProtectedState(_) => error_response(
     StatusCode::SERVICE_UNAVAILABLE,
     "protected_ceremony_state_unavailable",
 ),'''
+          if compact in text:
+              raise SystemExit(0)
           if ugly not in text:
               raise SystemExit('expected WebAuthn error block not found')
           path.write_text(text.replace(ugly, compact, 1))
