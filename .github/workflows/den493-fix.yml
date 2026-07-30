@@ -33,32 +33,29 @@ jobs:
 
           webauthn = Path('src/governance_ceremony/webauthn.rs')
           text = webauthn.read_text()
-          text = text.replace(
-              'let mut builder = WebauthnBuilder::new(rp_id, &origin)?;',
+          old_builder = 'let mut builder = WebauthnBuilder::new(rp_id, &origin)?;'
+          if old_builder not in text:
+              raise SystemExit('expected mutable builder not found')
+          webauthn.write_text(text.replace(
+              old_builder,
               'let builder = WebauthnBuilder::new(rp_id, &origin)?;',
-          )
-          webauthn.write_text(text)
+              1,
+          ))
 
           routes = Path('src/governance_ceremony/routes.inc.rs')
           text = routes.read_text()
-          needle = '''        CeremonyError::InvalidRequest(_) => {
-              error_response(StatusCode::BAD_REQUEST, "invalid_request")
-          }
-          CeremonyError::Store(_) | CeremonyError::CasRetriesExhausted => {'''
-          replacement = '''        CeremonyError::InvalidRequest(_) => {
-              error_response(StatusCode::BAD_REQUEST, "invalid_request")
-          }
-          CeremonyError::Webauthn(_) => {
+          store_arm = '        CeremonyError::Store(_) | CeremonyError::CasRetriesExhausted => {'
+          if store_arm not in text:
+              raise SystemExit('expected store error arm not found')
+          inserted = '''        CeremonyError::Webauthn(_) => {
               error_response(StatusCode::BAD_REQUEST, "webauthn_verification_failed")
           }
           CeremonyError::ProtectedState(_) => error_response(
               StatusCode::SERVICE_UNAVAILABLE,
               "protected_ceremony_state_unavailable",
           ),
-          CeremonyError::Store(_) | CeremonyError::CasRetriesExhausted => {'''
-          if needle not in text:
-              raise SystemExit('expected route error-match block not found')
-          routes.write_text(text.replace(needle, replacement))
+          '''
+          routes.write_text(text.replace(store_arm, inserted + store_arm, 1))
           PY
           cargo fmt --all
       - name: Publish focused fixes
