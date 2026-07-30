@@ -243,7 +243,7 @@ impl GovernanceWebauthn {
     ) -> Result<Self, CeremonyError> {
         let origin = Url::parse(rp_origin)
             .map_err(|_| CeremonyError::InvalidConfig("invalid governance WebAuthn origin"))?;
-        let mut builder = WebauthnBuilder::new(rp_id, &origin)?;
+        let builder = WebauthnBuilder::new(rp_id, &origin)?;
         let webauthn = builder.build()?;
         Ok(Self {
             webauthn: Arc::new(webauthn),

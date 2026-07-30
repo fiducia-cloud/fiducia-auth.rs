@@ -233,6 +233,13 @@ fn ceremony_error_response(error: CeremonyError) -> Response {
         CeremonyError::InvalidRequest(_) => {
             error_response(StatusCode::BAD_REQUEST, "invalid_request")
         }
+        CeremonyError::Webauthn(_) => {
+    error_response(StatusCode::BAD_REQUEST, "webauthn_verification_failed")
+}
+CeremonyError::ProtectedState(_) => error_response(
+    StatusCode::SERVICE_UNAVAILABLE,
+    "protected_ceremony_state_unavailable",
+),
         CeremonyError::Store(_) | CeremonyError::CasRetriesExhausted => {
             error_response(StatusCode::SERVICE_UNAVAILABLE, "ceremony_store_unavailable")
         }
