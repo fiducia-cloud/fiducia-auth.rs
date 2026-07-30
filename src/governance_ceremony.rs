@@ -45,6 +45,7 @@ const MAX_CAS_ATTEMPTS: usize = 8;
 include!("governance_ceremony/config.inc.rs");
 include!("governance_ceremony/model.inc.rs");
 #[allow(dead_code)]
+#[path = "governance_ceremony/webauthn.rs"]
 mod webauthn;
 include!("governance_ceremony/persistence.inc.rs");
 include!("governance_ceremony/routes.inc.rs");
