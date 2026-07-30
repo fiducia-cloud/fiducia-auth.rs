@@ -15,10 +15,9 @@ use chacha20poly1305::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use webauthn_rs::prelude::{
-    AuthenticationResult, CreationChallengeResponse, CredentialID, Passkey,
-    PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
-    RegisterPublicKeyCredential, RequestChallengeResponse, Url, Uuid, Webauthn,
-    WebauthnBuilder,
+    AuthenticationResult, CreationChallengeResponse, CredentialID, Passkey, PasskeyAuthentication,
+    PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
+    RequestChallengeResponse, Url, Uuid, Webauthn, WebauthnBuilder,
 };
 
 use super::{sha256_bytes, CeremonyError};
@@ -124,12 +123,12 @@ impl ProtectedStateCodec {
         value: &T,
     ) -> Result<ProtectedCeremonyState, CeremonyError> {
         context.validate()?;
-        let key = self
-            .keys
-            .get(self.active_key_id.as_ref())
-            .ok_or(CeremonyError::ProtectedState(
-                "active protected-state key is unavailable",
-            ))?;
+        let key =
+            self.keys
+                .get(self.active_key_id.as_ref())
+                .ok_or(CeremonyError::ProtectedState(
+                    "active protected-state key is unavailable",
+                ))?;
         let associated_data = associated_data(context, self.active_key_id.as_ref())?;
         let plaintext = serde_json::to_vec(value)?;
         let mut nonce = [0_u8; XCHACHA_NONCE_BYTES];
@@ -203,9 +202,7 @@ impl ProtectedStateCodec {
                     aad: &associated_data,
                 },
             )
-            .map_err(|_| CeremonyError::ProtectedState(
-                "protected-state authentication failed",
-            ))?;
+            .map_err(|_| CeremonyError::ProtectedState("protected-state authentication failed"))?;
         serde_json::from_slice(&plaintext).map_err(CeremonyError::from)
     }
 }
@@ -412,11 +409,9 @@ mod tests {
         };
         let envelope = codec.seal(&context, &value).expect("seal state");
 
-        let only_new_key = ProtectedStateCodec::new(
-            "key-2",
-            BTreeMap::from([("key-2".to_string(), [2_u8; 32])]),
-        )
-        .expect("valid test keyring");
+        let only_new_key =
+            ProtectedStateCodec::new("key-2", BTreeMap::from([("key-2".to_string(), [2_u8; 32])]))
+                .expect("valid test keyring");
         assert!(only_new_key
             .open::<ExampleState>(&context, &envelope)
             .is_err());
@@ -427,22 +422,13 @@ mod tests {
     }
 
     #[test]
-    fn safe_api_registration_state_is_serialized_only inside_server_envelope() {
-        let adapter = GovernanceWebauthn::new(
-            "fiducia.test",
-            "https://auth.fiducia.test",
-            keys("key-1"),
-        )
-        .expect("valid WebAuthn adapter");
+    fn safe_api_registration_state_is_serialized_only_inside_server_envelope() {
+        let adapter =
+            GovernanceWebauthn::new("fiducia.test", "https://auth.fiducia.test", keys("key-1"))
+                .expect("valid WebAuthn adapter");
         let context = context(ProtectedStateKind::PasskeyRegistration);
         let (_challenge, envelope) = adapter
-            .start_registration(
-                &context,
-                Uuid::new_v4(),
-                "founder-a",
-                "Founder A",
-                None,
-            )
+            .start_registration(&context, Uuid::new_v4(), "founder-a", "Founder A", None)
             .expect("start registration");
         assert_eq!(envelope.state_kind, ProtectedStateKind::PasskeyRegistration);
         assert_eq!(envelope.algorithm, PROTECTED_STATE_ALGORITHM);
