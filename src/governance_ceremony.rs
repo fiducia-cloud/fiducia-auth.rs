@@ -1,9 +1,9 @@
 //! Durable, proposal-bound governance ceremony lifecycle for DEN-475.
 //!
-//! This module deliberately does **not** implement WebAuthn cryptography. A future
-//! reviewed `webauthn-rs` adapter must produce the verified assertion receipt sent
-//! to the internal completion route. This boundary stores no raw challenge or
-//! authenticator response and does not append a governance approval by itself.
+//! This module delegates WebAuthn cryptography to the reviewed `webauthn-rs`
+//! safe API. Registration and authentication state is persisted only inside an
+//! authenticated encrypted server-side envelope; browser state is never trusted
+//! as a substitute for the durable ceremony record or final governance policy.
 
 use std::{
     collections::BTreeSet,
@@ -44,6 +44,9 @@ const MAX_CAS_ATTEMPTS: usize = 8;
 
 include!("governance_ceremony/config.inc.rs");
 include!("governance_ceremony/model.inc.rs");
+#[allow(dead_code)]
+#[path = "governance_ceremony/webauthn.rs"]
+mod webauthn;
 include!("governance_ceremony/persistence.inc.rs");
 include!("governance_ceremony/routes.inc.rs");
 include!("governance_ceremony/tests.inc.rs");

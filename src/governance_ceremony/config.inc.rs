@@ -185,6 +185,8 @@ pub enum CeremonyError {
     InvalidConfig(&'static str),
     #[error("invalid request: {0}")]
     InvalidRequest(&'static str),
+    #[error("protected ceremony state invalid: {0}")]
+    ProtectedState(&'static str),
     #[error("ceremony not found")]
     NotFound,
     #[error("ceremony binding or idempotency conflict")]
@@ -203,9 +205,10 @@ pub enum CeremonyError {
     Unauthorized,
     #[error("durable ceremony CAS retries exhausted")]
     CasRetriesExhausted,
+    #[error("WebAuthn operation failed: {0}")]
+    Webauthn(#[from] webauthn_rs::prelude::WebauthnError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
-

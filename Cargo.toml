@@ -5,6 +5,18 @@ version = "0.1.0"
 edition = "2021"
 description = "Auth server for fiducia.cloud — verifies Supabase dashboard sessions, issues/validates B2B API keys, and mints short-lived JWTs so the hot path never calls auth."
 
+[features]
+default = []
+# The standalone governance ceremony binary is not part of the production auth
+# image. Enabling this feature compiles the reviewed WebAuthn adapter and its
+# authenticated encrypted server-side state envelope.
+governance-webauthn = ["dep:webauthn-rs", "dep:chacha20poly1305"]
+
+[[bin]]
+name = "fiducia-governance-ceremony"
+path = "src/bin/fiducia-governance-ceremony.rs"
+required-features = ["governance-webauthn"]
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
@@ -23,6 +35,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 getrandom = "0.2"
 sha2 = "0.10"
 hmac = "0.12"
+
+# Governance WebAuthn uses the reviewed high-level passkey API. The one enabled
+# danger feature permits serialising opaque registration/authentication state to
+# an authenticated encrypted server-side Fiducia KV envelope. The state is never
+# returned to or trusted from a browser. All other danger features remain off.
+webauthn-rs = { version = "0.5.5", default-features = false, features = ["danger-allow-state-serialisation"], optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }
 
 # Shared OpenTelemetry + tracing setup (one init() for all services).
 fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.2.1" }
