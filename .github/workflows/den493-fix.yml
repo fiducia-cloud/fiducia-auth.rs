@@ -1,12 +1,16 @@
 name: den493-fix
 
 on:
-  push:
+  pull_request:
     branches:
-      - agent/den-493-webauthn-protected-state
+      - main
 
 permissions:
   contents: write
+
+concurrency:
+  group: den493-fix-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   fix:
