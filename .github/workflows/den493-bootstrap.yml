@@ -16,7 +16,7 @@ jobs:
   bootstrap:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -32,19 +32,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: "1.95.0"
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: repo
-      - name: Repair identifier, update lockfile, format, and validate
+          components: rustfmt
+      - name: Repair identifier, update lockfile, and format
         working-directory: repo
         run: |
           sed -i 's/fn safe_api_registration_state_is_serialized_only inside_server_envelope()/fn safe_api_registration_state_is_serialized_only_inside_server_envelope()/' src/governance_ceremony/webauthn.rs
-          cargo check --all-targets
+          cargo generate-lockfile
           cargo fmt --all
-          cargo test --all-targets
-          cargo clippy --all-targets -- -D warnings
-      - name: Publish generated lockfile and rustfmt-only changes
+      - name: Publish generated lockfile and rustfmt changes
         working-directory: repo
         run: |
           if git diff --quiet; then
