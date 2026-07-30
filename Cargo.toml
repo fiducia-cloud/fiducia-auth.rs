@@ -24,6 +24,13 @@ getrandom = "0.2"
 sha2 = "0.10"
 hmac = "0.12"
 
+# Governance WebAuthn uses the reviewed high-level passkey API. The one enabled
+# danger feature permits serialising opaque registration/authentication state to
+# an authenticated encrypted server-side Fiducia KV envelope. The state is never
+# returned to or trusted from a browser. All other danger features remain off.
+webauthn-rs = { version = "0.5.5", default-features = false, features = ["danger-allow-state-serialisation"] }
+chacha20poly1305 = "0.10"
+
 # Shared OpenTelemetry + tracing setup (one init() for all services).
 fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.2.1" }
 
