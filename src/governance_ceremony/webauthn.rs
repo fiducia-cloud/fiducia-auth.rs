@@ -1,10 +1,11 @@
-//! Reviewed WebAuthn safe-API adapter and protected server-side ceremony state.
+//! Reviewed WebAuthn safe-API adapter and protected server-side ceremony bundles.
 //!
 //! `webauthn-rs` deliberately disables serialisation of registration and
 //! authentication state by default because placing that state in a browser cookie
 //! permits replay. Fiducia enables only `danger-allow-state-serialisation` so the
-//! opaque state can be stored inside an authenticated encrypted envelope in the
-//! server-side Fiducia KV namespace. The envelope is never a client authority.
+//! browser options and matching opaque state can be stored together inside one
+//! authenticated encrypted envelope in the server-side Fiducia KV namespace.
+//! The envelope is never a client authority.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -14,6 +15,7 @@ use chacha20poly1305::{
     Key, KeyInit, XChaCha20Poly1305, XNonce,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
 use webauthn_rs::prelude::{
     AuthenticationResult, CreationChallengeResponse, CredentialID, Passkey, PasskeyAuthentication,
     PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
@@ -23,7 +25,7 @@ use webauthn_rs::prelude::{
 use super::{sha256_bytes, CeremonyError};
 
 const PROTECTED_STATE_CONTRACT_VERSION: &str = "1.0";
-const PROTECTED_STATE_OBJECT_KIND: &str = "governance_webauthn_protected_state";
+const PROTECTED_STATE_OBJECT_KIND: &str = "governance_webauthn_protected_bundle";
 const PROTECTED_STATE_ALGORITHM: &str = "xchacha20poly1305";
 const XCHACHA_NONCE_BYTES: usize = 24;
 
@@ -66,6 +68,7 @@ pub struct ProtectedCeremonyState {
     pub object_kind: String,
     pub algorithm: String,
     pub key_id: String,
+    pub keyring_version: u64,
     pub state_kind: ProtectedStateKind,
     pub nonce: String,
     pub ciphertext: String,
@@ -75,33 +78,50 @@ pub struct ProtectedCeremonyState {
 #[derive(Clone)]
 pub struct ProtectedStateCodec {
     active_key_id: Arc<str>,
+    keyring_version: u64,
     keys: Arc<BTreeMap<String, [u8; 32]>>,
 }
 
 impl ProtectedStateCodec {
     pub fn new(
         active_key_id: impl Into<String>,
+        keyring_version: u64,
         keys: BTreeMap<String, [u8; 32]>,
     ) -> Result<Self, CeremonyError> {
         let active_key_id = active_key_id.into();
+        if keyring_version == 0 {
+            return Err(CeremonyError::ProtectedState(
+                "protected-state keyring version must be positive",
+            ));
+        }
         if active_key_id.is_empty() || !keys.contains_key(&active_key_id) {
             return Err(CeremonyError::ProtectedState(
                 "active protected-state key is missing",
             ));
         }
-        if keys.is_empty() || keys.keys().any(|key_id| key_id.is_empty()) {
+        if keys.is_empty()
+            || keys.keys().any(|key_id| {
+                key_id.is_empty()
+                    || key_id.len() > 128
+                    || key_id
+                        .chars()
+                        .any(|character| character.is_whitespace() || character.is_control())
+            })
+        {
             return Err(CeremonyError::ProtectedState(
-                "protected-state key identifiers must be non-empty",
+                "protected-state key identifiers are invalid",
             ));
         }
         Ok(Self {
             active_key_id: Arc::from(active_key_id),
+            keyring_version,
             keys: Arc::new(keys),
         })
     }
 
     pub fn from_base64_keys(
         active_key_id: impl Into<String>,
+        keyring_version: u64,
         encoded_keys: BTreeMap<String, String>,
     ) -> Result<Self, CeremonyError> {
         let mut keys = BTreeMap::new();
@@ -114,7 +134,15 @@ impl ProtectedStateCodec {
                 .map_err(|_| CeremonyError::ProtectedState("state key must be 32 bytes"))?;
             keys.insert(key_id, key);
         }
-        Self::new(active_key_id, keys)
+        Self::new(active_key_id, keyring_version, keys)
+    }
+
+    pub fn active_key_id(&self) -> &str {
+        self.active_key_id.as_ref()
+    }
+
+    pub fn keyring_version(&self) -> u64 {
+        self.keyring_version
     }
 
     pub fn seal<T: Serialize>(
@@ -129,7 +157,11 @@ impl ProtectedStateCodec {
                 .ok_or(CeremonyError::ProtectedState(
                     "active protected-state key is unavailable",
                 ))?;
-        let associated_data = associated_data(context, self.active_key_id.as_ref())?;
+        let associated_data = associated_data(
+            context,
+            self.active_key_id.as_ref(),
+            self.keyring_version,
+        )?;
         let plaintext = serde_json::to_vec(value)?;
         let mut nonce = [0_u8; XCHACHA_NONCE_BYTES];
         getrandom::getrandom(&mut nonce)
@@ -150,6 +182,7 @@ impl ProtectedStateCodec {
             object_kind: PROTECTED_STATE_OBJECT_KIND.to_string(),
             algorithm: PROTECTED_STATE_ALGORITHM.to_string(),
             key_id: self.active_key_id.to_string(),
+            keyring_version: self.keyring_version,
             state_kind: context.state_kind,
             nonce: URL_SAFE_NO_PAD.encode(nonce),
             ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
@@ -166,6 +199,7 @@ impl ProtectedStateCodec {
         if envelope.contract_version != PROTECTED_STATE_CONTRACT_VERSION
             || envelope.object_kind != PROTECTED_STATE_OBJECT_KIND
             || envelope.algorithm != PROTECTED_STATE_ALGORITHM
+            || envelope.keyring_version == 0
             || envelope.state_kind != context.state_kind
         {
             return Err(CeremonyError::ProtectedState(
@@ -178,7 +212,7 @@ impl ProtectedStateCodec {
             .ok_or(CeremonyError::ProtectedState(
                 "protected-state key is unavailable",
             ))?;
-        let associated_data = associated_data(context, &envelope.key_id)?;
+        let associated_data = associated_data(context, &envelope.key_id, envelope.keyring_version)?;
         if envelope.associated_data_hash != sha256_bytes(&associated_data) {
             return Err(CeremonyError::ProtectedState(
                 "protected-state associated data mismatch",
@@ -210,6 +244,7 @@ impl ProtectedStateCodec {
 fn associated_data(
     context: &ProtectedStateContext,
     key_id: &str,
+    keyring_version: u64,
 ) -> Result<Vec<u8>, CeremonyError> {
     #[derive(Serialize)]
     struct AssociatedData<'a> {
@@ -217,6 +252,7 @@ fn associated_data(
         object_kind: &'static str,
         algorithm: &'static str,
         key_id: &'a str,
+        keyring_version: u64,
         context: &'a ProtectedStateContext,
     }
 
@@ -225,8 +261,21 @@ fn associated_data(
         object_kind: PROTECTED_STATE_OBJECT_KIND,
         algorithm: PROTECTED_STATE_ALGORITHM,
         key_id,
+        keyring_version,
         context,
     })?)
+}
+
+#[derive(Serialize, Deserialize)]
+struct RegistrationBundle {
+    client_options: Value,
+    state: PasskeyRegistration,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AuthenticationBundle {
+    client_options: Value,
+    state: PasskeyAuthentication,
 }
 
 #[derive(Clone)]
@@ -266,7 +315,11 @@ impl GovernanceWebauthn {
             user_display_name,
             exclude_credentials,
         )?;
-        let envelope = self.protected_state.seal(context, &state)?;
+        let bundle = RegistrationBundle {
+            client_options: serde_json::to_value(&challenge)?,
+            state,
+        };
+        let envelope = self.protected_state.seal(context, &bundle)?;
         Ok((challenge, envelope))
     }
 
@@ -277,10 +330,10 @@ impl GovernanceWebauthn {
         credential: &RegisterPublicKeyCredential,
     ) -> Result<Passkey, CeremonyError> {
         require_kind(context, ProtectedStateKind::PasskeyRegistration)?;
-        let state: PasskeyRegistration = self.protected_state.open(context, envelope)?;
+        let bundle: RegistrationBundle = self.protected_state.open(context, envelope)?;
         Ok(self
             .webauthn
-            .finish_passkey_registration(credential, &state)?)
+            .finish_passkey_registration(credential, &bundle.state)?)
     }
 
     pub fn start_authentication(
@@ -295,7 +348,11 @@ impl GovernanceWebauthn {
             ));
         }
         let (challenge, state) = self.webauthn.start_passkey_authentication(passkeys)?;
-        let envelope = self.protected_state.seal(context, &state)?;
+        let bundle = AuthenticationBundle {
+            client_options: serde_json::to_value(&challenge)?,
+            state,
+        };
+        let envelope = self.protected_state.seal(context, &bundle)?;
         Ok((challenge, envelope))
     }
 
@@ -306,10 +363,27 @@ impl GovernanceWebauthn {
         credential: &PublicKeyCredential,
     ) -> Result<AuthenticationResult, CeremonyError> {
         require_kind(context, ProtectedStateKind::PasskeyAuthentication)?;
-        let state: PasskeyAuthentication = self.protected_state.open(context, envelope)?;
+        let bundle: AuthenticationBundle = self.protected_state.open(context, envelope)?;
         Ok(self
             .webauthn
-            .finish_passkey_authentication(credential, &state)?)
+            .finish_passkey_authentication(credential, &bundle.state)?)
+    }
+
+    pub fn recover_client_options(
+        &self,
+        context: &ProtectedStateContext,
+        envelope: &ProtectedCeremonyState,
+    ) -> Result<Value, CeremonyError> {
+        match context.state_kind {
+            ProtectedStateKind::PasskeyRegistration => {
+                let bundle: RegistrationBundle = self.protected_state.open(context, envelope)?;
+                Ok(bundle.client_options)
+            }
+            ProtectedStateKind::PasskeyAuthentication => {
+                let bundle: AuthenticationBundle = self.protected_state.open(context, envelope)?;
+                Ok(bundle.client_options)
+            }
+        }
     }
 }
 
@@ -329,9 +403,10 @@ fn require_kind(
 mod tests {
     use super::*;
 
-    fn keys(active: &str) -> ProtectedStateCodec {
+    fn keys(active: &str, version: u64) -> ProtectedStateCodec {
         ProtectedStateCodec::new(
             active,
+            version,
             BTreeMap::from([
                 ("key-1".to_string(), [1_u8; 32]),
                 ("key-2".to_string(), [2_u8; 32]),
@@ -358,7 +433,7 @@ mod tests {
 
     #[test]
     fn protected_state_round_trips_and_detects_binding_mutation() {
-        let codec = keys("key-1");
+        let codec = keys("key-1", 1);
         let original = ExampleState {
             challenge_id: "challenge-1".to_string(),
             generation: 7,
@@ -378,9 +453,9 @@ mod tests {
     }
 
     #[test]
-    fn key_rotation_can_read_old_state_but_new_state_uses_active_key() {
-        let old_codec = keys("key-1");
-        let new_codec = keys("key-2");
+    fn key_rotation_reads_old_state_and_writes_with_the_active_version() {
+        let old_codec = keys("key-1", 1);
+        let new_codec = keys("key-2", 2);
         let context = context(ProtectedStateKind::PasskeyAuthentication);
         let value = ExampleState {
             challenge_id: "challenge-2".to_string(),
@@ -388,6 +463,7 @@ mod tests {
         };
         let old_envelope = old_codec.seal(&context, &value).expect("seal old state");
         assert_eq!(old_envelope.key_id, "key-1");
+        assert_eq!(old_envelope.keyring_version, 1);
         assert_eq!(
             new_codec
                 .open::<ExampleState>(&context, &old_envelope)
@@ -397,11 +473,12 @@ mod tests {
 
         let new_envelope = new_codec.seal(&context, &value).expect("seal new state");
         assert_eq!(new_envelope.key_id, "key-2");
+        assert_eq!(new_envelope.keyring_version, 2);
     }
 
     #[test]
-    fn missing_key_and_ciphertext_mutation_fail_closed() {
-        let codec = keys("key-1");
+    fn missing_key_ciphertext_and_keyring_mutation_fail_closed() {
+        let codec = keys("key-1", 1);
         let context = context(ProtectedStateKind::PasskeyRegistration);
         let value = ExampleState {
             challenge_id: "challenge-3".to_string(),
@@ -409,29 +486,49 @@ mod tests {
         };
         let envelope = codec.seal(&context, &value).expect("seal state");
 
-        let only_new_key =
-            ProtectedStateCodec::new("key-2", BTreeMap::from([("key-2".to_string(), [2_u8; 32])]))
-                .expect("valid test keyring");
+        let only_new_key = ProtectedStateCodec::new(
+            "key-2",
+            2,
+            BTreeMap::from([("key-2".to_string(), [2_u8; 32])]),
+        )
+        .expect("valid test keyring");
         assert!(only_new_key
             .open::<ExampleState>(&context, &envelope)
             .is_err());
 
-        let mut corrupted = envelope;
+        let mut corrupted = envelope.clone();
         corrupted.ciphertext.push('A');
         assert!(codec.open::<ExampleState>(&context, &corrupted).is_err());
+
+        let mut wrong_version = envelope;
+        wrong_version.keyring_version += 1;
+        assert!(codec
+            .open::<ExampleState>(&context, &wrong_version)
+            .is_err());
     }
 
     #[test]
-    fn safe_api_registration_state_is_serialized_only_inside_server_envelope() {
-        let adapter =
-            GovernanceWebauthn::new("fiducia.test", "https://auth.fiducia.test", keys("key-1"))
-                .expect("valid WebAuthn adapter");
+    fn safe_api_registration_options_and_state_share_one_encrypted_bundle() {
+        let adapter = GovernanceWebauthn::new(
+            "fiducia.test",
+            "https://auth.fiducia.test",
+            keys("key-1", 1),
+        )
+        .expect("valid WebAuthn adapter");
         let context = context(ProtectedStateKind::PasskeyRegistration);
-        let (_challenge, envelope) = adapter
+        let (challenge, envelope) = adapter
             .start_registration(&context, Uuid::new_v4(), "founder-a", "Founder A", None)
             .expect("start registration");
+        let recovered = adapter
+            .recover_client_options(&context, &envelope)
+            .expect("recover original client options");
+        assert_eq!(recovered, serde_json::to_value(challenge).unwrap());
         assert_eq!(envelope.state_kind, ProtectedStateKind::PasskeyRegistration);
         assert_eq!(envelope.algorithm, PROTECTED_STATE_ALGORITHM);
         assert!(!envelope.ciphertext.is_empty());
+
+        let persisted = serde_json::to_string(&envelope).unwrap();
+        assert!(!persisted.contains("publicKey"));
+        assert!(!persisted.contains("founder-a"));
     }
 }
