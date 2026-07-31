@@ -157,11 +157,8 @@ impl ProtectedStateCodec {
                 .ok_or(CeremonyError::ProtectedState(
                     "active protected-state key is unavailable",
                 ))?;
-        let associated_data = associated_data(
-            context,
-            self.active_key_id.as_ref(),
-            self.keyring_version,
-        )?;
+        let associated_data =
+            associated_data(context, self.active_key_id.as_ref(), self.keyring_version)?;
         let plaintext = serde_json::to_vec(value)?;
         let mut nonce = [0_u8; XCHACHA_NONCE_BYTES];
         getrandom::getrandom(&mut nonce)
