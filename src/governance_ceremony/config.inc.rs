@@ -1,4 +1,4 @@
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GovernanceConfig {
     pub enabled: bool,
     pub rp_id: Option<String>,
@@ -7,6 +7,34 @@ pub struct GovernanceConfig {
     pub ttl_ms: u64,
     ceremony_secret: Option<Vec<u8>>,
     verifier_secret: Option<String>,
+    protected_state_codec: Option<ProtectedStateCodec>,
+}
+
+impl std::fmt::Debug for GovernanceConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GovernanceConfig")
+            .field("enabled", &self.enabled)
+            .field("rp_id", &self.rp_id)
+            .field("origin", &self.origin)
+            .field("allowed_tenants", &self.allowed_tenants)
+            .field("ttl_ms", &self.ttl_ms)
+            .field(
+                "protected_state_active_key_id",
+                &self
+                    .protected_state_codec
+                    .as_ref()
+                    .map(ProtectedStateCodec::active_key_id),
+            )
+            .field(
+                "protected_state_keyring_version",
+                &self
+                    .protected_state_codec
+                    .as_ref()
+                    .map(ProtectedStateCodec::keyring_version),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl GovernanceConfig {
@@ -31,6 +59,7 @@ impl GovernanceConfig {
                 ttl_ms: ttl_secs * 1000,
                 ceremony_secret: None,
                 verifier_secret: None,
+                protected_state_codec: None,
             });
         }
 
@@ -47,6 +76,11 @@ impl GovernanceConfig {
             "FIDUCIA_GOVERNANCE_VERIFIER_SECRET",
             required_env("FIDUCIA_GOVERNANCE_VERIFIER_SECRET")?,
         )?;
+        let protected_state_codec = parse_protected_state_codec(
+            &required_env("FIDUCIA_GOVERNANCE_STATE_ACTIVE_KEY_ID")?,
+            &required_env("FIDUCIA_GOVERNANCE_STATE_KEYRING_VERSION")?,
+            &required_env("FIDUCIA_GOVERNANCE_STATE_KEYS_JSON")?,
+        )?;
 
         Ok(Self {
             enabled,
@@ -56,6 +90,7 @@ impl GovernanceConfig {
             ttl_ms: ttl_secs * 1000,
             ceremony_secret: Some(ceremony_secret),
             verifier_secret: Some(verifier_secret),
+            protected_state_codec: Some(protected_state_codec),
         })
     }
 
@@ -77,6 +112,12 @@ impl GovernanceConfig {
 
     fn origin(&self) -> Result<&str, CeremonyError> {
         self.origin.as_deref().ok_or(CeremonyError::Disabled)
+    }
+
+    fn protected_state_codec(&self) -> Result<ProtectedStateCodec, CeremonyError> {
+        self.protected_state_codec
+            .clone()
+            .ok_or(CeremonyError::Disabled)
     }
 }
 
@@ -105,6 +146,61 @@ fn parse_ttl_secs(value: Option<&str>) -> Result<u64, CeremonyError> {
         ));
     }
     Ok(ttl)
+}
+
+fn parse_keyring_version(value: &str) -> Result<u64, CeremonyError> {
+    let version: u64 = value.trim().parse().map_err(|_| {
+        CeremonyError::InvalidConfig(
+            "FIDUCIA_GOVERNANCE_STATE_KEYRING_VERSION must be a positive integer",
+        )
+    })?;
+    if version == 0 {
+        return Err(CeremonyError::InvalidConfig(
+            "FIDUCIA_GOVERNANCE_STATE_KEYRING_VERSION must be a positive integer",
+        ));
+    }
+    Ok(version)
+}
+
+fn parse_protected_state_codec(
+    active_key_id: &str,
+    keyring_version: &str,
+    keys_json: &str,
+) -> Result<ProtectedStateCodec, CeremonyError> {
+    validate_config_identifier(active_key_id, "FIDUCIA_GOVERNANCE_STATE_ACTIVE_KEY_ID")?;
+    let version = parse_keyring_version(keyring_version)?;
+    let encoded_keys: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(keys_json).map_err(|_| {
+            CeremonyError::InvalidConfig(
+                "FIDUCIA_GOVERNANCE_STATE_KEYS_JSON must be a JSON object of key IDs to base64url keys",
+            )
+        })?;
+    if encoded_keys.is_empty() {
+        return Err(CeremonyError::InvalidConfig(
+            "FIDUCIA_GOVERNANCE_STATE_KEYS_JSON must contain at least one key",
+        ));
+    }
+    for key_id in encoded_keys.keys() {
+        validate_config_identifier(key_id, "protected-state key ID")?;
+    }
+    ProtectedStateCodec::from_base64_keys(active_key_id.to_string(), version, encoded_keys)
+}
+
+fn validate_config_identifier(
+    value: &str,
+    _field: &'static str,
+) -> Result<(), CeremonyError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(CeremonyError::InvalidConfig(
+            "protected-state identifiers must be non-empty and contain no whitespace or control characters",
+        ));
+    }
+    Ok(())
 }
 
 fn required_env(name: &'static str) -> Result<String, CeremonyError> {

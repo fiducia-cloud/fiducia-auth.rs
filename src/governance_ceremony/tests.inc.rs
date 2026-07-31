@@ -2,6 +2,15 @@
 mod tests {
     use super::*;
 
+    fn test_codec() -> ProtectedStateCodec {
+        ProtectedStateCodec::new(
+            "test-key",
+            1,
+            std::collections::BTreeMap::from([("test-key".to_string(), [9_u8; 32])]),
+        )
+        .expect("valid test protected-state codec")
+    }
+
     fn test_config() -> GovernanceConfig {
         GovernanceConfig {
             enabled: true,
@@ -11,6 +20,7 @@ mod tests {
             ttl_ms: 300_000,
             ceremony_secret: Some(vec![7u8; 32]),
             verifier_secret: Some("v".repeat(32)),
+            protected_state_codec: Some(test_codec()),
         }
     }
 
@@ -77,6 +87,36 @@ mod tests {
         assert_eq!(parse_ttl_secs(None).unwrap(), DEFAULT_TTL_SECS);
         assert!(parse_ttl_secs(Some("59")).is_err());
         assert!(parse_ttl_secs(Some("901")).is_err());
+    }
+
+    #[test]
+    fn protected_state_keyring_requires_one_active_32_byte_key() {
+        let encoded = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let keys = serde_json::json!({ "key-1": encoded }).to_string();
+        let codec = parse_protected_state_codec("key-1", "3", &keys).unwrap();
+        assert_eq!(codec.active_key_id(), "key-1");
+        assert_eq!(codec.keyring_version(), 3);
+
+        assert!(parse_protected_state_codec("missing", "3", &keys).is_err());
+        assert!(parse_protected_state_codec("key-1", "0", &keys).is_err());
+        assert!(parse_protected_state_codec("key-1", "3", "{}").is_err());
+        assert!(parse_protected_state_codec(
+            "key-1",
+            "3",
+            &serde_json::json!({ "key-1": URL_SAFE_NO_PAD.encode([7_u8; 31]) }).to_string(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn governance_config_debug_output_redacts_all_secret_material() {
+        let config = test_config();
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("test-key"));
+        assert!(rendered.contains("keyring_version"));
+        assert!(!rendered.contains(&"v".repeat(32)));
+        assert!(!rendered.contains("[7, 7, 7"));
+        assert!(!rendered.contains("[9, 9, 9"));
     }
 
     #[test]
