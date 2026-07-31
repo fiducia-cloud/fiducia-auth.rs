@@ -38,15 +38,9 @@ fn selector_keys_match_the_canonical_record_contract() {
         token.storage_key().unwrap()
     );
 
-    let subject = RevocationRecord::for_subject(
-        "org_a",
-        "subject_a",
-        "incident",
-        "admin:test",
-        100,
-        800,
-    )
-    .unwrap();
+    let subject =
+        RevocationRecord::for_subject("org_a", "subject_a", "incident", "admin:test", 100, 800)
+            .unwrap();
     assert_eq!(
         RevocationSelector::Subject {
             tenant_id: "org_a".to_string(),
@@ -255,9 +249,7 @@ fn ledger_rejects_hash_chain_tampering() {
     } else {
         "0"
     };
-    ledger.events[0]
-        .event_hash
-        .replace_range(0..1, replacement);
+    ledger.events[0].event_hash.replace_range(0..1, replacement);
     assert!(matches!(
         ledger.validate(),
         Err(RevocationError::InvalidLedger)

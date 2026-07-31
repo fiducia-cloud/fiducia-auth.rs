@@ -29,14 +29,8 @@ pub const MAX_TRANSITIONS_PER_TARGET: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RevocationSelector {
-    TokenId {
-        tenant_id: String,
-        jti: String,
-    },
-    Subject {
-        tenant_id: String,
-        subject: String,
-    },
+    TokenId { tenant_id: String, jti: String },
+    Subject { tenant_id: String, subject: String },
 }
 
 impl RevocationSelector {
@@ -79,7 +73,10 @@ impl RevocationSelector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RevokeRequest {
-    TokenId { claims: Box<Claims>, reason: String },
+    TokenId {
+        claims: Box<Claims>,
+        reason: String,
+    },
     Subject {
         tenant_id: String,
         subject: String,
@@ -96,9 +93,7 @@ impl RevokeRequest {
                 jti: claims.jti.clone(),
             },
             Self::Subject {
-                tenant_id,
-                subject,
-                ..
+                tenant_id, subject, ..
             } => RevocationSelector::Subject {
                 tenant_id: tenant_id.clone(),
                 subject: subject.clone(),
@@ -207,7 +202,9 @@ impl<'a> MutationIdentity<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum RevocationAction {
-    Revoke { record: Box<RevocationRecord> },
+    Revoke {
+        record: Box<RevocationRecord>,
+    },
     Lift {
         actor: String,
         reason: String,
@@ -314,10 +311,7 @@ impl RevocationLedger {
     }
 
     fn generation(&self) -> u64 {
-        self.events
-            .last()
-            .map(|event| event.sequence)
-            .unwrap_or(0)
+        self.events.last().map(|event| event.sequence).unwrap_or(0)
     }
 
     fn current_record(&self) -> Option<&RevocationRecord> {
@@ -589,8 +583,8 @@ impl RevocationStore {
                     None => (None, 0),
                 };
                 if let Some(current) = ledger.as_ref() {
-                    if let Some(snapshot) = current
-                        .replay_snapshot(&idempotency_hash, &request_hash)?
+                    if let Some(snapshot) =
+                        current.replay_snapshot(&idempotency_hash, &request_hash)?
                     {
                         return Ok(snapshot);
                     }
@@ -636,12 +630,9 @@ impl RevocationStore {
                 current.append_revoke(record, idempotency_hash, request_hash)?;
                 current.clone()
             }
-            None => RevocationLedger::new(
-                storage_key.clone(),
-                record,
-                idempotency_hash,
-                request_hash,
-            )?,
+            None => {
+                RevocationLedger::new(storage_key.clone(), record, idempotency_hash, request_hash)?
+            }
         };
         ledgers.insert(storage_key, next.clone());
         Ok(next.snapshot(now))
@@ -666,8 +657,7 @@ impl RevocationStore {
 
         if let Some(kv) = &self.kv {
             for _ in 0..MAX_CAS_RETRIES {
-                let Some((mut ledger, previous_revision)) =
-                    load_ledger(kv, &storage_key).await?
+                let Some((mut ledger, previous_revision)) = load_ledger(kv, &storage_key).await?
                 else {
                     return Err(RevocationError::NotFound);
                 };
@@ -898,14 +888,22 @@ pub enum RevocationError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Contract(#[from] RevocationRecordError),
-    #[error("invalid revocation mutation field: {0}")] InvalidMutation(&'static str),
-    #[error("invalid internal access-token claims")] InvalidClaims,
-    #[error("stored revocation ledger is invalid")] InvalidLedger,
-    #[error("idempotency key was already used for a different request")] IdempotencyConflict,
-    #[error("revocation target was not found")] NotFound,
-    #[error("revocation target is not active")] NotActive,
-    #[error("revocation transition limit reached")] TransitionLimit,
-    #[error("revocation compare-and-set retries exhausted")] CasRetriesExhausted,
+    #[error("invalid revocation mutation field: {0}")]
+    InvalidMutation(&'static str),
+    #[error("invalid internal access-token claims")]
+    InvalidClaims,
+    #[error("stored revocation ledger is invalid")]
+    InvalidLedger,
+    #[error("idempotency key was already used for a different request")]
+    IdempotencyConflict,
+    #[error("revocation target was not found")]
+    NotFound,
+    #[error("revocation target is not active")]
+    NotActive,
+    #[error("revocation transition limit reached")]
+    TransitionLimit,
+    #[error("revocation compare-and-set retries exhausted")]
+    CasRetriesExhausted,
 }
 
 #[cfg(test)]
