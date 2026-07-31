@@ -898,22 +898,14 @@ pub enum RevocationError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Contract(#[from] RevocationRecordError),
-    #[error("invalid revocation mutation field: {0}")]
-    InvalidMutation(&'static str),
-    #[error("invalid internal access-token claims")]
-    InvalidClaims,
-    #[error("stored revocation ledger is invalid")]
-    InvalidLedger,
-    #[error("idempotency key was already used for a different request")]
-    IdempotencyConflict,
-    #[error("revocation target was not found")]
-    NotFound,
-    #[error("revocation target is not active")]
-    NotActive,
-    #[error("revocation transition limit reached")]
-    TransitionLimit,
-    #[error("revocation compare-and-set retries exhausted")]
-    CasRetriesExhausted,
+    #[error("invalid revocation mutation field: {0}")] InvalidMutation(&'static str),
+    #[error("invalid internal access-token claims")] InvalidClaims,
+    #[error("stored revocation ledger is invalid")] InvalidLedger,
+    #[error("idempotency key was already used for a different request")] IdempotencyConflict,
+    #[error("revocation target was not found")] NotFound,
+    #[error("revocation target is not active")] NotActive,
+    #[error("revocation transition limit reached")] TransitionLimit,
+    #[error("revocation compare-and-set retries exhausted")] CasRetriesExhausted,
 }
 
 #[cfg(test)]
