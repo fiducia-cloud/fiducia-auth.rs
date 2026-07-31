@@ -27,8 +27,7 @@ fn token_request(reason: &str) -> RevokeRequest {
 #[test]
 fn selector_keys_match_the_canonical_record_contract() {
     let token_claims = claims("org_a", "subject_a", "token_1");
-    let token =
-        RevocationRecord::for_token(&token_claims, "incident", "admin:test", 100).unwrap();
+    let token = RevocationRecord::for_token(&token_claims, "incident", "admin:test", 100).unwrap();
     assert_eq!(
         RevocationSelector::TokenId {
             tenant_id: "org_a".to_string(),
