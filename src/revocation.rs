@@ -79,10 +79,7 @@ impl RevocationSelector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RevokeRequest {
-    TokenId {
-        claims: Box<Claims>,
-        reason: String,
-    },
+    TokenId { claims: Box<Claims>, reason: String },
     Subject {
         tenant_id: String,
         subject: String,
@@ -871,10 +868,7 @@ fn event_hash(
 }
 
 fn digest_text_parts(parts: &[&str]) -> String {
-    let byte_parts = parts
-        .iter()
-        .map(|part| part.as_bytes())
-        .collect::<Vec<_>>();
+    let byte_parts = parts.iter().map(|part| part.as_bytes()).collect::<Vec<_>>();
     digest_byte_parts(&byte_parts)
 }
 
