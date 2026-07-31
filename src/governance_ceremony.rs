@@ -1,9 +1,9 @@
 //! Durable, proposal-bound governance ceremony lifecycle for DEN-475.
 //!
 //! This module delegates WebAuthn cryptography to the reviewed `webauthn-rs`
-//! safe API. Registration and authentication state is persisted only inside an
-//! authenticated encrypted server-side envelope; browser state is never trusted
-//! as a substitute for the durable ceremony record or final governance policy.
+//! safe API. Browser options and matching opaque server state are retained only
+//! inside an authenticated encrypted server-side envelope; browser state is never
+//! trusted as a substitute for the durable ceremony record or final governance policy.
 
 use std::{
     collections::BTreeSet,
@@ -31,6 +31,10 @@ use crate::{
     supabase,
 };
 
+#[path = "governance_ceremony/webauthn.rs"]
+mod webauthn;
+use webauthn::ProtectedStateCodec;
+
 type HmacSha256 = Hmac<Sha256>;
 
 const CONTRACT_VERSION: &str = "1.0";
@@ -44,9 +48,6 @@ const MAX_CAS_ATTEMPTS: usize = 8;
 
 include!("governance_ceremony/config.inc.rs");
 include!("governance_ceremony/model.inc.rs");
-#[allow(dead_code)]
-#[path = "governance_ceremony/webauthn.rs"]
-mod webauthn;
 include!("governance_ceremony/persistence.inc.rs");
 include!("governance_ceremony/routes.inc.rs");
 include!("governance_ceremony/tests.inc.rs");
