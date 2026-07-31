@@ -29,8 +29,14 @@ pub const MAX_TRANSITIONS_PER_TARGET: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RevocationSelector {
-    TokenId { tenant_id: String, jti: String },
-    Subject { tenant_id: String, subject: String },
+    TokenId {
+        tenant_id: String,
+        jti: String,
+    },
+    Subject {
+        tenant_id: String,
+        subject: String,
+    },
 }
 
 impl RevocationSelector {
@@ -73,7 +79,10 @@ impl RevocationSelector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RevokeRequest {
-    TokenId { claims: Box<Claims>, reason: String },
+    TokenId {
+        claims: Box<Claims>,
+        reason: String,
+    },
     Subject {
         tenant_id: String,
         subject: String,
@@ -308,7 +317,10 @@ impl RevocationLedger {
     }
 
     fn generation(&self) -> u64 {
-        self.events.last().map(|event| event.sequence).unwrap_or(0)
+        self.events
+            .last()
+            .map(|event| event.sequence)
+            .unwrap_or(0)
     }
 
     fn current_record(&self) -> Option<&RevocationRecord> {
@@ -323,10 +335,13 @@ impl RevocationLedger {
     }
 
     fn latest_expiry(&self) -> Option<u64> {
-        self.events.iter().rev().find_map(|event| match &event.action {
-            RevocationAction::Revoke { record } => Some(record.expires_at),
-            RevocationAction::Lift { .. } => None,
-        })
+        self.events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.action {
+                RevocationAction::Revoke { record } => Some(record.expires_at),
+                RevocationAction::Lift { .. } => None,
+            })
     }
 
     fn replay_snapshot(
@@ -577,8 +592,8 @@ impl RevocationStore {
                     None => (None, 0),
                 };
                 if let Some(current) = ledger.as_ref() {
-                    if let Some(snapshot) =
-                        current.replay_snapshot(&idempotency_hash, &request_hash)?
+                    if let Some(snapshot) = current
+                        .replay_snapshot(&idempotency_hash, &request_hash)?
                     {
                         return Ok(snapshot);
                     }
