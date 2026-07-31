@@ -16,8 +16,7 @@ use axum::{
     Json, Router,
 };
 use fiducia_auth::revocation::{
-    CheckRequest, LiftRequest, MutationIdentity, RevocationError, RevocationStore,
-    RevokeRequest,
+    CheckRequest, LiftRequest, MutationIdentity, RevocationError, RevocationStore, RevokeRequest,
 };
 use serde_json::{json, Value};
 use tower_http::{
@@ -46,10 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admin_secret = required_secret("FIDUCIA_REVOCATION_ADMIN_SECRET")?;
     let reader_secret = required_secret("FIDUCIA_REVOCATION_READER_SECRET")?;
     if constant_time_eq(admin_secret.as_bytes(), reader_secret.as_bytes()) {
-        return Err(std::io::Error::other(
-            "revocation admin and reader secrets must be distinct",
-        )
-        .into());
+        return Err(
+            std::io::Error::other("revocation admin and reader secrets must be distinct").into(),
+        );
     }
     let revocations = RevocationStore::from_env().map_err(std::io::Error::other)?;
     let state = Arc::new(AppState {
@@ -224,9 +222,7 @@ fn revocation_error(error: RevocationError) -> Response {
             (StatusCode::CONFLICT, "idempotency_conflict", false)
         }
         RevocationError::NotFound => (StatusCode::NOT_FOUND, "revocation_not_found", false),
-        RevocationError::NotActive => {
-            (StatusCode::CONFLICT, "revocation_not_active", false)
-        }
+        RevocationError::NotActive => (StatusCode::CONFLICT, "revocation_not_active", false),
         RevocationError::TransitionLimit => {
             (StatusCode::CONFLICT, "revocation_transition_limit", false)
         }
