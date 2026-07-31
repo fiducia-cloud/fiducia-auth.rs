@@ -31,6 +31,7 @@ use crate::{
     supabase,
 };
 
+#[allow(dead_code)]
 #[path = "governance_ceremony/webauthn.rs"]
 mod webauthn;
 use webauthn::ProtectedStateCodec;
