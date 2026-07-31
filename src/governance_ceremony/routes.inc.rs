@@ -11,8 +11,17 @@ impl CeremonyAppState {
             return Ok(Self { config, store: None });
         }
         supabase::validate_config().map_err(|_| {
-            CeremonyError::InvalidConfig("Supabase verification must be configured when governance is enabled")
+            CeremonyError::InvalidConfig(
+                "Supabase verification must be configured when governance is enabled",
+            )
         })?;
+        // Build the reviewed adapter at startup so invalid RP/origin or protected
+        // state key-ring configuration fails before the service becomes ready.
+        let _webauthn = webauthn::GovernanceWebauthn::new(
+            config.rp_id()?,
+            config.origin()?,
+            config.protected_state_codec()?,
+        )?;
         let kv = Arc::new(KvClient::from_env()?);
         let store = Arc::new(CeremonyStore::new(kv, config.clone()));
         Ok(Self {
@@ -96,7 +105,11 @@ async fn begin_approval(
     {
         Ok(response) => {
             tracing::info!(
-                outcome = if response.replayed { "replayed" } else { "created" },
+                outcome = if response.replayed {
+                    "replayed"
+                } else {
+                    "created"
+                },
                 ceremony_id = %response.ceremony_id,
                 "governance ceremony begin"
             );
@@ -122,7 +135,13 @@ async fn claim_ceremony(
     match store.claim(&ceremony_id, &body, now_ms()).await {
         Ok(response) => {
             tracing::info!(
-                outcome = if response.taken_over { "taken_over" } else if response.replayed { "replayed" } else { "claimed" },
+                outcome = if response.taken_over {
+                    "taken_over"
+                } else if response.replayed {
+                    "replayed"
+                } else {
+                    "claimed"
+                },
                 ceremony_id = %response.ceremony_id,
                 "governance ceremony claim"
             );
@@ -145,10 +164,17 @@ async fn complete_verified(
         Ok(store) => store,
         Err(error) => return ceremony_error_response(error),
     };
-    match store.complete_verified(&ceremony_id, &body, now_ms()).await {
+    match store
+        .complete_verified(&ceremony_id, &body, now_ms())
+        .await
+    {
         Ok(response) => {
             tracing::info!(
-                outcome = if response.replayed { "replayed" } else { "completed" },
+                outcome = if response.replayed {
+                    "replayed"
+                } else {
+                    "completed"
+                },
                 ceremony_id = %response.ceremony_id,
                 "verified governance WebAuthn assertion recorded"
             );
@@ -234,21 +260,22 @@ fn ceremony_error_response(error: CeremonyError) -> Response {
             error_response(StatusCode::BAD_REQUEST, "invalid_request")
         }
         CeremonyError::Webauthn(_) => {
-    error_response(StatusCode::BAD_REQUEST, "webauthn_verification_failed")
-}
-CeremonyError::ProtectedState(_) => error_response(
-    StatusCode::SERVICE_UNAVAILABLE,
-    "protected_ceremony_state_unavailable",
-),
+            error_response(StatusCode::BAD_REQUEST, "webauthn_verification_failed")
+        }
+        CeremonyError::ProtectedState(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "protected_ceremony_state_unavailable",
+        ),
         CeremonyError::Store(_) | CeremonyError::CasRetriesExhausted => {
             error_response(StatusCode::SERVICE_UNAVAILABLE, "ceremony_store_unavailable")
         }
         CeremonyError::MissingConfig(_)
         | CeremonyError::WeakSecret(_)
         | CeremonyError::InvalidConfig(_)
-        | CeremonyError::Json(_) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "governance_configuration_error")
-        }
+        | CeremonyError::Json(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "governance_configuration_error",
+        ),
     }
 }
 
@@ -344,4 +371,3 @@ fn now_ms() -> u64 {
         .try_into()
         .unwrap_or(u64::MAX)
 }
-
