@@ -3,6 +3,7 @@
 name = "fiducia-auth"
 version = "0.1.0"
 edition = "2021"
+default-run = "fiducia-auth"
 description = "Auth server for fiducia.cloud — verifies Supabase dashboard sessions, issues/validates B2B API keys, and mints short-lived JWTs so the hot path never calls auth."
 
 [features]
@@ -11,6 +12,10 @@ default = []
 # image. Enabling this feature compiles the reviewed WebAuthn adapter and its
 # authenticated encrypted server-side state envelope.
 governance-webauthn = ["dep:webauthn-rs", "dep:chacha20poly1305"]
+
+[[bin]]
+name = "fiducia-revocation-admin"
+path = "src/bin/fiducia-revocation-admin.rs"
 
 [[bin]]
 name = "fiducia-governance-ceremony"
