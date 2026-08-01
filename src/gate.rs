@@ -6,8 +6,7 @@
 //! 2. consult the bounded local revocation cache before tenant/permission
 //!    authorization;
 //! 3. coalesce concurrent refreshes per opaque token key;
-//! 4. use a bounded control-plane timeout and (by construction) separate reader
-//!    credentials;
+//! 4. use a bounded control-plane timeout and separate reader credentials;
 //! 5. allow only *fresh* cached negative decisions;
 //! 6. deny stale/missing negative state until an authoritative refresh succeeds.
 //!
@@ -21,6 +20,12 @@
 //! evidence. A clock regression, a refresh timeout, or a refresh error all yield
 //! [`Authorization::Unavailable`], which callers MUST treat as deny.
 //!
+//! # Cache identity
+//! Cache and single-flight maps are keyed by a SHA-256 digest of length-delimited
+//! issuer, audience, tenant, subject, and token-ID fields. Raw identity values are
+//! not retained as map keys, and equal `jti` values in different tenants cannot
+//! share authorization state.
+//!
 //! # Reader credentials
 //! The gate consults whatever [`RevocationAuthority`] it is constructed with. In
 //! production that authority is built with **reader-only** control-plane
@@ -30,6 +35,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::cache::{Decision, Lookup, RevocationCache};
@@ -91,6 +97,34 @@ fn decision_to_auth(decision: Decision) -> Authorization {
     }
 }
 
+/// Produce a fixed-size, opaque, tenant-scoped key for cache and single-flight
+/// state. Length prefixes prevent ambiguous concatenations such as `["ab", "c"]`
+/// and `["a", "bc"]` from sharing the same preimage representation.
+fn revocation_cache_key(claims: &Claims) -> String {
+    let mut digest = Sha256::new();
+    for field in [
+        claims.iss.as_bytes(),
+        claims.aud.as_bytes(),
+        claims.org_id.as_bytes(),
+        claims.sub.as_bytes(),
+        claims.jti.as_bytes(),
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    to_hex(&digest.finalize())
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 /// A verifier-side gate that consults a bounded local [`RevocationCache`] and,
 /// on stale/missing state, refreshes from a [`RevocationAuthority`] with
 /// per-token single-flight coalescing and a bounded timeout.
@@ -124,7 +158,7 @@ impl<A: RevocationAuthority> RevocationGate<A> {
     /// Authorize a token that has already passed offline validation. `now` is
     /// the verifier's current Unix time for this request.
     pub async fn authorize(&self, claims: &Claims, now: u64) -> Authorization {
-        let key = claims.jti.clone();
+        let key = revocation_cache_key(claims);
 
         // Fast path: a fresh cached decision needs no lock and no authority call.
         match self.cache_lookup(&key, now) {
@@ -133,7 +167,7 @@ impl<A: RevocationAuthority> RevocationGate<A> {
             Ok(Lookup::Stale) | Ok(Lookup::Miss) => {}
         }
 
-        // Slow path: serialize refreshes for this token key (single-flight).
+        // Slow path: serialize refreshes for this opaque token identity.
         let lock = self.acquire_key(&key);
         let outcome = {
             let _guard = lock.lock().await;
@@ -251,24 +285,28 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
             }
         }
+
         fn deny() -> Self {
             Self {
                 revoked: true,
                 ..Self::allow()
             }
         }
+
         fn failing() -> Self {
             Self {
                 fail: true,
                 ..Self::allow()
             }
         }
+
         fn slow(delay: Duration) -> Self {
             Self {
                 delay: Some(delay),
                 ..Self::allow()
             }
         }
+
         fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
@@ -301,6 +339,41 @@ mod tests {
                 })
             }
         }
+    }
+
+    #[test]
+    fn cache_identity_is_fixed_size_opaque_and_field_delimited() {
+        let claims = claims_with_jti("tenant-visible-token-id");
+        let key = revocation_cache_key(&claims);
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!key.contains(&claims.org_id));
+        assert!(!key.contains(&claims.sub));
+        assert!(!key.contains(&claims.jti));
+
+        let mut ambiguous_left = claims.clone();
+        ambiguous_left.org_id = "ab".to_string();
+        ambiguous_left.sub = "c".to_string();
+        let mut ambiguous_right = claims;
+        ambiguous_right.org_id = "a".to_string();
+        ambiguous_right.sub = "bc".to_string();
+        assert_ne!(
+            revocation_cache_key(&ambiguous_left),
+            revocation_cache_key(&ambiguous_right)
+        );
+    }
+
+    #[tokio::test]
+    async fn equal_jti_values_in_different_tenants_do_not_share_cache_state() {
+        let gate = RevocationGate::with_defaults(MockAuthority::allow());
+        let first = claims_with_jti("same-jti");
+        let mut second = claims_with_jti("same-jti");
+        second.org_id = "tenant-2".to_string();
+        second.sub = "user-2".to_string();
+
+        assert_eq!(gate.authorize(&first, 100).await, Authorization::Allowed);
+        assert_eq!(gate.authorize(&second, 100).await, Authorization::Allowed);
+        assert_eq!(gate.authority.call_count(), 2);
     }
 
     #[tokio::test]
