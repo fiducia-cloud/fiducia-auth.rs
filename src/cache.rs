@@ -209,10 +209,18 @@ mod tests {
     #[test]
     fn fresh_within_budget_then_stale_past_it() {
         let mut cache = RevocationCache::new(30, 16);
-        cache.apply_authoritative(KEY, Decision::Allow, 100).unwrap();
-        assert_eq!(cache.lookup(KEY, 100).unwrap(), Lookup::Fresh(Decision::Allow));
+        cache
+            .apply_authoritative(KEY, Decision::Allow, 100)
+            .unwrap();
+        assert_eq!(
+            cache.lookup(KEY, 100).unwrap(),
+            Lookup::Fresh(Decision::Allow)
+        );
         // exactly at the budget boundary is still fresh
-        assert_eq!(cache.lookup(KEY, 130).unwrap(), Lookup::Fresh(Decision::Allow));
+        assert_eq!(
+            cache.lookup(KEY, 130).unwrap(),
+            Lookup::Fresh(Decision::Allow)
+        );
         // one second past the budget is stale
         assert_eq!(cache.lookup(KEY, 131).unwrap(), Lookup::Stale);
     }
@@ -221,12 +229,22 @@ mod tests {
     fn regression_after_a_fresh_negative_is_rejected_and_never_allows() {
         let mut cache = RevocationCache::new(30, 16);
         // A fresh negative (Allow == "not revoked") observed at t=100.
-        cache.apply_authoritative(KEY, Decision::Allow, 100).unwrap();
+        cache
+            .apply_authoritative(KEY, Decision::Allow, 100)
+            .unwrap();
         // Clock regresses to t=90: lookup must fail closed, not return Allow.
         let err = cache.lookup(KEY, 90).unwrap_err();
-        assert_eq!(err, ClockRegression { regressed_by_secs: 10 });
+        assert_eq!(
+            err,
+            ClockRegression {
+                regressed_by_secs: 10
+            }
+        );
         // State is preserved: once the clock recovers, the entry is intact.
-        assert_eq!(cache.lookup(KEY, 100).unwrap(), Lookup::Fresh(Decision::Allow));
+        assert_eq!(
+            cache.lookup(KEY, 100).unwrap(),
+            Lookup::Fresh(Decision::Allow)
+        );
     }
 
     #[test]
@@ -234,7 +252,12 @@ mod tests {
         let mut cache = RevocationCache::with_defaults();
         cache.record_refresh_start(200).unwrap();
         let err = cache.record_refresh_start(150).unwrap_err();
-        assert_eq!(err, ClockRegression { regressed_by_secs: 50 });
+        assert_eq!(
+            err,
+            ClockRegression {
+                regressed_by_secs: 50
+            }
+        );
         assert_eq!(cache.high_water(), 200);
     }
 
@@ -246,9 +269,17 @@ mod tests {
         let err = cache
             .apply_authoritative(KEY, Decision::Allow, 80)
             .unwrap_err();
-        assert_eq!(err, ClockRegression { regressed_by_secs: 20 });
+        assert_eq!(
+            err,
+            ClockRegression {
+                regressed_by_secs: 20
+            }
+        );
         // ...and the prior Deny is unchanged.
-        assert_eq!(cache.lookup(KEY, 100).unwrap(), Lookup::Fresh(Decision::Deny));
+        assert_eq!(
+            cache.lookup(KEY, 100).unwrap(),
+            Lookup::Fresh(Decision::Deny)
+        );
     }
 
     #[test]
@@ -259,26 +290,42 @@ mod tests {
         assert!(cache.lookup(KEY, 70).is_err());
         assert_eq!(cache.high_water(), 100);
         // Resume exactly at the high-water mark.
-        assert_eq!(cache.lookup(KEY, 100).unwrap(), Lookup::Fresh(Decision::Deny));
+        assert_eq!(
+            cache.lookup(KEY, 100).unwrap(),
+            Lookup::Fresh(Decision::Deny)
+        );
         // And past it.
         assert!(cache.apply_authoritative(KEY, Decision::Allow, 110).is_ok());
-        assert_eq!(cache.lookup(KEY, 110).unwrap(), Lookup::Fresh(Decision::Allow));
+        assert_eq!(
+            cache.lookup(KEY, 110).unwrap(),
+            Lookup::Fresh(Decision::Allow)
+        );
     }
 
     #[test]
     fn cached_state_is_unchanged_after_a_rejected_operation() {
         let mut cache = RevocationCache::new(30, 16);
         cache.apply_authoritative(KEY, Decision::Deny, 500).unwrap();
-        cache.apply_authoritative(OTHER, Decision::Allow, 500).unwrap();
+        cache
+            .apply_authoritative(OTHER, Decision::Allow, 500)
+            .unwrap();
         let before_len = cache.len();
         // Every regressed operation kind is rejected.
         assert!(cache.lookup(KEY, 400).is_err());
         assert!(cache.record_refresh_start(400).is_err());
-        assert!(cache.apply_authoritative(KEY, Decision::Allow, 400).is_err());
+        assert!(cache
+            .apply_authoritative(KEY, Decision::Allow, 400)
+            .is_err());
         // Nothing changed: same size, same decisions.
         assert_eq!(cache.len(), before_len);
-        assert_eq!(cache.lookup(KEY, 500).unwrap(), Lookup::Fresh(Decision::Deny));
-        assert_eq!(cache.lookup(OTHER, 500).unwrap(), Lookup::Fresh(Decision::Allow));
+        assert_eq!(
+            cache.lookup(KEY, 500).unwrap(),
+            Lookup::Fresh(Decision::Deny)
+        );
+        assert_eq!(
+            cache.lookup(OTHER, 500).unwrap(),
+            Lookup::Fresh(Decision::Allow)
+        );
     }
 
     #[test]
@@ -300,8 +347,14 @@ mod tests {
         cache.apply_authoritative("c", Decision::Deny, 30).unwrap();
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.lookup("a", 30).unwrap(), Lookup::Miss);
-        assert_eq!(cache.lookup("b", 30).unwrap(), Lookup::Fresh(Decision::Deny));
-        assert_eq!(cache.lookup("c", 30).unwrap(), Lookup::Fresh(Decision::Deny));
+        assert_eq!(
+            cache.lookup("b", 30).unwrap(),
+            Lookup::Fresh(Decision::Deny)
+        );
+        assert_eq!(
+            cache.lookup("c", 30).unwrap(),
+            Lookup::Fresh(Decision::Deny)
+        );
     }
 
     #[test]
@@ -311,13 +364,18 @@ mod tests {
         // Re-applying the same key at capacity 1 updates in place.
         cache.apply_authoritative(KEY, Decision::Deny, 20).unwrap();
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.lookup(KEY, 20).unwrap(), Lookup::Fresh(Decision::Deny));
+        assert_eq!(
+            cache.lookup(KEY, 20).unwrap(),
+            Lookup::Fresh(Decision::Deny)
+        );
     }
 
     #[test]
     fn regression_never_returns_allow_even_when_a_fresh_allow_exists() {
         let mut cache = RevocationCache::new(30, 16);
-        cache.apply_authoritative(KEY, Decision::Allow, 100).unwrap();
+        cache
+            .apply_authoritative(KEY, Decision::Allow, 100)
+            .unwrap();
         // The pivotal safety property: a regressed lookup must be an Err, not
         // Ok(Fresh(Allow)), even though a fresh Allow is present.
         match cache.lookup(KEY, 50) {
