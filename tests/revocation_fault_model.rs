@@ -113,8 +113,7 @@ impl TestVerifier {
         self.cache
             .apply_authoritative(&reply.key, reply.decision, now)
             .expect("deterministic test clock must be monotonic");
-        self.latest_generation
-            .insert(reply.key, reply.generation);
+        self.latest_generation.insert(reply.key, reply.generation);
         ApplyOutcome::Applied
     }
 
