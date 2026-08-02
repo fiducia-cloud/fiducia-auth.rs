@@ -39,6 +39,9 @@ struct AppState {
     reader_secret: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputError(&'static str);
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _telemetry = fiducia_telemetry::init(SERVICE);
@@ -89,11 +92,11 @@ async fn revoke(
     }
     let actor = match required_actor(&headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return bad_request(error.0),
     };
     let idempotency_key = match required_idempotency_key(&headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return bad_request(error.0),
     };
     match state
         .revocations
@@ -119,11 +122,11 @@ async fn lift(
     }
     let actor = match required_actor(&headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return bad_request(error.0),
     };
     let idempotency_key = match required_idempotency_key(&headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return bad_request(error.0),
     };
     match state
         .revocations
@@ -162,27 +165,27 @@ fn authorized(headers: &HeaderMap, name: &'static str, expected: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn required_actor(headers: &HeaderMap) -> Result<String, Response> {
+fn required_actor(headers: &HeaderMap) -> Result<String, InputError> {
     let Some(actor) = headers
         .get(ACTOR_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
     else {
-        return Err(bad_request("actor_required"));
+        return Err(InputError("actor_required"));
     };
     if actor.is_empty() || actor.len() > 128 || actor.chars().any(char::is_control) {
-        return Err(bad_request("invalid_actor"));
+        return Err(InputError("invalid_actor"));
     }
     Ok(actor.to_string())
 }
 
-fn required_idempotency_key(headers: &HeaderMap) -> Result<String, Response> {
+fn required_idempotency_key(headers: &HeaderMap) -> Result<String, InputError> {
     let Some(key) = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
     else {
-        return Err(bad_request("idempotency_key_required"));
+        return Err(InputError("idempotency_key_required"));
     };
     if key.is_empty()
         || key.len() > 128
@@ -190,7 +193,7 @@ fn required_idempotency_key(headers: &HeaderMap) -> Result<String, Response> {
             .chars()
             .any(|character| character.is_control() || character.is_whitespace())
     {
-        return Err(bad_request("invalid_idempotency_key"));
+        return Err(InputError("invalid_idempotency_key"));
     }
     Ok(key.to_string())
 }
