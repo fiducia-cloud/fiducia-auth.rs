@@ -5,6 +5,7 @@
 //! needed by the least-privilege revocation administration binary.
 
 pub mod cache;
+pub mod gate;
 pub mod model;
 pub mod revocation;
 pub mod store;
