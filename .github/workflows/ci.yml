@@ -1,4 +1,4 @@
-# CI: build, test, and lint (rustfmt/clippy) on push and pull request.
+# CI: build, test, lint, audit, and prove both immutable OCI targets.
 name: ci
 
 on:
@@ -13,6 +13,10 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  INTERFACES_SHA: bd718cd72d72aa330534f3688f8fb1ce90c19d10
+  RUST_VERSION: 1.97.1
 
 jobs:
   test:
@@ -30,15 +34,24 @@ jobs:
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
         with:
           args: repo/.github/workflows/ci.yml repo/.github/workflows/cli-flags.yml repo/.github/workflows/docker.yml
+      - name: Validate container contract script syntax
+        working-directory: repo
+        run: bash -n scripts/check-revocation-container.sh
+      - name: Pin parity across Rust and interface build inputs
+        working-directory: repo
+        run: |
+          grep -Fq 'channel = "1.97.1"' rust-toolchain.toml
+          grep -Fq 'FROM rust:1.97.1-slim-bookworm@sha256:' Dockerfile
+          grep -Fq 'ARG INTERFACES_SHA=bd718cd72d72aa330534f3688f8fb1ce90c19d10' Dockerfile
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-interfaces
-          ref: bd718cd72d72aa330534f3688f8fb1ce90c19d10
+          ref: ${{ env.INTERFACES_SHA }}
           path: fiducia-interfaces
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: "1.95.0"
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -66,3 +79,34 @@ jobs:
       - name: audit
         working-directory: repo
         run: cargo audit
+
+  container-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build backward-compatible auth target
+        run: >-
+          docker build
+          --pull
+          --target auth
+          --build-arg INTERFACES_SHA=${INTERFACES_SHA}
+          --tag fiducia-auth:ci
+          .
+      - name: Build least-privilege revocation target
+        run: >-
+          docker build
+          --target revocation-admin
+          --build-arg INTERFACES_SHA=${INTERFACES_SHA}
+          --tag fiducia-revocation-admin:ci
+          .
+      - name: Preserve the existing auth image contract
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' fiducia-auth:ci)" = '65532:65532'
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' fiducia-auth:ci)" = '["/usr/local/bin/fiducia-auth-production-entrypoint"]'
+      - name: Prove the revocation image fails closed without credentials
+        run: bash scripts/check-revocation-container.sh fiducia-revocation-admin:ci
