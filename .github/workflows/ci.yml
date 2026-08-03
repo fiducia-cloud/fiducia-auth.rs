@@ -36,7 +36,14 @@ jobs:
           args: repo/.github/workflows/ci.yml repo/.github/workflows/cli-flags.yml repo/.github/workflows/docker.yml
       - name: Validate container contract script syntax
         working-directory: repo
-        run: bash -n scripts/check-revocation-container.sh
+        run: >-
+          bash -n
+          scripts/check-revocation-container.sh
+          scripts/check-docker-publish-contract.sh
+          scripts/render-oci-release-ledger-entry.sh
+      - name: Validate OCI digest publication contract
+        working-directory: repo
+        run: bash scripts/check-docker-publish-contract.sh
       - name: Pin parity across Rust and interface build inputs
         working-directory: repo
         run: |
