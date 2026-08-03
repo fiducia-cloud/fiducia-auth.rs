@@ -135,22 +135,13 @@ fn subject_record_is_tenant_scoped_and_time_bounded() {
     )
     .expect("valid subject record");
 
-    assert!(record.matches(
-        &claims("tenant-a", "subject-a", "first-token"),
-        CREATED_AT
-    ));
+    assert!(record.matches(&claims("tenant-a", "subject-a", "first-token"), CREATED_AT));
     assert!(record.matches(
         &claims("tenant-a", "subject-a", "replacement-token"),
         EXPIRES_AT - 1
     ));
-    assert!(!record.matches(
-        &claims("tenant-b", "subject-a", "first-token"),
-        CREATED_AT
-    ));
-    assert!(!record.matches(
-        &claims("tenant-a", "subject-b", "first-token"),
-        CREATED_AT
-    ));
+    assert!(!record.matches(&claims("tenant-b", "subject-a", "first-token"), CREATED_AT));
+    assert!(!record.matches(&claims("tenant-a", "subject-b", "first-token"), CREATED_AT));
     assert!(!record.matches(
         &claims("tenant-a", "subject-a", "first-token"),
         CREATED_AT - 1
@@ -202,8 +193,14 @@ fn storage_keys_are_opaque_and_domain_separated() {
         assert!(!key.contains("subject-visible"));
         assert!(!key.contains("jti-visible"));
     }
-    assert_ne!(exact_key, subject_key, "target kind must be domain separated");
-    assert_ne!(subject_key, other_tenant_key, "tenant must be domain separated");
+    assert_ne!(
+        exact_key, subject_key,
+        "target kind must be domain separated"
+    );
+    assert_ne!(
+        subject_key, other_tenant_key,
+        "tenant must be domain separated"
+    );
 }
 
 #[test]
