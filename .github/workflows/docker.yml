@@ -1,4 +1,4 @@
-# Build and push the service container image on push to main.
+# Build and push both least-privilege service images on push to main.
 name: docker
 on:
   push:
@@ -18,7 +18,15 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      packages: write # Required only to publish this commit-SHA image to GHCR.
+      packages: write # Required only to publish commit-SHA images to GHCR.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: auth
+            image: fiducia-auth
+          - target: revocation-admin
+            image: fiducia-revocation-admin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -32,6 +40,7 @@ jobs:
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
+          target: ${{ matrix.target }}
           build-args: |
             INTERFACES_SHA=bd718cd72d72aa330534f3688f8fb1ce90c19d10
           push: true
@@ -39,4 +48,4 @@ jobs:
           provenance: mode=max
           sbom: true
           tags: |
-            ghcr.io/fiducia-cloud/fiducia-auth:${{ github.sha }}
+            ghcr.io/fiducia-cloud/${{ matrix.image }}:${{ github.sha }}
