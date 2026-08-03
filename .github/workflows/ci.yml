@@ -94,14 +94,14 @@ jobs:
           docker build
           --pull
           --target auth
-          --build-arg INTERFACES_SHA=${INTERFACES_SHA}
+          --build-arg "INTERFACES_SHA=${INTERFACES_SHA}"
           --tag fiducia-auth:ci
           .
       - name: Build least-privilege revocation target
         run: >-
           docker build
           --target revocation-admin
-          --build-arg INTERFACES_SHA=${INTERFACES_SHA}
+          --build-arg "INTERFACES_SHA=${INTERFACES_SHA}"
           --tag fiducia-revocation-admin:ci
           .
       - name: Preserve the existing auth image contract
