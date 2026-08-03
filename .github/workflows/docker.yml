@@ -66,33 +66,13 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-
-          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            printf 'invalid source SHA from GitHub context\n' >&2
-            exit 1
-          fi
-          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            printf 'build-push-action returned an invalid OCI digest\n' >&2
-            exit 1
-          fi
-          if [[ ! "$TARGET" =~ ^(auth|revocation-admin)$ ]]; then
-            printf 'unexpected Docker target in release matrix\n' >&2
-            exit 1
-          fi
-          if [[ ! "$IMAGE" =~ ^ghcr\.io/fiducia-cloud/fiducia-(auth|revocation-admin)$ ]]; then
-            printf 'unexpected image name in release matrix\n' >&2
-            exit 1
-          fi
-
-          immutable_ref="${IMAGE}@${DIGEST}"
           ledger_entry="${RUNNER_TEMP}/fiducia-oci-release.md"
-          cat >"$ledger_entry" <<EOF
-          <!-- fiducia-oci-release:${SOURCE_SHA}:${TARGET} -->
-          ```json
-          {"repository":"${SOURCE_REPOSITORY}","source_sha":"${SOURCE_SHA}","target":"${TARGET}","image":"${IMAGE}","digest":"${DIGEST}","ref":"${immutable_ref}"}
-          ```
-          EOF
-
+          bash scripts/render-oci-release-ledger-entry.sh \
+            "$SOURCE_REPOSITORY" \
+            "$SOURCE_SHA" \
+            "$TARGET" \
+            "$IMAGE" \
+            "$DIGEST" >"$ledger_entry"
           gh issue comment "$RELEASE_LEDGER_ISSUE" \
             --repo "$SOURCE_REPOSITORY" \
             --body-file "$ledger_entry"
