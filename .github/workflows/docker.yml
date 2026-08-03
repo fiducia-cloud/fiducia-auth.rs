@@ -19,6 +19,7 @@ jobs:
     permissions:
       contents: read
       packages: write # Required only to publish commit-SHA images to GHCR.
+      issues: write # Required only to append validated image digests to issue 38.
     strategy:
       fail-fast: false
       matrix:
@@ -37,7 +38,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           target: ${{ matrix.target }}
@@ -47,5 +49,50 @@ jobs:
           pull: true
           provenance: mode=max
           sbom: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=${{ matrix.image }}
           tags: |
             ghcr.io/fiducia-cloud/${{ matrix.image }}:${{ github.sha }}
+      - name: Validate and record immutable digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_LEDGER_ISSUE: "38"
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          TARGET: ${{ matrix.target }}
+          IMAGE: ghcr.io/fiducia-cloud/${{ matrix.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'invalid source SHA from GitHub context\n' >&2
+            exit 1
+          fi
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf 'build-push-action returned an invalid OCI digest\n' >&2
+            exit 1
+          fi
+          if [[ ! "$TARGET" =~ ^(auth|revocation-admin)$ ]]; then
+            printf 'unexpected Docker target in release matrix\n' >&2
+            exit 1
+          fi
+          if [[ ! "$IMAGE" =~ ^ghcr\.io/fiducia-cloud/fiducia-(auth|revocation-admin)$ ]]; then
+            printf 'unexpected image name in release matrix\n' >&2
+            exit 1
+          fi
+
+          immutable_ref="${IMAGE}@${DIGEST}"
+          ledger_entry="${RUNNER_TEMP}/fiducia-oci-release.md"
+          cat >"$ledger_entry" <<EOF
+          <!-- fiducia-oci-release:${SOURCE_SHA}:${TARGET} -->
+          ```json
+          {"repository":"${SOURCE_REPOSITORY}","source_sha":"${SOURCE_SHA}","target":"${TARGET}","image":"${IMAGE}","digest":"${DIGEST}","ref":"${immutable_ref}"}
+          ```
+          EOF
+
+          gh issue comment "$RELEASE_LEDGER_ISSUE" \
+            --repo "$SOURCE_REPOSITORY" \
+            --body-file "$ledger_entry"
