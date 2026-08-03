@@ -146,10 +146,7 @@ fn subject_record_is_tenant_scoped_and_time_bounded() {
         &claims("tenant-a", "subject-a", "first-token"),
         CREATED_AT - 1
     ));
-    assert!(!record.matches(
-        &claims("tenant-a", "subject-a", "first-token"),
-        EXPIRES_AT
-    ));
+    assert!(!record.matches(&claims("tenant-a", "subject-a", "first-token"), EXPIRES_AT));
 }
 
 #[test]
