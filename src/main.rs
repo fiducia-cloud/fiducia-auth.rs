@@ -71,6 +71,9 @@ const ALLOWED_API_KEY_SCOPES: &[&str] = &[
 const REQUEST_TIMEOUT_SECS: u64 = 15;
 /// Cap request bodies; auth payloads are tiny JSON.
 const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Shared server-to-server credentials must have meaningful entropy and must
+/// never be syntactically ambiguous when an intermediary coalesces headers.
+const MIN_INTROSPECT_SECRET_BYTES: usize = 32;
 
 struct AppState {
     keys: KeyStore,
@@ -89,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     token::validate_config().map_err(std::io::Error::other)?;
     supabase::validate_config().map_err(std::io::Error::other)?;
-    let introspect_secret = required_env("FIDUCIA_INTROSPECT_SECRET")?;
+    let introspect_secret = introspect_secret_from_env()?;
     let rotation_overlap_seconds = rotation_overlap_seconds_from_env()?;
     let keys = KeyStore::from_env().map_err(std::io::Error::other)?;
     let customer_origin = customer_origin_from_env()?;
@@ -158,10 +161,9 @@ async fn jwks() -> Json<Value> {
 
 /// Require a valid Supabase session; 401 otherwise.
 async fn require_user(headers: &HeaderMap) -> Result<UserCtx, Response> {
-    let bearer = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "));
+    let bearer = single_header_str(headers, "authorization")
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty());
     match bearer {
         Some(jwt) => supabase::verify_session(jwt)
             .await
@@ -281,11 +283,7 @@ fn key_store_error(error: StoreError) -> Response {
 
 #[allow(clippy::result_large_err)]
 fn require_idempotency_key(headers: &HeaderMap) -> Result<String, Response> {
-    let Some(value) = headers
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-    else {
+    let Some(value) = single_header_str(headers, "idempotency-key") else {
         return Err(bad_key_request("idempotency_key_required"));
     };
     if value.is_empty()
@@ -299,11 +297,45 @@ fn require_idempotency_key(headers: &HeaderMap) -> Result<String, Response> {
     Ok(value.to_string())
 }
 
-fn required_env(name: &str) -> Result<String, std::io::Error> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| std::io::Error::other(format!("{name} must be configured")))
+fn introspect_secret_from_env() -> Result<String, std::io::Error> {
+    match std::env::var("FIDUCIA_INTROSPECT_SECRET") {
+        Ok(value) => introspect_secret_from(Some(&value)),
+        Err(std::env::VarError::NotPresent) => introspect_secret_from(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::other(
+            "FIDUCIA_INTROSPECT_SECRET must be valid UTF-8",
+        )),
+    }
+}
+
+fn introspect_secret_from(value: Option<&str>) -> Result<String, std::io::Error> {
+    let Some(secret) = value.filter(|value| !value.is_empty()) else {
+        return Err(std::io::Error::other(
+            "FIDUCIA_INTROSPECT_SECRET must be configured",
+        ));
+    };
+    if secret.trim() != secret
+        || secret.len() < MIN_INTROSPECT_SECRET_BYTES
+        || secret.chars().any(|character| {
+            character.is_control() || character.is_whitespace() || character == ','
+        })
+    {
+        return Err(std::io::Error::other(
+            "FIDUCIA_INTROSPECT_SECRET must be at least 32 bytes and contain no whitespace, control characters, or commas",
+        ));
+    }
+    Ok(secret.to_string())
+}
+
+/// Return one canonical header value or fail closed. `HeaderMap::get` alone is
+/// not enough for an identity boundary: it selects one value when duplicates
+/// exist, while a proxy may select another or coalesce them with commas.
+fn single_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?.to_str().ok()?.trim();
+    if value.is_empty() || value.contains(',') || values.next().is_some() {
+        return None;
+    }
+    Some(value)
 }
 
 fn customer_origin_from_env() -> Result<HeaderValue, std::io::Error> {
@@ -588,11 +620,8 @@ async fn exchange_token(State(s): State<Arc<AppState>>, Json(body): Json<TokenBo
 }
 
 fn internal_secret_authorized(headers: &HeaderMap, expected: &str) -> bool {
-    headers
-        .get("x-server-auth")
-        .and_then(|value| value.to_str().ok())
-        .map(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
-        .unwrap_or(false)
+    single_header_str(headers, "x-server-auth")
+        .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
 }
 
 /// Compare two byte strings in time independent of how many leading bytes match,
@@ -613,7 +642,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(test)]
 mod constant_time_tests {
-    use super::constant_time_eq;
+    use super::{
+        constant_time_eq, internal_secret_authorized, introspect_secret_from, single_header_str,
+    };
+    use axum::http::HeaderMap;
 
     #[test]
     fn matches_only_on_exact_equality() {
@@ -621,6 +653,60 @@ mod constant_time_tests {
         assert!(!constant_time_eq(b"s3cret-value", b"s3cret-walue"));
         assert!(!constant_time_eq(b"s3cret", b"s3cret-value")); // length mismatch
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn identity_headers_require_exactly_one_unambiguous_value() {
+        let mut headers = HeaderMap::new();
+        headers.append("authorization", "Bearer valid.jwt.value".parse().unwrap());
+        assert_eq!(
+            single_header_str(&headers, "authorization"),
+            Some("Bearer valid.jwt.value")
+        );
+
+        headers.append(
+            "authorization",
+            "Bearer attacker.jwt.value".parse().unwrap(),
+        );
+        assert_eq!(single_header_str(&headers, "authorization"), None);
+
+        let mut coalesced = HeaderMap::new();
+        coalesced.insert(
+            "authorization",
+            "Bearer valid.jwt.value, Bearer attacker.jwt.value"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(single_header_str(&coalesced, "authorization"), None);
+    }
+
+    #[test]
+    fn introspection_rejects_duplicate_values_in_both_orders() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        let mut correct_first = HeaderMap::new();
+        correct_first.append("x-server-auth", secret.parse().unwrap());
+        correct_first.append("x-server-auth", "attacker".parse().unwrap());
+        assert!(!internal_secret_authorized(&correct_first, secret));
+
+        let mut correct_last = HeaderMap::new();
+        correct_last.append("x-server-auth", "attacker".parse().unwrap());
+        correct_last.append("x-server-auth", secret.parse().unwrap());
+        assert!(!internal_secret_authorized(&correct_last, secret));
+
+        let mut exact = HeaderMap::new();
+        exact.insert("x-server-auth", secret.parse().unwrap());
+        assert!(internal_secret_authorized(&exact, secret));
+    }
+
+    #[test]
+    fn introspection_secret_configuration_is_strong_and_unambiguous() {
+        assert!(introspect_secret_from(None).is_err());
+        assert!(introspect_secret_from(Some("short")).is_err());
+        let padded = format!(" {}", "x".repeat(32));
+        assert!(introspect_secret_from(Some(&padded)).is_err());
+        assert!(introspect_secret_from(Some(&"x".repeat(32))).is_ok());
+        assert!(introspect_secret_from(Some(&("x".repeat(32) + ",suffix"))).is_err());
+        assert!(introspect_secret_from(Some(&("x".repeat(32) + " suffix"))).is_err());
     }
 }
 

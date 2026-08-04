@@ -151,7 +151,7 @@ traffic with a half-initialized identity.
 | `CUSTOMER_API_KEY_HASH_ALGORITHM` | enum | no | Stored key-hash algorithm; any value other than `hmac-sha256` aborts startup | `hmac-sha256` |
 | `CUSTOMER_API_KEY_ACCEPT_LEGACY_SHA256` | bool | no | Temporary migration gate for pre-pepper `sha256:` records; rotate all such keys, then disable | `false` |
 | `FIDUCIA_ROTATION_OVERLAP_SECONDS` | positive integer | no | Maximum positive-introspection cache TTL across edge/LB consumers; reported to clients after rotation. Invalid or zero values abort startup. | `60` |
-| `FIDUCIA_INTROSPECT_SECRET` | string | **yes** | `x-server-auth` shared secret required on the internal `POST /v1/introspect` route | — (required) |
+| `FIDUCIA_INTROSPECT_SECRET` | string | **yes** | `x-server-auth` shared secret required on the internal `POST /v1/introspect` route. Must be at least 32 bytes and contain no whitespace, control character, or comma. | — (required) |
 | `FIDUCIA_CUSTOMER_ORIGIN` | HTTP(S) origin | no | Exact independently hosted customer-app origin allowed by CORS; paths, wildcards, query strings, and `null` are rejected | `https://app.fiducia.cloud` |
 | `SUPABASE_URL` | string (URL) | no | Supabase project URL — the system of record for org membership | derived from project ref |
 | `SUPABASE_SERVICE_ROLE_KEY` | string | **yes** | Supabase service-role key used by the required org sync | — (required) |
@@ -230,6 +230,8 @@ Hardening in place:
 - **Constant-time** comparison of both the API-key secret hash (`keys.rs`) and the
   internal `x-server-auth` secret (`main.rs`), so neither leaks byte-by-byte under
   timing probes.
+- **Single-value identity headers.** Duplicate or comma-coalesced `Authorization`,
+  `Idempotency-Key`, and `x-server-auth` values fail closed before authorization.
 - **Two data-plane endpoints, two threat models.** `POST /v1/introspect` is a
   server-to-server oracle — it reports validity/scopes for *any* key the caller
   submits, including keys the caller does not hold — so it is internal-only and
