@@ -1,0 +1,51 @@
+name: Apply DEN-1391 auth authority patch
+
+on:
+  push:
+    branches:
+      - agent/den-1391-auth-authority-boundaries
+    paths:
+      - .github/workflows/apply-den-1391-auth-authority.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-den-1391-auth-authority
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.repository == 'fiducia-cloud/fiducia-auth.rs' && github.ref_name == 'agent/den-1391-auth-authority-boundaries'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/den-1391-auth-authority-boundaries
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Verify and apply the reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch=.github/patches/den-1391-auth-authority.patch
+          printf '%s  %s\n' \
+            '6cd964dfca80a69a4d2841a78729c9af22a56a7ec1709aa8eccc33296bf2d9cc' \
+            "$patch" | sha256sum --check --strict
+          git config user.name 'ORESoftware Automation'
+          git config user.email 'noreply@github.com'
+          git apply --check "$patch"
+          git am --keep-cr "$patch"
+
+      - name: Remove the one-shot bootstrap files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm \
+            .github/patches/den-1391-auth-authority.patch \
+            .github/workflows/apply-den-1391-auth-authority.yml
+          git commit -m 'chore: remove one-shot patch applicator'
+          git push origin HEAD:refs/heads/agent/den-1391-auth-authority-boundaries
