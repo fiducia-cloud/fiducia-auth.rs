@@ -37,9 +37,7 @@ jobs:
         run: |
           set -euo pipefail
           patch=.github/patches/den-1391-auth-authority.patch
-          printf '%s  %s\n' \
-            '6cd964dfca80a69a4d2841a78729c9af22a56a7ec1709aa8eccc33296bf2d9cc' \
-            "$patch" | sha256sum --check --strict
+          test "$(git hash-object "$patch")" = 'bcc8d75ede77712404809095b82e024076432a1b'
           git config user.name 'ORESoftware Automation'
           git config user.email 'noreply@github.com'
           git apply --check "$patch"
