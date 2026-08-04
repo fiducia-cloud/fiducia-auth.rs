@@ -40,8 +40,9 @@ jobs:
           test "$(git hash-object "$patch")" = 'bcc8d75ede77712404809095b82e024076432a1b'
           git config user.name 'ORESoftware Automation'
           git config user.email 'noreply@github.com'
-          git apply --check "$patch"
-          git am --keep-cr "$patch"
+          git apply --check --recount "$patch"
+          git apply --index --recount "$patch"
+          git commit -m 'security(DEN-1391): reject ambiguous auth headers'
 
       - name: Remove the one-shot bootstrap files
         shell: bash
