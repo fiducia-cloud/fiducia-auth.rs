@@ -32,16 +32,244 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Verify and apply the reviewed patch
+      - name: Apply the reviewed authority-boundary transformation
         shell: bash
         run: |
           set -euo pipefail
           patch=.github/patches/den-1391-auth-authority.patch
           test "$(git hash-object "$patch")" = 'bcc8d75ede77712404809095b82e024076432a1b'
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one source match, found {count}")
+              return text.replace(old, new, 1)
+
+          readme_path = Path("README.md")
+          readme = readme_path.read_text()
+          readme = replace_once(
+              readme,
+              "| `FIDUCIA_INTROSPECT_SECRET` | string | **yes** | `x-server-auth` shared secret required on the internal `POST /v1/introspect` route | — (required) |",
+              "| `FIDUCIA_INTROSPECT_SECRET` | string | **yes** | `x-server-auth` shared secret required on the internal `POST /v1/introspect` route. Must be at least 32 bytes and contain no whitespace, control character, or comma. | — (required) |",
+              "README introspection-secret contract",
+          )
+          readme = replace_once(
+              readme,
+              """- **Constant-time** comparison of both the API-key secret hash (`keys.rs`) and the
+            internal `x-server-auth` secret (`main.rs`), so neither leaks byte-by-byte under
+            timing probes.
+          - **Two data-plane endpoints, two threat models.**""",
+              """- **Constant-time** comparison of both the API-key secret hash (`keys.rs`) and the
+            internal `x-server-auth` secret (`main.rs`), so neither leaks byte-by-byte under
+            timing probes.
+          - **Single-value identity headers.** Duplicate or comma-coalesced `Authorization`,
+            `Idempotency-Key`, and `x-server-auth` values fail closed before authorization.
+          - **Two data-plane endpoints, two threat models.**""",
+              "README single-value header policy",
+          )
+          readme_path.write_text(readme)
+
+          main_path = Path("src/main.rs")
+          main = main_path.read_text()
+          main = replace_once(
+              main,
+              """const REQUEST_TIMEOUT_SECS: u64 = 15;
+          /// Cap request bodies; auth payloads are tiny JSON.
+          const MAX_BODY_BYTES: usize = 64 * 1024;""",
+              """const REQUEST_TIMEOUT_SECS: u64 = 15;
+          /// Cap request bodies; auth payloads are tiny JSON.
+          const MAX_BODY_BYTES: usize = 64 * 1024;
+          /// Shared server-to-server credentials must have meaningful entropy and must
+          /// never be syntactically ambiguous when an intermediary coalesces headers.
+          const MIN_INTROSPECT_SECRET_BYTES: usize = 32;""",
+              "minimum introspection secret",
+          )
+          main = replace_once(
+              main,
+              'let introspect_secret = required_env("FIDUCIA_INTROSPECT_SECRET")?;',
+              'let introspect_secret = introspect_secret_from_env()?;',
+              "startup introspection secret",
+          )
+          main = replace_once(
+              main,
+              """    let bearer = headers
+                  .get("authorization")
+                  .and_then(|v| v.to_str().ok())
+                  .and_then(|s| s.strip_prefix("Bearer "));""",
+              """    let bearer = single_header_str(headers, "authorization")
+                  .and_then(|value| value.strip_prefix("Bearer "))
+                  .filter(|value| !value.is_empty());""",
+              "dashboard Authorization parsing",
+          )
+          main = replace_once(
+              main,
+              """    let Some(value) = headers
+                  .get("idempotency-key")
+                  .and_then(|value| value.to_str().ok())
+                  .map(str::trim)
+              else {""",
+              """    let Some(value) = single_header_str(headers, "idempotency-key") else {""",
+              "idempotency header parsing",
+          )
+          main = replace_once(
+              main,
+              """fn required_env(name: &str) -> Result<String, std::io::Error> {
+              std::env::var(name)
+                  .ok()
+                  .filter(|value| !value.trim().is_empty())
+                  .ok_or_else(|| std::io::Error::other(format!("{name} must be configured")))
+          }
+          """,
+              """fn introspect_secret_from_env() -> Result<String, std::io::Error> {
+              match std::env::var("FIDUCIA_INTROSPECT_SECRET") {
+                  Ok(value) => introspect_secret_from(Some(&value)),
+                  Err(std::env::VarError::NotPresent) => introspect_secret_from(None),
+                  Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::other(
+                      "FIDUCIA_INTROSPECT_SECRET must be valid UTF-8",
+                  )),
+              }
+          }
+
+          fn introspect_secret_from(value: Option<&str>) -> Result<String, std::io::Error> {
+              let Some(secret) = value.filter(|value| !value.is_empty()) else {
+                  return Err(std::io::Error::other(
+                      "FIDUCIA_INTROSPECT_SECRET must be configured",
+                  ));
+              };
+              if secret.trim() != secret
+                  || secret.len() < MIN_INTROSPECT_SECRET_BYTES
+                  || secret.chars().any(|character| {
+                      character.is_control() || character.is_whitespace() || character == ','
+                  })
+              {
+                  return Err(std::io::Error::other(
+                      "FIDUCIA_INTROSPECT_SECRET must be at least 32 bytes and contain no whitespace, control characters, or commas",
+                  ));
+              }
+              Ok(secret.to_string())
+          }
+
+          /// Return one canonical header value or fail closed. `HeaderMap::get` alone is
+          /// not enough for an identity boundary: it selects one value when duplicates
+          /// exist, while a proxy may select another or coalesce them with commas.
+          fn single_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+              let mut values = headers.get_all(name).iter();
+              let value = values.next()?.to_str().ok()?.trim();
+              if value.is_empty() || value.contains(',') || values.next().is_some() {
+                  return None;
+              }
+              Some(value)
+          }
+          """,
+              "introspection policy helpers",
+          )
+          main = replace_once(
+              main,
+              """fn internal_secret_authorized(headers: &HeaderMap, expected: &str) -> bool {
+              headers
+                  .get("x-server-auth")
+                  .and_then(|value| value.to_str().ok())
+                  .map(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
+                  .unwrap_or(false)
+          }""",
+              """fn internal_secret_authorized(headers: &HeaderMap, expected: &str) -> bool {
+              single_header_str(headers, "x-server-auth")
+                  .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
+          }""",
+              "internal server credential parsing",
+          )
+          main = replace_once(
+              main,
+              """mod constant_time_tests {
+              use super::constant_time_eq;""",
+              """mod constant_time_tests {
+              use super::{
+                  constant_time_eq, internal_secret_authorized, introspect_secret_from,
+                  single_header_str,
+              };
+              use axum::http::HeaderMap;""",
+              "constant-time test imports",
+          )
+          main = replace_once(
+              main,
+              """    #[test]
+              fn matches_only_on_exact_equality() {
+                  assert!(constant_time_eq(b"s3cret-value", b"s3cret-value"));
+                  assert!(!constant_time_eq(b"s3cret-value", b"s3cret-walue"));
+                  assert!(!constant_time_eq(b"s3cret", b"s3cret-value")); // length mismatch
+                  assert!(constant_time_eq(b"", b""));
+              }
+          }""",
+              """    #[test]
+              fn matches_only_on_exact_equality() {
+                  assert!(constant_time_eq(b"s3cret-value", b"s3cret-value"));
+                  assert!(!constant_time_eq(b"s3cret-value", b"s3cret-walue"));
+                  assert!(!constant_time_eq(b"s3cret", b"s3cret-value")); // length mismatch
+                  assert!(constant_time_eq(b"", b""));
+              }
+
+              #[test]
+              fn identity_headers_require_exactly_one_unambiguous_value() {
+                  let mut headers = HeaderMap::new();
+                  headers.append("authorization", "Bearer valid.jwt.value".parse().unwrap());
+                  assert_eq!(
+                      single_header_str(&headers, "authorization"),
+                      Some("Bearer valid.jwt.value")
+                  );
+
+                  headers.append("authorization", "Bearer attacker.jwt.value".parse().unwrap());
+                  assert_eq!(single_header_str(&headers, "authorization"), None);
+
+                  let mut coalesced = HeaderMap::new();
+                  coalesced.insert(
+                      "authorization",
+                      "Bearer valid.jwt.value, Bearer attacker.jwt.value"
+                          .parse()
+                          .unwrap(),
+                  );
+                  assert_eq!(single_header_str(&coalesced, "authorization"), None);
+              }
+
+              #[test]
+              fn introspection_rejects_duplicate_values_in_both_orders() {
+                  let secret = "0123456789abcdef0123456789abcdef";
+                  let mut correct_first = HeaderMap::new();
+                  correct_first.append("x-server-auth", secret.parse().unwrap());
+                  correct_first.append("x-server-auth", "attacker".parse().unwrap());
+                  assert!(!internal_secret_authorized(&correct_first, secret));
+
+                  let mut correct_last = HeaderMap::new();
+                  correct_last.append("x-server-auth", "attacker".parse().unwrap());
+                  correct_last.append("x-server-auth", secret.parse().unwrap());
+                  assert!(!internal_secret_authorized(&correct_last, secret));
+
+                  let mut exact = HeaderMap::new();
+                  exact.insert("x-server-auth", secret.parse().unwrap());
+                  assert!(internal_secret_authorized(&exact, secret));
+              }
+
+              #[test]
+              fn introspection_secret_configuration_is_strong_and_unambiguous() {
+                  assert!(introspect_secret_from(None).is_err());
+                  assert!(introspect_secret_from(Some("short")).is_err());
+                  let padded = format!(" {}", "x".repeat(32));
+                  assert!(introspect_secret_from(Some(&padded)).is_err());
+                  assert!(introspect_secret_from(Some(&"x".repeat(32))).is_ok());
+                  assert!(introspect_secret_from(Some(&("x".repeat(32) + ",suffix"))).is_err());
+                  assert!(introspect_secret_from(Some(&("x".repeat(32) + " suffix"))).is_err());
+              }
+          }""",
+              "authority-boundary unit tests",
+          )
+          main_path.write_text(main)
+          PY
+          cargo fmt --all
+          git diff --check
           git config user.name 'ORESoftware Automation'
           git config user.email 'noreply@github.com'
-          git apply --check --recount "$patch"
-          git apply --index --recount "$patch"
+          git add README.md src/main.rs
           git commit -m 'security(DEN-1391): reject ambiguous auth headers'
 
       - name: Remove the one-shot bootstrap files
