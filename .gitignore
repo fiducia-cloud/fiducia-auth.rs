@@ -12,3 +12,7 @@ tmp/
 
 # Local cargo target probe cache
 .cargo-target-check/
+tmp
+temp
+tmp/worktrees
+temp/worktrees
