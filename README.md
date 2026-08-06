@@ -173,6 +173,48 @@ traffic with a half-initialized identity.
 | `SUPABASE_ORGS_TABLE` | string | no | Table synced for org metadata | `organizations` |
 | `SUPABASE_ORGS_ID_COLUMN` | string | no | Id column in that table | `id` |
 
+### Separate Supabase instances per surface
+
+The customer app and the admin app normally run on **different Supabase
+projects**, so the signing key itself is the surface boundary. Set
+`FIDUCIA_SUPABASE_PROJECTS` to a JSON array and each token is routed to the
+project that owns its `iss`, verified there, and bound to that project's
+surfaces:
+
+```json
+[
+  { "name": "fiducia-customer",
+    "surfaces": ["fiducia-customer"],
+    "project_ref": "customerprojectref",
+    "publishable_key_env": "SUPABASE_CUSTOMER_PUBLISHABLE_KEY" },
+  { "name": "fiducia-admin",
+    "surfaces": ["fiducia-admin"],
+    "project_ref": "adminprojectref",
+    "publishable_key_env": "SUPABASE_ADMIN_PUBLISHABLE_KEY" }
+]
+```
+
+| Field | Required | Meaning |
+|---|:--:|---|
+| `name` | yes | Stable slug for logs and metrics; must be unique |
+| `surfaces` | yes | `fiducia-admin` and/or `fiducia-customer` — what this project may authorize |
+| `url` or `project_ref` | yes | Instance URL, or a project ref to derive `https://<ref>.supabase.co` |
+| `issuer` / `jwks_url` / `user_url` | no | Explicit overrides; otherwise derived from the URL |
+| `audience` | no | Expected `aud` claim (default `authenticated`) |
+| `publishable_key_env` | no | **Name of** the env var holding the key — never the key itself |
+
+The project binding intersects with the role-derived surfaces, so it can only
+ever *remove* a surface. An `admin` role smuggled into the customer project's
+`app_metadata` therefore grants nothing: both the key and the role must agree.
+Duplicate issuers or names, an unknown surface, and an empty `surfaces` list all
+abort startup rather than failing ambiguously per request.
+
+Each project keeps its own JWKS cache entry, so one instance's traffic can
+neither evict another's keys nor reset its unknown-`kid` refresh cooldown.
+
+When `FIDUCIA_SUPABASE_PROJECTS` is unset, the single-project configuration
+above is used unchanged and both surfaces resolve against it, exactly as before.
+
 ### Verification-mode flag
 
 `SUPABASE_AUTH_ALLOW_REMOTE_USERINFO` is a bounded compatibility flag. The

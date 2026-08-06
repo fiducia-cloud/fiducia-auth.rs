@@ -67,6 +67,14 @@ pub struct UserCtx {
     /// with the live factor list to reject a stale `aal1` session for an account
     /// that has an enrolled MFA factor.
     pub aal: AssuranceLevel,
+    /// Surfaces the *verifying Supabase project* is permitted to serve.
+    ///
+    /// When the customer and admin apps sit on separate Supabase projects, the
+    /// signing key itself becomes the surface boundary: a token minted by the
+    /// customer project can never authorize the admin surface even if its
+    /// `app_metadata` claims an admin role. `None` means the deployment runs a
+    /// single shared project, so only roles constrain the surface.
+    pub project_surfaces: Option<Vec<&'static str>>,
 }
 
 impl UserCtx {
@@ -94,13 +102,25 @@ impl UserCtx {
             surface_audiences.push(CUSTOMER_SURFACE_AUDIENCE);
         }
 
-        let mut capabilities = Vec::new();
-        if has_admin {
-            capabilities.extend(["admin:read", "admin:operate", "admin:write"]);
-        } else if has_operator {
-            capabilities.extend(["admin:read", "admin:operate"]);
+        // Intersect with what the issuing project may serve. This runs *after*
+        // the role derivation so a project binding can only ever remove a
+        // surface, never add one: both gates must agree.
+        if let Some(allowed) = self.project_surfaces.as_deref() {
+            surface_audiences.retain(|surface| allowed.contains(surface));
         }
-        if has_customer || self.roles.is_empty() {
+
+        let admin_surface = surface_audiences.contains(&ADMIN_SURFACE_AUDIENCE);
+        let customer_surface = surface_audiences.contains(&CUSTOMER_SURFACE_AUDIENCE);
+
+        let mut capabilities = Vec::new();
+        if admin_surface {
+            if has_admin {
+                capabilities.extend(["admin:read", "admin:operate", "admin:write"]);
+            } else if has_operator {
+                capabilities.extend(["admin:read", "admin:operate"]);
+            }
+        }
+        if customer_surface {
             capabilities.push("customer:self-service");
         }
 
@@ -280,6 +300,14 @@ mod tests {
             orgs: vec!["org_1".to_string()],
             roles: roles.iter().map(|role| (*role).to_string()).collect(),
             aal: AssuranceLevel::Aal2,
+            project_surfaces: None,
+        }
+    }
+
+    fn user_on_project(roles: &[&str], surfaces: &[&'static str]) -> UserCtx {
+        UserCtx {
+            project_surfaces: Some(surfaces.to_vec()),
+            ..user(roles)
         }
     }
 
@@ -331,6 +359,70 @@ mod tests {
         assert!(authorization.surface_audiences.is_empty());
         assert!(authorization.roles.is_empty());
         assert!(authorization.capabilities.is_empty());
+    }
+
+    // The headline separation property: when the customer app runs on its own
+    // Supabase project, an admin role smuggled into that project's app_metadata
+    // buys nothing. The signing key, not the claim, decides the surface.
+    #[test]
+    fn customer_project_token_can_never_reach_the_admin_surface() {
+        let authorization =
+            user_on_project(&["admin"], &[CUSTOMER_SURFACE_AUDIENCE]).authorization_context();
+        assert!(authorization.surface_audiences.is_empty());
+        assert!(authorization.capabilities.is_empty());
+
+        // ...and a legitimate customer on that same project still works.
+        let customer =
+            user_on_project(&["customer"], &[CUSTOMER_SURFACE_AUDIENCE]).authorization_context();
+        assert_eq!(customer.surface_audiences, vec![CUSTOMER_SURFACE_AUDIENCE]);
+        assert_eq!(customer.capabilities, vec!["customer:self-service"]);
+    }
+
+    #[test]
+    fn admin_project_token_does_not_receive_the_customer_surface() {
+        let authorization = user_on_project(&["operator", "customer"], &[ADMIN_SURFACE_AUDIENCE])
+            .authorization_context();
+        assert_eq!(
+            authorization.surface_audiences,
+            vec![ADMIN_SURFACE_AUDIENCE]
+        );
+        assert_eq!(
+            authorization.capabilities,
+            vec!["admin:read", "admin:operate"]
+        );
+    }
+
+    // A legacy empty-role session on the admin project must not be silently
+    // upgraded into a customer session there.
+    #[test]
+    fn legacy_empty_roles_are_bounded_by_the_project_binding() {
+        let authorization = user_on_project(&[], &[ADMIN_SURFACE_AUDIENCE]).authorization_context();
+        assert!(authorization.surface_audiences.is_empty());
+        assert!(authorization.capabilities.is_empty());
+    }
+
+    // A project bound to both surfaces behaves exactly like the single-project
+    // deployment, so enabling the registry cannot change existing behaviour.
+    #[test]
+    fn dual_bound_project_matches_unbound_behaviour() {
+        for roles in [
+            vec![],
+            vec!["admin"],
+            vec!["operator"],
+            vec!["customer"],
+            vec!["operator", "customer"],
+            vec!["owner-from-browser"],
+        ] {
+            let unbound = user(&roles).authorization_context();
+            let bound =
+                user_on_project(&roles, &[ADMIN_SURFACE_AUDIENCE, CUSTOMER_SURFACE_AUDIENCE])
+                    .authorization_context();
+            assert_eq!(
+                unbound.surface_audiences, bound.surface_audiences,
+                "{roles:?}"
+            );
+            assert_eq!(unbound.capabilities, bound.capabilities, "{roles:?}");
+        }
     }
 
     #[test]

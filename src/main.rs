@@ -887,6 +887,7 @@ mod interface_contract_tests {
             orgs: orgs.iter().map(|value| (*value).to_string()).collect(),
             roles: Vec::new(),
             aal: AssuranceLevel::Aal2,
+            project_surfaces: None,
         }
     }
 
