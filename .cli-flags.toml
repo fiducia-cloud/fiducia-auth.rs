@@ -59,6 +59,12 @@ aliases = ["supabase-url"]
 type = "string"
 help = "Optional Supabase project URL."
 
+[flags.supabase-projects]
+env = "FIDUCIA_SUPABASE_PROJECTS"
+aliases = ["supabase-projects"]
+type = "string"
+help = "JSON array of Supabase projects bound to surfaces; overrides the single-project SUPABASE_URL."
+
 [flags.supabase-sync-interval-secs]
 env = "SUPABASE_SYNC_INTERVAL_SECS"
 aliases = ["supabase-sync-interval-secs"]
