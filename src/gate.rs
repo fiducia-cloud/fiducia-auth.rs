@@ -285,24 +285,28 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
             }
         }
+
         fn deny() -> Self {
             Self {
                 revoked: true,
                 ..Self::allow()
             }
         }
+
         fn failing() -> Self {
             Self {
                 fail: true,
                 ..Self::allow()
             }
         }
+
         fn slow(delay: Duration) -> Self {
             Self {
                 delay: Some(delay),
                 ..Self::allow()
             }
         }
+
         fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
