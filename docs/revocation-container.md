@@ -72,3 +72,10 @@ bash scripts/check-docker-publish-contract.sh
 The pending deployment must replace its Rust builder image and startup-time Git/cargo script with the published revocation `image@sha256` reference. After that replacement, remove public HTTP(S) bootstrap egress from the revocation authority NetworkPolicy. The load balancer receives only the reader credential; writer access remains restricted to a separately reviewed operator or break-glass path.
 
 This repository change creates the immutable artifact and release-metadata contract. It does not by itself prove registry publication, Argo CD rollout, live authority health, credential rotation, two-verifier propagation, or production fault behavior.
+Both use BuildKit SBOM generation and maximum provenance. GitOps must resolve the revocation image to the registry digest produced by the reviewed commit and pin that digest in the workload manifest. A mutable tag alone is not a deployment identity.
+
+## GitOps follow-up
+
+The pending deployment must replace its Rust builder image and startup-time Git/cargo script with the published revocation image digest. After that replacement, remove public HTTP(S) bootstrap egress from the revocation authority NetworkPolicy. The load balancer receives only the reader credential; writer access remains restricted to a separately reviewed operator or break-glass path.
+
+This repository change creates the immutable artifact contract. It does not by itself prove registry publication, Argo CD rollout, live authority health, credential rotation, two-verifier propagation, or production fault behavior.
