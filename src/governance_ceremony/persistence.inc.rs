@@ -24,6 +24,11 @@ impl CeremonyStore {
         validate_identifier(participant_id, "participant_id")?;
         validate_identifier(tenant_id, "tenant_id")?;
         validate_idempotency_key(idempotency_key)?;
+        validate_canonical_sha256_urn(
+            &request.canonical_proposal_hash,
+            "canonical_proposal_hash",
+        )?;
+        validate_canonical_sha256_urn(&request.policy_hash, "policy_hash")?;
         if request.org_id != tenant_id || request.participant_id != participant_id {
             return Err(CeremonyError::Unauthorized);
         }
@@ -72,6 +77,7 @@ impl CeremonyStore {
             claimed_at_ms: None,
             terminal: None,
         };
+        validate_record_against_config(&record, &self.config, &ceremony_id)?;
         let path = ceremony_path(&ceremony_id);
         match self
             .kv
@@ -126,7 +132,7 @@ impl CeremonyStore {
         request: &ClaimRequest,
         now_ms: u64,
     ) -> Result<ClaimResponse, CeremonyError> {
-        validate_identifier(ceremony_id, "ceremony_id")?;
+        validate_ceremony_id(ceremony_id)?;
         validate_identifier(&request.claim_id, "claim_id")?;
         if request.fencing_token == 0 {
             return Err(CeremonyError::InvalidRequest("fencing_token must be positive"));
@@ -139,6 +145,7 @@ impl CeremonyStore {
                 .await?
                 .ok_or(CeremonyError::NotFound)?;
             let record: CeremonyRecord = serde_json::from_value(versioned.value)?;
+            validate_record_against_config(&record, &self.config, ceremony_id)?;
             record.validate_identity(&request.tenant_id, &request.participant_id)?;
             if record.binding.expires_at_ms <= now_ms {
                 return Err(CeremonyError::Expired);
@@ -158,6 +165,7 @@ impl CeremonyStore {
                 request.fencing_token,
                 now_ms,
             )?;
+            validate_record_against_config(&candidate, &self.config, ceremony_id)?;
             if replayed {
                 return Ok(ClaimResponse {
                     ceremony_id: ceremony_id.to_string(),
@@ -197,12 +205,15 @@ impl CeremonyStore {
         request: &CompleteVerifiedRequest,
         now_ms: u64,
     ) -> Result<CompleteVerifiedResponse, CeremonyError> {
-        validate_identifier(ceremony_id, "ceremony_id")?;
+        validate_ceremony_id(ceremony_id)?;
         validate_identifier(&request.claim_id, "claim_id")?;
         validate_identifier(&request.credential_id, "credential_id")?;
-        validate_sha256_urn(&request.binding_hash, "binding_hash")?;
-        validate_sha256_urn(&request.challenge_hash, "challenge_hash")?;
-        validate_sha256_urn(&request.assertion_receipt_hash, "assertion_receipt_hash")?;
+        validate_canonical_sha256_urn(&request.binding_hash, "binding_hash")?;
+        validate_canonical_sha256_urn(&request.challenge_hash, "challenge_hash")?;
+        validate_canonical_sha256_urn(
+            &request.assertion_receipt_hash,
+            "assertion_receipt_hash",
+        )?;
         if !request.user_verified {
             return Err(CeremonyError::Unauthorized);
         }
@@ -214,6 +225,7 @@ impl CeremonyStore {
                 .await?
                 .ok_or(CeremonyError::NotFound)?;
             let record: CeremonyRecord = serde_json::from_value(versioned.value)?;
+            validate_record_against_config(&record, &self.config, ceremony_id)?;
             record.validate_identity(&request.tenant_id, &request.participant_id)?;
             if let Some(terminal) = record.terminal.as_ref() {
                 if terminal.outcome == CeremonyStatus::Completed
@@ -233,6 +245,7 @@ impl CeremonyStore {
                 return Err(CeremonyError::Expired);
             }
             let candidate = complete_record(record, request, now_ms)?;
+            validate_record_against_config(&candidate, &self.config, ceremony_id)?;
             let terminal = candidate
                 .terminal
                 .clone()
@@ -261,12 +274,15 @@ impl CeremonyStore {
     }
 
     async fn load(&self, ceremony_id: &str) -> Result<CeremonyRecord, CeremonyError> {
+        validate_ceremony_id(ceremony_id)?;
         let value = self
             .kv
             .get(&ceremony_path(ceremony_id))
             .await?
             .ok_or(CeremonyError::NotFound)?;
-        Ok(serde_json::from_value(value)?)
+        let record = serde_json::from_value(value)?;
+        validate_record_against_config(&record, &self.config, ceremony_id)?;
+        Ok(record)
     }
 }
 
@@ -330,25 +346,12 @@ fn complete_record(
     if record.binding.activation_credential_id.as_deref() == Some(request.credential_id.as_str()) {
         return Err(CeremonyError::Unauthorized);
     }
-    let unsigned = json!({
-        "contract_version": CONTRACT_VERSION,
-        "object_kind": "verified_governance_webauthn_assertion",
-        "ceremony_id": &record.ceremony_id,
-        "tenant_id": &record.binding.tenant_id,
-        "participant_id": &record.binding.participant_id,
-        "proposal_id": &record.binding.proposal_id,
-        "canonical_proposal_hash": &record.binding.canonical_proposal_hash,
-        "policy_id": &record.binding.policy_id,
-        "policy_version": record.binding.policy_version,
-        "policy_hash": &record.binding.policy_hash,
-        "continuity_generation": record.binding.continuity_generation,
-        "credential_id": &request.credential_id,
-        "credential_generation": request.credential_generation,
-        "assertion_receipt_hash": &request.assertion_receipt_hash,
-        "user_verified": true,
-        "completed_at_ms": now_ms
-    });
-    let result_hash = sha256_json(&unsigned)?;
+    let result_hash = record.completed_result_hash(
+        &request.credential_id,
+        request.credential_generation,
+        &request.assertion_receipt_hash,
+        now_ms,
+    )?;
     record.status = CeremonyStatus::Completed;
     record.terminal = Some(TerminalVerification {
         outcome: CeremonyStatus::Completed,
@@ -361,4 +364,3 @@ fn complete_record(
     });
     Ok(record)
 }
-

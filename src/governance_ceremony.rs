@@ -49,6 +49,7 @@ const MAX_CAS_ATTEMPTS: usize = 8;
 
 include!("governance_ceremony/config.inc.rs");
 include!("governance_ceremony/model.inc.rs");
+include!("governance_ceremony/integrity.inc.rs");
 include!("governance_ceremony/persistence.inc.rs");
 include!("governance_ceremony/routes.inc.rs");
 include!("governance_ceremony/tests.inc.rs");
