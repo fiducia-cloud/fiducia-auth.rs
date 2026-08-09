@@ -114,9 +114,7 @@ impl fmt::Display for RevocationCacheError {
                 "revocation-cache clock regressed: observed={observed}, high_water={high_water}"
             ),
             Self::UnknownRefresh => formatter.write_str("unknown revocation-cache refresh"),
-            Self::SupersededRefresh => {
-                formatter.write_str("superseded revocation-cache refresh")
-            }
+            Self::SupersededRefresh => formatter.write_str("superseded revocation-cache refresh"),
             Self::GenerationRegression { observed, cached } => write!(
                 formatter,
                 "revocation generation regressed: observed={observed}, cached={cached}"
@@ -281,11 +279,7 @@ mod tests {
     ) {
         let permit = cache.begin_refresh(key, now).expect("begin refresh");
         cache
-            .apply_authoritative(
-                permit,
-                AuthorityDecision { generation, state },
-                now,
-            )
+            .apply_authoritative(permit, AuthorityDecision { generation, state }, now)
             .expect("apply response");
     }
 
