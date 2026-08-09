@@ -7,6 +7,7 @@
 //! observable non-production migration path for shared-secret projects.
 
 use std::{
+    collections::HashMap,
     env, fmt,
     sync::OnceLock,
     time::{Duration, Instant},
@@ -24,7 +25,7 @@ use serde_json::Value;
 use tokio::sync::{OnceCell, RwLock};
 
 use crate::{
-    model::{AssuranceLevel, UserCtx},
+    model::{AssuranceLevel, UserCtx, ADMIN_SURFACE_AUDIENCE, CUSTOMER_SURFACE_AUDIENCE},
     supabase_policy::{
         remote_userinfo_policy_from_env, DeploymentMode, RemoteUserinfoPolicyError,
         PUBLISHABLE_KEY_ENV,
@@ -32,6 +33,9 @@ use crate::{
 };
 
 const DEFAULT_AUDIENCE: &str = "authenticated";
+/// Declarative multi-project registry. When unset, the legacy single-project
+/// `SUPABASE_URL` / `SUPABASE_PROJECT_REF` configuration is used unchanged.
+const PROJECTS_ENV: &str = "FIDUCIA_SUPABASE_PROJECTS";
 const DEFAULT_JWKS_TTL_SECS: u64 = 10 * 60;
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 5;
 /// Minimum age of the cached JWKS before an unknown `kid` may force a refetch.
@@ -44,7 +48,7 @@ const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 5;
 const MIN_FORCED_JWKS_REFRESH_SECS: u64 = 30;
 
 static HTTP_CLIENT: OnceCell<reqwest::Client> = OnceCell::const_new();
-static JWKS_CACHE: OnceCell<RwLock<Option<CachedJwks>>> = OnceCell::const_new();
+static JWKS_CACHE: OnceCell<RwLock<HashMap<String, CachedJwks>>> = OnceCell::const_new();
 static UNKNOWN_KID_EVENTS: OnceLock<Counter<u64>> = OnceLock::new();
 static FORCED_REFRESH_EVENTS: OnceLock<Counter<u64>> = OnceLock::new();
 static REMOTE_USERINFO_EVENTS: OnceLock<Counter<u64>> = OnceLock::new();
@@ -152,9 +156,114 @@ fn record_remote_userinfo(outcome: RemoteUserinfoOutcome) {
 /// Validate the project identity at startup so a missing deployment value can
 /// never silently select a real project or turn into per-request auth failure.
 pub fn validate_config() -> Result<(), String> {
-    SupabaseConfig::from_env()
+    ProjectRegistry::from_env()
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// The configured Supabase projects, routed by issuer.
+///
+/// The customer and admin apps normally sit on *separate* Supabase projects so
+/// the signing key is itself the surface boundary. A token's unverified `iss`
+/// only selects which project verifies it; that project re-pins `iss` during
+/// real verification, so a forged issuer can only ever pick a verifier that
+/// rejects the signature.
+#[derive(Debug, Clone)]
+struct ProjectRegistry {
+    projects: Vec<SupabaseConfig>,
+}
+
+impl ProjectRegistry {
+    fn from_env() -> Result<Self, VerifyError> {
+        let Some(raw) = env_value(PROJECTS_ENV) else {
+            // No registry configured: keep the single-project deployment exactly
+            // as it was, including its env vars and error messages.
+            return Ok(Self {
+                projects: vec![SupabaseConfig::from_env()?],
+            });
+        };
+
+        let specs: Vec<SupabaseProjectSpec> = serde_json::from_str(&raw).map_err(|_| {
+            VerifyError::MissingConfiguration("FIDUCIA_SUPABASE_PROJECTS must be a JSON array")
+        })?;
+        if specs.is_empty() {
+            return Err(VerifyError::MissingConfiguration(
+                "FIDUCIA_SUPABASE_PROJECTS must not be empty",
+            ));
+        }
+
+        let (_, allow_remote_userinfo) =
+            remote_userinfo_policy_from_env().map_err(VerifyError::RemoteUserinfoPolicy)?;
+
+        let mut projects: Vec<SupabaseConfig> = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let project = SupabaseConfig::from_spec(spec, allow_remote_userinfo)?;
+            // Two projects sharing an issuer would make routing ambiguous, and
+            // the resolution would silently decide which surface a token gets.
+            if projects
+                .iter()
+                .any(|existing| existing.issuer == project.issuer)
+            {
+                return Err(VerifyError::MissingConfiguration(
+                    "FIDUCIA_SUPABASE_PROJECTS contains duplicate issuers",
+                ));
+            }
+            if projects
+                .iter()
+                .any(|existing| existing.name == project.name)
+            {
+                return Err(VerifyError::MissingConfiguration(
+                    "FIDUCIA_SUPABASE_PROJECTS contains duplicate project names",
+                ));
+            }
+            if project.allow_remote_userinfo && project.publishable_key.is_none() {
+                return Err(VerifyError::MissingPublishableKey);
+            }
+            projects.push(project);
+        }
+        Ok(Self { projects })
+    }
+
+    /// Select the project that owns this token's issuer. A single unbound
+    /// legacy project keeps answering for every token, issuer or not.
+    fn select(&self, jwt: &str) -> Result<&SupabaseConfig, VerifyError> {
+        if let [only] = self.projects.as_slice() {
+            if only.surfaces.is_empty() {
+                return Ok(only);
+            }
+        }
+        let issuer =
+            unverified_issuer(jwt).ok_or(VerifyError::InvalidToken("missing issuer claim"))?;
+        self.projects
+            .iter()
+            .find(|project| project.issuer == issuer)
+            .ok_or(VerifyError::UnknownIssuer)
+    }
+}
+
+/// Read `iss` WITHOUT verifying the signature — routing only.
+fn unverified_issuer(jwt: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = jwt.split('.').nth(1)?;
+    if payload.len() > 12 * 1024 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("iss")?.as_str().map(str::to_string)
+}
+
+async fn registry() -> Result<&'static ProjectRegistry, VerifyError> {
+    // Built once. `validate_config` already failed startup on a bad registry,
+    // so this only re-reports that same error on the request path.
+    static REGISTRY: OnceCell<Result<ProjectRegistry, String>> = OnceCell::const_new();
+    REGISTRY
+        .get_or_init(|| async { ProjectRegistry::from_env().map_err(|error| error.to_string()) })
+        .await
+        .as_ref()
+        .map_err(|_| VerifyError::MissingConfiguration("supabase project registry is invalid"))
 }
 
 /// Verifies a Supabase Auth access token and returns the caller identity.
@@ -173,11 +282,15 @@ async fn verify_session_inner(jwt: &str) -> Result<UserCtx, VerifyError> {
         return Err(VerifyError::InvalidToken("empty bearer token"));
     }
 
-    let config = SupabaseConfig::from_env()?;
+    let registry = registry().await?;
+    verify_session_with(jwt, registry.select(jwt)?).await
+}
+
+async fn verify_session_with(jwt: &str, config: &SupabaseConfig) -> Result<UserCtx, VerifyError> {
     let header = decode_header(jwt).map_err(VerifyError::Jwt)?;
 
     if is_asymmetric_algorithm(header.alg) && header.kid.is_some() {
-        match verify_with_jwks(jwt, &config, header.alg, header.kid.as_deref().unwrap()).await {
+        match verify_with_jwks(jwt, config, header.alg, header.kid.as_deref().unwrap()).await {
             Ok(user) => return Ok(user),
             Err(err) if !config.allow_remote_userinfo => return Err(err),
             Err(err) => {
@@ -191,7 +304,7 @@ async fn verify_session_inner(jwt: &str) -> Result<UserCtx, VerifyError> {
         record_remote_userinfo(RemoteUserinfoOutcome::Attempted);
     }
 
-    verify_with_user_endpoint(jwt, &config).await
+    verify_with_user_endpoint(jwt, config).await
 }
 
 async fn verify_with_jwks(
@@ -246,7 +359,7 @@ async fn verify_with_jwks(
 
     let token =
         decode::<SupabaseClaims>(jwt, &decoding_key, &validation).map_err(VerifyError::Jwt)?;
-    user_ctx_from_claims(token.claims)
+    user_ctx_from_claims(token.claims, config)
 }
 
 async fn verify_with_user_endpoint(
@@ -301,13 +414,17 @@ async fn verify_with_user_endpoint(
     }
 }
 
-async fn cached_jwks(config: &SupabaseConfig) -> Result<JwkSet, VerifyError> {
-    let cache = JWKS_CACHE.get_or_init(|| async { RwLock::new(None) }).await;
+async fn jwks_cache() -> &'static RwLock<HashMap<String, CachedJwks>> {
+    JWKS_CACHE
+        .get_or_init(|| async { RwLock::new(HashMap::new()) })
+        .await
+}
 
+async fn cached_jwks(config: &SupabaseConfig) -> Result<JwkSet, VerifyError> {
     {
-        let guard = cache.read().await;
-        if let Some(cached) = guard.as_ref() {
-            if cached.url == config.jwks_url && cached.fetched_at.elapsed() < config.jwks_ttl {
+        let guard = jwks_cache().await.read().await;
+        if let Some(cached) = guard.get(&config.jwks_url) {
+            if cached.fetched_at.elapsed() < config.jwks_ttl {
                 return Ok(cached.jwks.clone());
             }
         }
@@ -319,14 +436,14 @@ async fn cached_jwks(config: &SupabaseConfig) -> Result<JwkSet, VerifyError> {
 /// Whether an unknown-`kid` miss may force a refetch: only when there is no
 /// cached set for this URL yet, or the cached set is older than the
 /// anti-amplification floor ([`MIN_FORCED_JWKS_REFRESH_SECS`]).
+///
+/// The cache is keyed per project, so one project's traffic can neither evict
+/// another's keys nor reset another's anti-amplification cooldown.
 async fn forced_refresh_allowed(config: &SupabaseConfig) -> bool {
-    let cache = JWKS_CACHE.get_or_init(|| async { RwLock::new(None) }).await;
-    let guard = cache.read().await;
-    match guard.as_ref() {
-        Some(cached) if cached.url == config.jwks_url => {
-            forced_refresh_cooldown_elapsed(cached.fetched_at.elapsed())
-        }
-        _ => true,
+    let guard = jwks_cache().await.read().await;
+    match guard.get(&config.jwks_url) {
+        Some(cached) => forced_refresh_cooldown_elapsed(cached.fetched_at.elapsed()),
+        None => true,
     }
 }
 
@@ -351,12 +468,13 @@ async fn refresh_jwks(config: &SupabaseConfig) -> Result<JwkSet, VerifyError> {
         return Err(VerifyError::EmptyJwks);
     }
 
-    let cache = JWKS_CACHE.get_or_init(|| async { RwLock::new(None) }).await;
-    *cache.write().await = Some(CachedJwks {
-        url: config.jwks_url.clone(),
-        fetched_at: Instant::now(),
-        jwks: jwks.clone(),
-    });
+    jwks_cache().await.write().await.insert(
+        config.jwks_url.clone(),
+        CachedJwks {
+            fetched_at: Instant::now(),
+            jwks: jwks.clone(),
+        },
+    );
 
     Ok(jwks)
 }
@@ -372,7 +490,10 @@ async fn http_client() -> &'static reqwest::Client {
         .await
 }
 
-fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> {
+fn user_ctx_from_claims(
+    claims: SupabaseClaims,
+    config: &SupabaseConfig,
+) -> Result<UserCtx, VerifyError> {
     if claims.role.as_deref() != Some(DEFAULT_AUDIENCE) {
         return Err(VerifyError::UnexpectedRole(claims.role));
     }
@@ -393,6 +514,7 @@ fn user_ctx_from_claims(claims: SupabaseClaims) -> Result<UserCtx, VerifyError> 
         orgs,
         roles,
         aal,
+        project_surfaces: config.project_surfaces(),
     })
 }
 
@@ -429,6 +551,7 @@ fn user_ctx_from_remote_user(
         orgs,
         roles,
         aal,
+        project_surfaces: config.project_surfaces(),
     })
 }
 
@@ -536,6 +659,11 @@ fn is_asymmetric_algorithm(alg: Algorithm) -> bool {
 
 #[derive(Debug, Clone)]
 struct SupabaseConfig {
+    /// Stable slug used in logs and metrics, e.g. `fiducia-customer`.
+    name: String,
+    /// Surfaces this project may serve. Empty means "unbound" — the legacy
+    /// single-project deployment where only roles constrain the surface.
+    surfaces: Vec<&'static str>,
     audience: String,
     issuer: String,
     jwks_ttl: Duration,
@@ -545,7 +673,115 @@ struct SupabaseConfig {
     allow_remote_userinfo: bool,
 }
 
+/// One entry of `FIDUCIA_SUPABASE_PROJECTS`.
+///
+/// Credentials are referenced by environment-variable *name*; a key value must
+/// never appear in this JSON, which is carried in plain deployment config.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupabaseProjectSpec {
+    name: String,
+    /// Surface audiences this project is allowed to authorize, e.g.
+    /// `["fiducia-customer"]`. Required: an unbound project in a multi-project
+    /// deployment would silently defeat the separation.
+    surfaces: Vec<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    project_ref: Option<String>,
+    #[serde(default)]
+    issuer: Option<String>,
+    #[serde(default)]
+    jwks_url: Option<String>,
+    #[serde(default)]
+    user_url: Option<String>,
+    #[serde(default)]
+    audience: Option<String>,
+    /// Name of the env var holding this project's publishable key.
+    #[serde(default)]
+    publishable_key_env: Option<String>,
+}
+
 impl SupabaseConfig {
+    /// Build one project from its declarative spec, deriving the Supabase URL
+    /// shape from `project_ref` when the explicit URLs are omitted.
+    fn from_spec(
+        spec: SupabaseProjectSpec,
+        allow_remote_userinfo: bool,
+    ) -> Result<Self, VerifyError> {
+        if spec.name.trim().is_empty() {
+            return Err(VerifyError::MissingConfiguration(
+                "FIDUCIA_SUPABASE_PROJECTS entries require a non-empty name",
+            ));
+        }
+        let mut surfaces = Vec::new();
+        for surface in &spec.surfaces {
+            let surface = match surface.trim() {
+                ADMIN_SURFACE_AUDIENCE => ADMIN_SURFACE_AUDIENCE,
+                CUSTOMER_SURFACE_AUDIENCE => CUSTOMER_SURFACE_AUDIENCE,
+                _ => return Err(VerifyError::MissingConfiguration(
+                    "FIDUCIA_SUPABASE_PROJECTS surfaces must be fiducia-admin or fiducia-customer",
+                )),
+            };
+            if !surfaces.contains(&surface) {
+                surfaces.push(surface);
+            }
+        }
+        if surfaces.is_empty() {
+            return Err(VerifyError::MissingConfiguration(
+                "FIDUCIA_SUPABASE_PROJECTS entries require at least one surface",
+            ));
+        }
+
+        let url = match (spec.url.as_deref(), spec.project_ref.as_deref()) {
+            (Some(url), _) => normalize_url(url),
+            (None, Some(project_ref)) => supabase_url_for_project(project_ref),
+            (None, None) => {
+                return Err(VerifyError::MissingConfiguration(
+                    "FIDUCIA_SUPABASE_PROJECTS entries require url or project_ref",
+                ))
+            }
+        };
+        let issuer = spec.issuer.unwrap_or_else(|| format!("{url}/auth/v1"));
+        let jwks_url = spec
+            .jwks_url
+            .unwrap_or_else(|| format!("{issuer}/.well-known/jwks.json"));
+        let user_url = spec.user_url.unwrap_or_else(|| format!("{issuer}/user"));
+        let publishable_key = match spec.publishable_key_env.as_deref() {
+            Some(name) => {
+                let value = env_value(name).ok_or(VerifyError::MissingConfiguration(
+                    "referenced Supabase publishable-key env var is missing or empty",
+                ))?;
+                Some(value)
+            }
+            None => None,
+        };
+
+        Ok(SupabaseConfig {
+            name: spec.name.trim().to_string(),
+            surfaces,
+            audience: spec
+                .audience
+                .unwrap_or_else(|| DEFAULT_AUDIENCE.to_string()),
+            issuer,
+            jwks_ttl: Duration::from_secs(
+                env_value("SUPABASE_AUTH_JWKS_TTL_SECS")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(DEFAULT_JWKS_TTL_SECS),
+            ),
+            jwks_url,
+            publishable_key,
+            user_url,
+            allow_remote_userinfo,
+        })
+    }
+
+    /// Surfaces this project may authorize, or `None` for the unbound legacy
+    /// single-project deployment where only roles constrain the surface.
+    fn project_surfaces(&self) -> Option<Vec<&'static str>> {
+        (!self.surfaces.is_empty()).then(|| self.surfaces.clone())
+    }
+
     fn from_env() -> Result<Self, VerifyError> {
         let url = match env_value("SUPABASE_URL") {
             Some(url) => url,
@@ -577,6 +813,10 @@ impl SupabaseConfig {
         );
 
         Ok(SupabaseConfig {
+            name: env_value("SUPABASE_PROJECT_NAME").unwrap_or_else(|| "default".to_string()),
+            // Legacy single-project deployments stay unbound: both surfaces are
+            // served by one project, exactly as before.
+            surfaces: Vec::new(),
             audience: env_value("SUPABASE_AUTH_AUDIENCE")
                 .unwrap_or_else(|| DEFAULT_AUDIENCE.to_string()),
             issuer,
@@ -597,6 +837,8 @@ impl SupabaseConfig {
         let url = supabase_url_for_project(project_ref);
         let issuer = format!("{url}/auth/v1");
         SupabaseConfig {
+            name: "default".to_string(),
+            surfaces: Vec::new(),
             audience: DEFAULT_AUDIENCE.to_string(),
             issuer: issuer.clone(),
             jwks_ttl: Duration::from_secs(DEFAULT_JWKS_TTL_SECS),
@@ -623,9 +865,9 @@ fn normalize_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
+/// One project's cached key set. Keyed by JWKS URL in [`JWKS_CACHE`].
 #[derive(Clone, Debug)]
 struct CachedJwks {
-    url: String,
     fetched_at: Instant,
     jwks: JwkSet,
 }
@@ -671,6 +913,7 @@ enum VerifyError {
     UnexpectedAudience(Option<String>),
     UnexpectedAssurance(String),
     UnexpectedRole(Option<String>),
+    UnknownIssuer,
     UnsupportedAlgorithm(Algorithm),
 }
 
@@ -700,6 +943,9 @@ impl fmt::Display for VerifyError {
                 write!(f, "unexpected authenticator assurance level {aal:?}")
             }
             VerifyError::UnexpectedRole(role) => write!(f, "unexpected role {role:?}"),
+            // Deliberately does not echo the issuer: it is attacker-controlled
+            // and unverified at the point this is raised.
+            VerifyError::UnknownIssuer => write!(f, "token issuer is not a configured project"),
             VerifyError::UnsupportedAlgorithm(alg) => {
                 write!(f, "unsupported jwt signing algorithm {alg:?}")
             }
@@ -730,6 +976,198 @@ mod tests {
             config.user_url,
             "https://ruxctrzdvugxztbjcpoi.supabase.co/auth/v1/user"
         );
+    }
+
+    // ---- multi-project registry: separate Supabase instances per surface ----
+
+    fn registry_from(specs: serde_json::Value) -> Result<ProjectRegistry, VerifyError> {
+        let specs: Vec<SupabaseProjectSpec> = serde_json::from_value(specs).unwrap();
+        let mut projects = Vec::new();
+        for spec in specs {
+            let project = SupabaseConfig::from_spec(spec, false)?;
+            if projects
+                .iter()
+                .any(|existing: &SupabaseConfig| existing.issuer == project.issuer)
+            {
+                return Err(VerifyError::MissingConfiguration(
+                    "FIDUCIA_SUPABASE_PROJECTS contains duplicate issuers",
+                ));
+            }
+            projects.push(project);
+        }
+        Ok(ProjectRegistry { projects })
+    }
+
+    fn two_project_registry() -> ProjectRegistry {
+        registry_from(json!([
+            {
+                "name": "fiducia-customer",
+                "surfaces": ["fiducia-customer"],
+                "project_ref": "customerref"
+            },
+            {
+                "name": "fiducia-admin",
+                "surfaces": ["fiducia-admin"],
+                "project_ref": "adminref"
+            }
+        ]))
+        .expect("valid two-project registry")
+    }
+
+    /// An unsigned token carrying just an `iss` — enough to exercise routing,
+    /// which happens before any signature check.
+    fn token_from_issuer(issuer: &str) -> String {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(json!({ "iss": issuer, "sub": "u1" }).to_string());
+        format!("header.{payload}.signature")
+    }
+
+    // The headline requirement: the customer app and the admin app sit on
+    // different Supabase instances, and each token routes to its own project.
+    #[test]
+    fn tokens_route_to_their_own_supabase_instance() {
+        let registry = two_project_registry();
+
+        let customer = registry
+            .select(&token_from_issuer(
+                "https://customerref.supabase.co/auth/v1",
+            ))
+            .expect("customer token routes");
+        assert_eq!(customer.name, "fiducia-customer");
+        assert_eq!(
+            customer.project_surfaces(),
+            Some(vec![CUSTOMER_SURFACE_AUDIENCE])
+        );
+        assert_eq!(
+            customer.jwks_url,
+            "https://customerref.supabase.co/auth/v1/.well-known/jwks.json"
+        );
+
+        let admin = registry
+            .select(&token_from_issuer("https://adminref.supabase.co/auth/v1"))
+            .expect("admin token routes");
+        assert_eq!(admin.name, "fiducia-admin");
+        assert_eq!(admin.project_surfaces(), Some(vec![ADMIN_SURFACE_AUDIENCE]));
+        // Distinct instances must never share a key set.
+        assert_ne!(customer.jwks_url, admin.jwks_url);
+    }
+
+    #[test]
+    fn a_token_from_an_unconfigured_instance_is_rejected() {
+        let registry = two_project_registry();
+        assert!(matches!(
+            registry.select(&token_from_issuer("https://attacker.supabase.co/auth/v1")),
+            Err(VerifyError::UnknownIssuer)
+        ));
+        assert!(matches!(
+            registry.select("not-a-jwt"),
+            Err(VerifyError::InvalidToken(_))
+        ));
+    }
+
+    #[test]
+    fn registry_rejects_ambiguous_and_unusable_configuration() {
+        // Same issuer twice: routing would silently pick a surface.
+        assert!(registry_from(json!([
+            {"name": "a", "surfaces": ["fiducia-customer"], "project_ref": "same"},
+            {"name": "b", "surfaces": ["fiducia-admin"], "project_ref": "same"}
+        ]))
+        .is_err());
+
+        // A project with no surface would authorize nothing; an unknown surface
+        // is a typo that must not silently fail closed at request time.
+        assert!(registry_from(json!([{"name": "a", "surfaces": [], "project_ref": "r"}])).is_err());
+        assert!(registry_from(
+            json!([{"name": "a", "surfaces": ["fiducia-marketing"], "project_ref": "r"}])
+        )
+        .is_err());
+
+        // Neither url nor project_ref: nothing to verify against.
+        assert!(registry_from(json!([{"name": "a", "surfaces": ["fiducia-admin"]}])).is_err());
+
+        // Secrets must be referenced by env-var name, never inlined.
+        assert!(serde_json::from_value::<SupabaseProjectSpec>(json!({
+            "name": "a", "surfaces": ["fiducia-admin"], "project_ref": "r",
+            "publishable_key": "sb_publishable_inline"
+        }))
+        .is_err());
+    }
+
+    // A self-hosted or custom-domain instance must be configurable by URL, not
+    // only by Supabase project ref.
+    #[test]
+    fn an_explicit_url_overrides_the_derived_supabase_domain() {
+        let registry = registry_from(json!([{
+            "name": "self-hosted",
+            "surfaces": ["fiducia-customer"],
+            "url": "https://auth.internal.example/",
+            "audience": "fiducia"
+        }]))
+        .expect("valid url-configured project");
+        let project = &registry.projects[0];
+        assert_eq!(project.issuer, "https://auth.internal.example/auth/v1");
+        assert_eq!(project.audience, "fiducia");
+    }
+
+    // Without the registry env var, the existing single-project deployment must
+    // behave exactly as before: one unbound project answers for every token.
+    #[test]
+    fn a_single_unbound_project_still_answers_for_any_issuer() {
+        let registry = ProjectRegistry {
+            projects: vec![SupabaseConfig::for_project("legacy")],
+        };
+        let project = registry
+            .select(&token_from_issuer("https://anything.supabase.co/auth/v1"))
+            .expect("legacy project answers");
+        assert_eq!(project.name, "default");
+        assert_eq!(project.project_surfaces(), None);
+    }
+
+    // Two instances must not share one cache slot, or each request would evict
+    // the other project's keys and force a refetch.
+    #[tokio::test]
+    async fn each_instance_caches_its_own_key_set() {
+        let registry = two_project_registry();
+        let customer = &registry.projects[0];
+        let admin = &registry.projects[1];
+
+        let mut cache = jwks_cache().await.write().await;
+        for project in [customer, admin] {
+            cache.insert(
+                project.jwks_url.clone(),
+                CachedJwks {
+                    fetched_at: Instant::now(),
+                    jwks: JwkSet { keys: Vec::new() },
+                },
+            );
+        }
+        assert!(cache.contains_key(&customer.jwks_url));
+        assert!(cache.contains_key(&admin.jwks_url));
+    }
+
+    // End-to-end of the separation: an admin role smuggled into the customer
+    // instance's app_metadata yields no admin surface and no capabilities.
+    #[test]
+    fn an_admin_role_on_the_customer_instance_grants_nothing() {
+        let registry = two_project_registry();
+        let customer = &registry.projects[0];
+        let claims = SupabaseClaims {
+            sub: "user_1".to_string(),
+            email: Some("user@example.com".to_string()),
+            role: Some(DEFAULT_AUDIENCE.to_string()),
+            aal: Some("aal2".to_string()),
+            app_metadata: Some(json!({ "fiducia_roles": ["admin"] })),
+            _user_metadata: None,
+        };
+
+        let user = user_ctx_from_claims(claims, customer).unwrap();
+        let authorization = user.authorization_context();
+        assert!(
+            authorization.surface_audiences.is_empty(),
+            "customer-instance token must not reach the admin surface"
+        );
+        assert!(authorization.capabilities.is_empty());
     }
 
     #[test]
@@ -794,7 +1232,7 @@ mod tests {
             })),
         };
 
-        let user = user_ctx_from_claims(claims).unwrap();
+        let user = user_ctx_from_claims(claims, &SupabaseConfig::for_project("unbound")).unwrap();
         assert_eq!(user.orgs, vec!["org_trusted"]);
         assert_eq!(user.roles, vec!["operator"]);
         assert_eq!(user.aal, AssuranceLevel::Aal2);
@@ -812,7 +1250,7 @@ mod tests {
         };
 
         assert!(matches!(
-            user_ctx_from_claims(claims),
+            user_ctx_from_claims(claims, &SupabaseConfig::for_project("unbound")),
             Err(VerifyError::UnexpectedRole(Some(role))) if role == "service_role"
         ));
     }
@@ -891,9 +1329,8 @@ mod tests {
         // Once the cached set is older than the cooldown, a kid-miss may force
         // exactly one refetch again (how genuine rotations are picked up).
         {
-            let cache = JWKS_CACHE.get_or_init(|| async { RwLock::new(None) }).await;
-            let mut guard = cache.write().await;
-            let cached = guard.as_mut().expect("cache populated");
+            let mut guard = jwks_cache().await.write().await;
+            let cached = guard.get_mut(&config.jwks_url).expect("cache populated");
             cached.fetched_at = Instant::now()
                 .checked_sub(Duration::from_secs(MIN_FORCED_JWKS_REFRESH_SECS + 1))
                 .expect("age within Instant range");

@@ -12,6 +12,11 @@ and validates its signature or JWKS key plus issuer, audience, and time claims
 before authorizing a request. A service that accepts only trusted-hop identity
 headers, peer/shared secrets, API-key introspection results, or a remote
 browser-session result is not a direct internal-JWT verifier.
+Status: active inventory for DEN-1119. The parent remains open until every confirmed verifier is wired, deployed, and exercised through propagation/fault tests.
+
+## Verification boundary definition
+
+A service is a direct internal-JWT verifier when it accepts a raw Fiducia JWT and validates its signature or JWKS key plus issuer, audience, and time claims before authorizing a request. A service that accepts only trusted-hop identity headers, peer/shared secrets, API-key introspection results, or a remote browser-session result is not a direct internal-JWT verifier.
 
 ## Confirmed direct verifiers
 
@@ -23,6 +28,8 @@ browser-session result is not a direct internal-JWT verifier.
 There are currently two direct internal-JWT verifier boundaries. Both source
 implementations are merged. This inventory does **not** treat merged code or
 component CI as live revocation propagation certification.
+| `fiducia-cloud/fiducia-edge` | Cloudflare Worker module entry and the JWT path in `src/index.mjs` | Performs JWKS-backed asymmetric signature validation and issuer/audience/expiry checks before forwarding verified identity. | Implemented in PR `fiducia-edge#12`: offline validation occurs before a bounded, reader-only, fail-closed revocation lookup with opaque tenant-scoped cache keys and single-flight refreshes. Hosted CI passes. |
+| `fiducia-cloud/fiducia-load-balance.rs` | Direct credential path in `src/auth.rs` | Depends on `jsonwebtoken`, accepts a raw Bearer JWT, validates against JWKS, and caches a `VerifiedIdentity`. Direct clients can reach this path without the Cloudflare edge. | **Open gap.** The current JWT identity cache can return before any revocation check. This repository needs the shared gate or an equivalent transport adapter, complete claims (`iss`, `aud`, `iat`, `jti`), reader-only configuration, and the DEN-1119 integration suite. |
 
 ## Reviewed non-verifiers
 
@@ -79,3 +86,15 @@ both deployed paths have comparable propagation and fault evidence.
 7. Repeat the inventory when a repository adds `jsonwebtoken`, `jose`, JWKS
    validation, or a raw internal-token ingress path. Add an organization-level
    drift scanner once repository-index access is available to CI.
+`fiducia_auth::gate::RevocationGate` is the reusable Rust gate for downstream verifiers. Its cache and single-flight identity is a fixed-size SHA-256 digest over length-delimited issuer, audience, tenant, subject, and token ID. Equal `jti` values in different tenants therefore cannot share state, and map keys do not reveal raw identifiers.
+
+The gate must run only after normal offline JWT validation and before scope, tenant, or route authorization. Every `Unavailable` result is a deny. Production transports must use a reader-only credential and a bounded request timeout.
+
+## Remaining completion gates
+
+1. Integrate the load balancer direct-JWT path and remove its pre-revocation identity-cache bypass.
+2. Add its tests for allow, exact-token deny, subject deny, stale negative, stale positive, timeout, malformed response, clock regression, tenant isolation, and concurrent refresh coalescing.
+3. Wire deployment endpoint/reader secret references without committing values.
+4. Run hosted CI and container smoke tests for the load balancer and edge.
+5. Exercise revoke and lift propagation across at least two live verifier instances, including authority outage and restart, and attach identifier-safe evidence to DEN-1119/DEN-1120.
+6. Repeat the inventory when a repository adds `jsonwebtoken`, `jose`, JWKS validation, or a raw internal-token ingress path; CI follow-up should automate that drift check.
