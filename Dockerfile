@@ -33,6 +33,12 @@ USER 65532:65532
 FROM runtime AS revocation-admin
 COPY --from=build --chown=65532:65532 /build/fiducia-auth.rs/target/release/fiducia-revocation-admin /usr/local/bin/fiducia-revocation-admin
 EXPOSE 8098
+# --- sops: this final stage has no shell (distroless/scratch), so runtime
+# decryption cannot run inside the container. Inject secrets HOST-SIDE at
+# `docker run` instead — never at build, never as --build-arg:
+#     just env-docker-run prod <image>        # decrypts env/enc/prod.env.enc
+#                                             # and passes --env-file, no plaintext on disk
+# or render a platform secret from the same ciphertext. See env/README.md.
 ENTRYPOINT ["/usr/local/bin/fiducia-revocation-admin"]
 
 # Keep this stage last: it is the backward-compatible default image target.
@@ -40,4 +46,10 @@ FROM runtime AS auth
 COPY --from=build --chown=65532:65532 /build/fiducia-auth.rs/target/release/fiducia-auth /usr/local/bin/fiducia-auth
 COPY --from=build --chown=65532:65532 /build/fiducia-auth.rs/target/release/fiducia-auth-production-entrypoint /usr/local/bin/fiducia-auth-production-entrypoint
 EXPOSE 8097
+# --- sops: this final stage has no shell (distroless/scratch), so runtime
+# decryption cannot run inside the container. Inject secrets HOST-SIDE at
+# `docker run` instead — never at build, never as --build-arg:
+#     just env-docker-run prod <image>        # decrypts env/enc/prod.env.enc
+#                                             # and passes --env-file, no plaintext on disk
+# or render a platform secret from the same ciphertext. See env/README.md.
 ENTRYPOINT ["/usr/local/bin/fiducia-auth-production-entrypoint"]
