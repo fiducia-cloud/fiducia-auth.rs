@@ -24,7 +24,7 @@ RUN cargo build --locked --release \
        target/release/fiducia-auth-production-entrypoint \
        target/release/fiducia-revocation-admin
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77 AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 USER 65532:65532
 
 # Explicit target for the private revocation control plane. It contains no Git,
