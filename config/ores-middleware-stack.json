@@ -1,0 +1,26 @@
+{
+  "contractVersion": "1.0.0",
+  "environment": "development",
+  "requiredCapabilities": ["request-context", "panic-recovery", "request-id", "trace-context", "structured-logging", "metrics-red", "deadline-timeout", "payload-limit", "rate-limit", "auth", "sync-observer", "json", "headers", "compression", "tls-policy", "security-headers", "idempotency", "ip-policy", "cache-etag", "content-negotiation", "fault-injection", "test-auth-bypass", "schema-capture"],
+  "settings": {
+    "requestIdHeader": "x-request-id",
+    "traceHeader": "traceparent",
+    "timeoutMs": 5000,
+    "maxBodyBytes": 2097152,
+    "contextRegistryMaxEntries": 10000,
+    "contextRegistryTtlMs": 30000,
+    "rateLimit": {"enabled": true, "capacity": 100, "refillPerSecond": 20, "keyBy": ["ip", "route"]},
+    "compression": {"enabled": true, "minimumBytes": 1024, "algorithms": ["br", "gzip"]},
+    "tls": {"mode": "disabled", "requireHttps": false, "strictForwardedHeaders": true, "trustedProxyCidrs": []},
+    "securityHeaders": {"enabled": true, "hstsMaxAgeSeconds": 31536000, "frameOptions": "DENY"},
+    "idempotency": {"enabled": true, "headerName": "idempotency-key", "ttlSeconds": 86400, "requiredMethods": ["POST", "PUT", "PATCH"]},
+    "faultInjection": {"enabled": false, "latencyMs": 0, "errorRate": 0, "dropRate": 0},
+    "testAuthBypass": {"enabled": false, "headerName": "x-test-auth-bypass", "allowedCidrs": []},
+    "contentRepresentations": ["application/json", "application/problem+json"]
+  },
+  "integrations": {
+    "sharedAuth": {"mode": "disabled", "failOpen": false},
+    "optoSync": {"mode": "disabled", "failOpen": false},
+    "oresOtel": {"enabled": true, "serviceName": "fiducia-auth", "propagators": ["tracecontext", "baggage"]}
+  }
+}
