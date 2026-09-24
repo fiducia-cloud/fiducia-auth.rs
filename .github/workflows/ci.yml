@@ -16,7 +16,7 @@ concurrency:
 
 env:
   INTERFACES_SHA: bd718cd72d72aa330534f3688f8fb1ce90c19d10
-  RUST_VERSION: 1.97.1
+  RUST_VERSION: 1.98.1
 
 jobs:
   test:
@@ -47,8 +47,8 @@ jobs:
       - name: Pin parity across Rust and interface build inputs
         working-directory: repo
         run: |
-          grep -Fq 'channel = "1.97.1"' rust-toolchain.toml
-          grep -Fq 'FROM rust:1.97.1-slim-bookworm@sha256:' Dockerfile
+          grep -Fq 'channel = "1.98.1"' rust-toolchain.toml
+          grep -Fq 'FROM rust:1.98.1-slim-bookworm@sha256:' Dockerfile
           grep -Fq 'ARG INTERFACES_SHA=bd718cd72d72aa330534f3688f8fb1ce90c19d10' Dockerfile
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
