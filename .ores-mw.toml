@@ -1,0 +1,11 @@
+# ORES middleware server orchestration. The referenced JSON remains the full stack configuration.
+schema_version = 1
+repository_mode = "server-only"
+default_target = "server"
+
+[[targets]]
+name = "server"
+role = "server"
+roots = ["."]
+middleware = "stack"
+stack_config = "config/ores-middleware-stack.json"

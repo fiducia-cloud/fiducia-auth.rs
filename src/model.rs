@@ -94,35 +94,34 @@ impl UserCtx {
             .iter()
             .any(|role| matches!(role, TrustedRole::Customer));
 
-        let mut surface_audiences = Vec::new();
-        if has_admin || has_operator {
-            surface_audiences.push(ADMIN_SURFACE_AUDIENCE);
-        }
-        if has_customer || self.roles.is_empty() {
-            surface_audiences.push(CUSTOMER_SURFACE_AUDIENCE);
-        }
-
+        let derived_surfaces = [
+            (has_admin || has_operator).then_some(ADMIN_SURFACE_AUDIENCE),
+            (has_customer || self.roles.is_empty()).then_some(CUSTOMER_SURFACE_AUDIENCE),
+        ]
+        .into_iter()
+        .flatten();
         // Intersect with what the issuing project may serve. This runs *after*
         // the role derivation so a project binding can only ever remove a
         // surface, never add one: both gates must agree.
-        if let Some(allowed) = self.project_surfaces.as_deref() {
-            surface_audiences.retain(|surface| allowed.contains(surface));
-        }
+        let surface_audiences: Vec<&'static str> = match self.project_surfaces.as_deref() {
+            Some(allowed) => derived_surfaces
+                .filter(|surface| allowed.contains(surface))
+                .collect(),
+            None => derived_surfaces.collect(),
+        };
 
         let admin_surface = surface_audiences.contains(&ADMIN_SURFACE_AUDIENCE);
         let customer_surface = surface_audiences.contains(&CUSTOMER_SURFACE_AUDIENCE);
-
-        let mut capabilities = Vec::new();
-        if admin_surface {
-            if has_admin {
-                capabilities.extend(["admin:read", "admin:operate", "admin:write"]);
-            } else if has_operator {
-                capabilities.extend(["admin:read", "admin:operate"]);
-            }
-        }
-        if customer_surface {
-            capabilities.push("customer:self-service");
-        }
+        let admin_caps: &[&str] = match (admin_surface, has_admin, has_operator) {
+            (true, true, _) => &["admin:read", "admin:operate", "admin:write"],
+            (true, false, true) => &["admin:read", "admin:operate"],
+            _ => &[],
+        };
+        let capabilities: Vec<&'static str> = admin_caps
+            .iter()
+            .copied()
+            .chain(customer_surface.then_some("customer:self-service"))
+            .collect();
 
         AuthorizationContext {
             version: AUTHORIZATION_CONTEXT_VERSION,
@@ -154,21 +153,23 @@ impl Serialize for UserCtx {
 }
 
 fn normalized_trusted_roles(roles: &[String]) -> Vec<TrustedRole> {
-    let mut normalized = Vec::new();
-    for role in roles {
-        let role = match role.trim().to_ascii_lowercase().as_str() {
+    roles
+        .iter()
+        .filter_map(|role| match role.trim().to_ascii_lowercase().as_str() {
             "admin" => Some(TrustedRole::Admin),
             "operator" => Some(TrustedRole::Operator),
             "customer" => Some(TrustedRole::Customer),
             _ => None,
-        };
-        if let Some(role) = role {
-            if !normalized.contains(&role) {
-                normalized.push(role);
+        })
+        .fold(Vec::new(), |normalized, role| {
+            match normalized.contains(&role) {
+                true => normalized,
+                false => normalized
+                    .into_iter()
+                    .chain(std::iter::once(role))
+                    .collect(),
             }
-        }
-    }
-    normalized
+        })
 }
 
 /// What an API key resolves to (data plane). This is what the edge/LB caches.

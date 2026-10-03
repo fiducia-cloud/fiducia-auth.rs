@@ -2,7 +2,7 @@
 # Multi-stage build for the customer auth server and the separately deployed
 # least-privilege revocation authority. The final default target remains `auth`
 # so existing `docker build .` callers preserve their current image contract.
-FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS build
+FROM rust:1.98.1-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
@@ -24,7 +24,7 @@ RUN cargo build --locked --release \
        target/release/fiducia-auth-production-entrypoint \
        target/release/fiducia-revocation-admin
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 USER 65532:65532
 
 # Explicit target for the private revocation control plane. It contains no Git,
@@ -33,6 +33,12 @@ USER 65532:65532
 FROM runtime AS revocation-admin
 COPY --from=build --chown=65532:65532 /build/fiducia-auth.rs/target/release/fiducia-revocation-admin /usr/local/bin/fiducia-revocation-admin
 EXPOSE 8098
+# --- sops: this final stage has no shell (distroless/scratch), so runtime
+# decryption cannot run inside the container. Inject secrets HOST-SIDE at
+# `docker run` instead — never at build, never as --build-arg:
+#     just env-docker-run prod <image>        # decrypts env/enc/prod.env.enc
+#                                             # and passes --env-file, no plaintext on disk
+# or render a platform secret from the same ciphertext. See env/README.md.
 ENTRYPOINT ["/usr/local/bin/fiducia-revocation-admin"]
 
 # Keep this stage last: it is the backward-compatible default image target.
@@ -40,4 +46,10 @@ FROM runtime AS auth
 COPY --from=build --chown=65532:65532 /build/fiducia-auth.rs/target/release/fiducia-auth /usr/local/bin/fiducia-auth
 COPY --from=build --chown=65532:65532 /build/fiducia-auth.rs/target/release/fiducia-auth-production-entrypoint /usr/local/bin/fiducia-auth-production-entrypoint
 EXPOSE 8097
+# --- sops: this final stage has no shell (distroless/scratch), so runtime
+# decryption cannot run inside the container. Inject secrets HOST-SIDE at
+# `docker run` instead — never at build, never as --build-arg:
+#     just env-docker-run prod <image>        # decrypts env/enc/prod.env.enc
+#                                             # and passes --env-file, no plaintext on disk
+# or render a platform secret from the same ciphertext. See env/README.md.
 ENTRYPOINT ["/usr/local/bin/fiducia-auth-production-entrypoint"]

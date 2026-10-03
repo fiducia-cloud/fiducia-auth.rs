@@ -47,6 +47,19 @@
             ];
 
             shellHook = ''
+              # `env/dec/` is intentionally ignored, so a fresh clone cannot
+              # contain it. Recreate the owner-only plaintext boundary before
+              # SOPS, Just, hooks, or application tooling can need it.
+              _repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+              if [ -L "$_repo_root/env" ] || [ -L "$_repo_root/env/dec" ]; then
+                echo "refusing to prepare symlinked env/dec" >&2
+                return 1 2>/dev/null || exit 1
+              fi
+              umask 077
+              mkdir -p "$_repo_root/env/dec"
+              chmod 700 "$_repo_root/env/dec"
+              unset _repo_root
+
               echo "Fiducia dev shell (${system})"
 
               # Point sops at this machine's age key. sops finds the platform

@@ -1,6 +1,6 @@
 # Pins the Rust toolchain and components used by local development, CI, and
 # both OCI build targets. Keep this exact version aligned with Dockerfile.
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
