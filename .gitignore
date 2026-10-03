@@ -20,3 +20,7 @@ Thumbs.db
 .direnv/
 target/
 .cargo-target-*/
+tmp
+temp
+tmp/worktrees
+temp/worktrees
