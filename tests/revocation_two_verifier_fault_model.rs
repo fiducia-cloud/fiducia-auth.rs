@@ -284,3 +284,74 @@ async fn token_isolation() {
         Authorization::Allowed
     );
 }
+
+
+// Wave50: independently exercised public gate/cache behavior, no wall-clock sleeps.
+#[tokio::test]
+async fn wave50_cold_verifiers_do_not_share_a_fresh_negative_cache() {
+    let authority = ReferenceAuthority::default();
+    let a = verifier(authority.clone());
+    let b = verifier(authority.clone());
+    let token = claims("independent-cold", "tenant-a");
+    assert_eq!(a.authorize(&token, 100).await, Authorization::Allowed);
+    assert_eq!(authority.calls(), 1);
+    assert_eq!(b.authorize(&token, 100).await, Authorization::Allowed);
+    assert_eq!(authority.calls(), 2, "each independent verifier must refresh");
+}
+
+#[tokio::test]
+async fn wave50_revoke_only_one_of_two_same_tenant_tokens() {
+    let authority = ReferenceAuthority::default();
+    let verifier = verifier(authority.clone());
+    let a = claims("same-tenant-a", "tenant-a");
+    let b = claims("same-tenant-b", "tenant-a");
+    assert_eq!(verifier.authorize(&a, 100).await, Authorization::Allowed);
+    assert_eq!(verifier.authorize(&b, 100).await, Authorization::Allowed);
+    authority.revoke("same-tenant-a");
+    assert_eq!(verifier.authorize(&a, 100 + B + 1).await, Authorization::Revoked);
+    assert_eq!(verifier.authorize(&b, 100 + B + 1).await, Authorization::Allowed);
+}
+
+#[tokio::test]
+async fn wave50_partitioned_verifier_does_not_contaminate_healthy_peer_cache() {
+    let authority = ReferenceAuthority::default();
+    let a = verifier(authority.clone());
+    let b = verifier(authority.clone());
+    let token = claims("partition-peer", "tenant-a");
+    assert_eq!(a.authorize(&token, 100).await, Authorization::Allowed);
+    assert_eq!(b.authorize(&token, 101).await, Authorization::Allowed);
+    authority.set_outage(true);
+    assert!(matches!(a.authorize(&token, 100 + B + 1).await, Authorization::Unavailable(_)));
+    assert_eq!(b.authorize(&token, 101 + B).await, Authorization::Allowed);
+    assert!(matches!(b.authorize(&token, 101 + B + 1).await, Authorization::Unavailable(_)));
+}
+
+#[tokio::test]
+async fn wave50_revoke_lift_converges_after_both_independent_deadlines() {
+    let authority = ReferenceAuthority::default();
+    authority.revoke("lift-both");
+    let a = verifier(authority.clone());
+    let b = verifier(authority.clone());
+    let token = claims("lift-both", "tenant-b");
+    assert_eq!(a.authorize(&token, 100).await, Authorization::Revoked);
+    assert_eq!(b.authorize(&token, 105).await, Authorization::Revoked);
+    authority.lift("lift-both");
+    assert_eq!(a.authorize(&token, 100 + B).await, Authorization::Revoked);
+    assert_eq!(b.authorize(&token, 105 + B).await, Authorization::Revoked);
+    assert_eq!(a.authorize(&token, 100 + B + 1).await, Authorization::Allowed);
+    assert_eq!(b.authorize(&token, 105 + B + 1).await, Authorization::Allowed);
+}
+
+#[tokio::test]
+async fn wave50_clock_regression_in_one_verifier_leaves_peer_unaffected() {
+    let authority = ReferenceAuthority::default();
+    let a = verifier(authority.clone());
+    let b = verifier(authority.clone());
+    let token = claims("clock-peers", "tenant-a");
+    assert_eq!(a.authorize(&token, 200).await, Authorization::Allowed);
+    assert_eq!(b.authorize(&token, 205).await, Authorization::Allowed);
+    assert!(matches!(a.authorize(&token, 199).await, Authorization::Unavailable(_)));
+    assert_eq!(b.authorize(&token, 210).await, Authorization::Allowed);
+    assert_eq!(a.authorize(&token, 200).await, Authorization::Allowed);
+    assert_eq!(authority.calls(), 2);
+}
