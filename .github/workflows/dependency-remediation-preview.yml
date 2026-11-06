@@ -1,0 +1,56 @@
+name: Dependency lockfile remediation preview
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/dependency-remediation-preview.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dependency-preview:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.head_ref == 'formal/20261105-key-lifecycle-safety-bounded')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: repo
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: bd718cd72d72aa330534f3688f8fb1ce90c19d10
+          path: fiducia-interfaces
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.98.1
+      - name: Resolve security-advisory-compatible versions without changing source
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          cargo update -p quinn-proto --precise 0.11.18
+          cargo update -p rustls --precise 0.23.46
+          cargo update -p rustls-webpki --precise 0.103.16
+          cargo update -p webpki-roots --precise 1.0.10
+          cargo update -p tokio
+          echo 'BEGIN_CARGO_LOCK_PATCH'
+          git diff --no-ext-diff -- Cargo.lock
+          echo 'END_CARGO_LOCK_PATCH'
+          test "$(git diff --numstat -- Cargo.lock | awk '{print $1+$2}')" -lt 500
+      - name: Verify the temporary lockfile builds and lifecycle regressions pass
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          cargo check --locked --bins
+          cargo test --locked --all-targets --features governance-webauthn
+      - name: Report unresolved crypto-bigint major-version migration
+        if: always()
+        run: |
+          echo 'crypto-bigint 0.5.x requires a separate transitive-dependency major-version migration.'
+          echo 'This is a read-only remediation preview; source Cargo.lock is unchanged.'
