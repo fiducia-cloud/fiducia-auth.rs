@@ -9,7 +9,7 @@ function fiducia_auth_model() {
   const freshAllowed=s=>!s.revoked&&s.activeGen===s.presentedGen;
   const invariant=s=>s.now>=0&&s.now<=3&&s.activeGen>=1&&s.activeGen<=2&&
     s.cacheUntil<=4 && (!s.cacheAllow || s.cacheGen>0);
-  let states=0,edges=0,cacheGrants=0,expiredDenials=0;
+  let states=0,edges=0,cacheGrants=0,expiredDenials=0,rotations=0,revocations=0,renewals=0;
   for(const gen of [1,2]) {
     const start=init(gen),q=[start],seen=new Set([JSON.stringify(start)]);
     for(let i=0;i<q.length;i++){
