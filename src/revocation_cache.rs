@@ -267,14 +267,18 @@ impl RevocationCache {
         Ok(())
     }
 
-    /// Clears one key. This always leaves the target cold and denied.
+    /// Invalidates a key. A previously detected authority-generation conflict
+    /// remains quarantined: caller-triggered invalidation must never turn an
+    /// inconsistent generation into a fresh allow at that same generation.
     pub fn invalidate(
         &mut self,
         key: &RevocationCacheKey,
         now: u64,
     ) -> Result<(), RevocationCacheError> {
         self.observe_time(now)?;
-        self.entries.remove(key);
+        if !self.entries.get(key).is_some_and(|entry| entry.quarantined) {
+            self.entries.remove(key);
+        }
         self.latest_refresh.remove(key);
         Ok(())
     }
