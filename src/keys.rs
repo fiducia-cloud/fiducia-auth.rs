@@ -1308,4 +1308,103 @@ mod tests {
         assert_eq!(merged, vec!["existing", "concurrent", "ours"]);
         server.abort();
     }
+    /// Model-based refinement: enumerate every four-step lifecycle history over
+    /// rotation, revocation, observation and wrong-org revocation. The reference
+    /// is deliberately independent of KeyStore's transition implementation.
+    /// This tests the in-memory production API only; durable multi-replica KV
+    /// behavior requires a separate fault-injection gate.
+    #[tokio::test]
+    async fn bounded_lifecycle_histories_refine_production_api() {
+        const HISTORY_LENGTH: usize = 4;
+        const ACTIONS: usize = 4;
+        let histories = ACTIONS.pow(HISTORY_LENGTH as u32);
+
+        for seed in 0..histories {
+            let s = store();
+            let (raw, created) = s
+                .create(
+                    MutationIdentity::new("refinement-user", "refinement-create"),
+                    "org_1".into(),
+                    "worker".into(),
+                    vec!["requests:write".into()],
+                    "test".into(),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let mut sequence = seed;
+            let mut credentials = vec![raw.clone()];
+            let mut current = raw;
+            let mut revoked = false;
+            let mut expected_version = created.version;
+
+            for step in 0..HISTORY_LENGTH {
+                let action = sequence % ACTIONS;
+                sequence /= ACTIONS;
+                match action {
+                    0 => {
+                        let token = format!("refinement-rotate-{step}");
+                        let result = s
+                            .rotate("refinement-user", &token, "org_1", &created.key_id)
+                            .await
+                            .unwrap();
+                        if revoked {
+                            assert!(result.is_none(), "revoked key rotated: {seed}/{step}");
+                        } else {
+                            let (replacement, metadata) =
+                                result.expect("live key must rotate");
+                            assert_ne!(replacement, current);
+                            expected_version += 1;
+                            assert_eq!(metadata.version, expected_version);
+                            current = replacement.clone();
+                            credentials.push(replacement);
+                        }
+                    }
+                    1 => {
+                        assert!(
+                            s.revoke("org_1", &created.key_id).await.unwrap(),
+                            "owner revoke failed: {seed}/{step}"
+                        );
+                        if !revoked {
+                            expected_version += 1;
+                            revoked = true;
+                        }
+                    }
+                    2 => {
+                        // Introspection itself must not change lifecycle state.
+                        let _ = s.introspect(&current).await.unwrap();
+                    }
+                    3 => {
+                        assert!(
+                            !s.revoke("org_2", &created.key_id).await.unwrap(),
+                            "cross-organization revoke succeeded: {seed}/{step}"
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+
+                let meta = s.list("org_1").await.unwrap();
+                assert_eq!(meta.len(), 1, "lost key: {seed}/{step}");
+                assert_eq!(
+                    meta[0].version, expected_version,
+                    "version disagreement: {seed}/{step}"
+                );
+                assert_eq!(meta[0].revoked, revoked, "revoke disagreement");
+                assert!(meta[0].require_idempotency);
+                for credential in &credentials {
+                    let observed = s.introspect(credential).await.unwrap().valid;
+                    let expected = !revoked && *credential == current;
+                    assert_eq!(
+                        observed, expected,
+                        "old or revoked credential admitted: {seed}/{step}"
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "key lifecycle production refinement: {histories} four-step histories"
+        );
+    }
+
 }
