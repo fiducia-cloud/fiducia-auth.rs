@@ -74,6 +74,8 @@ pub enum DenyReason {
     Stale,
     Revoked,
     RevocationExpiredNeedsRefresh,
+    /// Conflicting decisions for one authority generation; deny until a newer generation.
+    AuthorityGenerationConflict,
 }
 
 /// Metrics-safe cache error. No variant contains a cache key or identity value.
@@ -85,6 +87,7 @@ pub enum RevocationCacheError {
     UnknownRefresh,
     SupersededRefresh,
     GenerationRegression { observed: u64, cached: u64 },
+    GenerationConflict { generation: u64 },
 }
 
 impl RevocationCacheError {
@@ -97,6 +100,7 @@ impl RevocationCacheError {
             Self::UnknownRefresh => "unknown_refresh",
             Self::SupersededRefresh => "superseded_refresh",
             Self::GenerationRegression { .. } => "generation_regression",
+            Self::GenerationConflict { .. } => "generation_conflict",
         }
     }
 }
@@ -119,6 +123,10 @@ impl fmt::Display for RevocationCacheError {
                 formatter,
                 "revocation generation regressed: observed={observed}, cached={cached}"
             ),
+            Self::GenerationConflict { generation } => write!(
+                formatter,
+                "conflicting revocation decisions at authority generation {generation}"
+            ),
         }
     }
 }
@@ -129,6 +137,8 @@ impl Error for RevocationCacheError {}
 struct CacheEntry {
     decision: AuthorityDecision,
     fresh_until: u64,
+    /// A same-generation contradiction is quarantined until authority advances.
+    quarantined: bool,
 }
 
 /// Verifier-local bounded-freshness cache.
@@ -175,6 +185,10 @@ impl RevocationCache {
             return Ok(CacheDecision::Deny(DenyReason::Cold));
         };
 
+        if entry.quarantined {
+            return Ok(CacheDecision::Deny(DenyReason::AuthorityGenerationConflict));
+        }
+
         match entry.decision.state {
             AuthorityState::Revoked {
                 expires_at: Some(expires_at),
@@ -215,11 +229,27 @@ impl RevocationCache {
         if permit.sequence != latest_sequence {
             return Err(RevocationCacheError::SupersededRefresh);
         }
-        if let Some(current) = self.entries.get(&permit.key) {
+        if let Some(current) = self.entries.get(&permit.key).copied() {
             if decision.generation < current.decision.generation {
                 return Err(RevocationCacheError::GenerationRegression {
                     observed: decision.generation,
                     cached: current.decision.generation,
+                });
+            }
+            if decision.generation == current.decision.generation
+                && (current.quarantined || decision.state != current.decision.state)
+            {
+                // A generation names one immutable authority decision. Never
+                // replace a cached revocation with a contradictory stale allow,
+                // nor leave a formerly-fresh allow usable after contradiction.
+                // Recovery requires an authoritative *higher* generation.
+                self.entries.insert(permit.key.clone(), CacheEntry {
+                    quarantined: true,
+                    ..current
+                });
+                self.latest_refresh.remove(&permit.key);
+                return Err(RevocationCacheError::GenerationConflict {
+                    generation: decision.generation,
                 });
             }
         }
@@ -230,6 +260,7 @@ impl RevocationCache {
             CacheEntry {
                 decision,
                 fresh_until,
+                quarantined: false,
             },
         );
         self.latest_refresh.remove(&permit.key);
