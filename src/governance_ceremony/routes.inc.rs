@@ -70,7 +70,7 @@ async fn begin_approval(
 ) -> Response {
     let user = match require_user(&headers).await {
         Ok(user) => user,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if user.aal != AssuranceLevel::Aal2 {
         return error_response(StatusCode::FORBIDDEN, "aal2_required");
@@ -184,7 +184,7 @@ async fn complete_verified(
     }
 }
 
-async fn require_user(headers: &HeaderMap) -> Result<UserCtx, Response> {
+async fn require_user(headers: &HeaderMap) -> Result<UserCtx, Box<Response>> {
     let bearer = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -192,11 +192,11 @@ async fn require_user(headers: &HeaderMap) -> Result<UserCtx, Response> {
     match bearer {
         Some(jwt) => supabase::verify_session(jwt)
             .await
-            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "invalid_session")),
-        None => Err(error_response(
+            .ok_or_else(|| Box::new(error_response(StatusCode::UNAUTHORIZED, "invalid_session"))),
+        None => Err(Box::new(error_response(
             StatusCode::UNAUTHORIZED,
             "missing_bearer_token",
-        )),
+        ))),
     }
 }
 
