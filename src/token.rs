@@ -22,7 +22,7 @@ use base64::Engine as _;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use once_cell::sync::Lazy;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 #[cfg(test)]
 use p256::pkcs8::EncodePublicKey;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
