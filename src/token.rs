@@ -22,7 +22,7 @@ use base64::Engine as _;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use once_cell::sync::Lazy;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 #[cfg(test)]
 use p256::pkcs8::EncodePublicKey;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
@@ -310,7 +310,7 @@ impl Signer {
         };
 
         // Public JWK (uncompressed point -> x/y) for /.well-known/jwks.json.
-        let point = pubkey.to_encoded_point(false); // 0x04 || x || y
+        let point = pubkey.to_sec1_point(false); // 0x04 || x || y
         let x = point.x().expect("P-256 x coordinate");
         let y = point.y().expect("P-256 y coordinate");
         let b64u = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
