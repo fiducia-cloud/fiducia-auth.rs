@@ -163,3 +163,107 @@ fn clock_regression_fails_closed_without_changing_either_tenant() {
     ));
     assert_decisions(&mut cache, &keys, &oracle, 102);
 }
+
+fn authoritative(
+    cache: &mut RevocationCache,
+    target: &RevocationCacheKey,
+    generation: u64,
+    revoked: bool,
+    now: u64,
+) -> Result<(), RevocationCacheError> {
+    let permit = cache.begin_refresh(target.clone(), now).expect("begin refresh");
+    cache.apply_authoritative(
+        permit,
+        AuthorityDecision {
+            generation,
+            state: if revoked {
+                AuthorityState::Revoked { expires_at: None }
+            } else {
+                AuthorityState::NotRevoked
+            },
+        },
+        now,
+    )
+}
+
+#[test]
+fn same_generation_allow_then_deny_fails_closed() {
+    let target = key("tenant-a");
+    let mut cache = RevocationCache::new(20).unwrap();
+    authoritative(&mut cache, &target, 7, false, 100).unwrap();
+    assert_eq!(cache.lookup(&target, 101), Ok(CacheDecision::Allow));
+    assert_eq!(
+        authoritative(&mut cache, &target, 7, true, 102),
+        Err(RevocationCacheError::GenerationConflict { generation: 7 }),
+    );
+    assert_eq!(
+        cache.lookup(&target, 103),
+        Ok(CacheDecision::Deny(DenyReason::AuthorityGenerationConflict)),
+    );
+}
+
+#[test]
+fn same_generation_deny_then_allow_never_revives_token() {
+    let target = key("tenant-a");
+    let mut cache = RevocationCache::new(20).unwrap();
+    authoritative(&mut cache, &target, 7, true, 100).unwrap();
+    assert_eq!(
+        authoritative(&mut cache, &target, 7, false, 101),
+        Err(RevocationCacheError::GenerationConflict { generation: 7 }),
+    );
+    assert_ne!(cache.lookup(&target, 102), Ok(CacheDecision::Allow));
+}
+
+#[test]
+fn quarantined_generation_requires_strict_authority_advance() {
+    let target = key("tenant-a");
+    let mut cache = RevocationCache::new(20).unwrap();
+    authoritative(&mut cache, &target, 7, false, 100).unwrap();
+    authoritative(&mut cache, &target, 7, true, 101).unwrap_err();
+
+    // Neither a repeat of the original response nor a replay of the
+    // conflicting response may remove quarantine.
+    for (revoked, now) in [(false, 102), (true, 103)] {
+        assert_eq!(
+            authoritative(&mut cache, &target, 7, revoked, now),
+            Err(RevocationCacheError::GenerationConflict { generation: 7 }),
+        );
+        assert_eq!(
+            cache.lookup(&target, now),
+            Ok(CacheDecision::Deny(DenyReason::AuthorityGenerationConflict)),
+        );
+    }
+    assert_eq!(
+        authoritative(&mut cache, &target, 6, false, 104),
+        Err(RevocationCacheError::GenerationRegression {
+            observed: 6,
+            cached: 7,
+        }),
+    );
+    authoritative(&mut cache, &target, 8, true, 105).unwrap();
+    assert_eq!(cache.lookup(&target, 106), Ok(CacheDecision::Deny(DenyReason::Revoked)));
+    authoritative(&mut cache, &target, 9, false, 107).unwrap();
+    assert_eq!(cache.lookup(&target, 108), Ok(CacheDecision::Allow));
+}
+
+#[test]
+fn one_tenant_generation_conflict_cannot_poison_another_tenant() {
+    let first = key("tenant-a");
+    let second = key("tenant-b");
+    let mut cache = RevocationCache::new(20).unwrap();
+    authoritative(&mut cache, &first, 7, false, 100).unwrap();
+    authoritative(&mut cache, &second, 3, false, 100).unwrap();
+    authoritative(&mut cache, &first, 7, true, 101).unwrap_err();
+    assert_eq!(
+        cache.lookup(&first, 102),
+        Ok(CacheDecision::Deny(DenyReason::AuthorityGenerationConflict)),
+    );
+    assert_eq!(cache.lookup(&second, 102), Ok(CacheDecision::Allow));
+}
+
+#[test]
+fn conflict_metric_label_never_contains_tenant_identity() {
+    let error = RevocationCacheError::GenerationConflict { generation: 5 };
+    assert_eq!(error.metric_kind(), "generation_conflict");
+    assert!(!error.to_string().contains("tenant"));
+}
