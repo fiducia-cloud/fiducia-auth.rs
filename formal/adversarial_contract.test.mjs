@@ -23,8 +23,15 @@ const mutants = [["cache TTL is extended beyond bound","cacheUntil:s.now+1","cac
 for (const [label, original, replacement] of mutants) {
   test("rejects mutant: " + label, () => {
     assert.equal(source.split(original).length - 1, 1, "mutation anchor drift: " + label);
-    const runResult = run(source.replace(original, replacement));
+    const mutant = source.replace(original, replacement);
+    const syntax = spawnSync(process.execPath, ["--input-type=module", "--check"], {
+      encoding: "utf8", input: mutant, timeout: 10000
+    });
+    assert.equal(syntax.error, undefined, "syntax checker unavailable: " + label);
+    assert.equal(syntax.status, 0, "invalid mutant syntax: " + label + "\n" + syntax.stderr);
+    const runResult = run(mutant);
     assert.notEqual(runResult.status, 0, "mutant survived: " + label);
-    assert.match(runResult.stderr, /Error|AssertionError/, "mutant had no assertion failure: " + label);
+    assert.match(runResult.stderr, /(?:^|\n)Error: /,
+      "mutant did not trigger a model safety assertion: " + label);
   });
 }
