@@ -1406,4 +1406,107 @@ mod tests {
         }
         eprintln!("key lifecycle production refinement: {histories} four-step histories");
     }
+    #[tokio::test]
+    async fn revoked_rotation_replay_never_reissues_the_secret() {
+        let s = store();
+        let (original, created) = s
+            .create(
+                MutationIdentity::new("user-1", "make-key"),
+                "org_1".into(),
+                "worker".into(),
+                vec!["requests:write".into()],
+                "test".into(),
+                true,
+            )
+            .await
+            .unwrap();
+        let (rotated, prior) = s
+            .rotate("user-1", "rotate-idempotently", "org_1", &created.key_id)
+            .await
+            .unwrap()
+            .expect("first rotation allowed");
+        assert_ne!(rotated, original);
+        assert!(s.introspect(&rotated).await.unwrap().valid);
+
+        assert!(s.revoke("org_1", &created.key_id).await.unwrap());
+        assert!(!s.introspect(&original).await.unwrap().valid);
+        assert!(!s.introspect(&rotated).await.unwrap().valid);
+        assert!(s
+            .rotate("user-1", "rotate-idempotently", "org_1", &created.key_id)
+            .await
+            .unwrap()
+            .is_none(), "revoked key must not replay previously issued secrets");
+        assert!(s
+            .rotate("user-1", "fresh-rotation", "org_1", &created.key_id)
+            .await
+            .unwrap()
+            .is_none());
+        let final_metadata = s.list("org_1").await.unwrap();
+        assert_eq!(final_metadata.len(), 1);
+        assert!(final_metadata[0].revoked);
+        assert_eq!(final_metadata[0].version, prior.version + 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_rotate_and_revoke_cannot_resurrect_credential() {
+        for iteration in 0..32 {
+            let s = Arc::new(store());
+            let (original, created) = s
+                .create(
+                    MutationIdentity::new("racer", "create"),
+                    "org_1".into(),
+                    "worker".into(),
+                    vec!["requests:write".into()],
+                    "test".into(),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let start = Arc::new(tokio::sync::Barrier::new(3));
+            let rotate_store = Arc::clone(&s);
+            let revoke_store = Arc::clone(&s);
+            let rotate_start = Arc::clone(&start);
+            let revoke_start = Arc::clone(&start);
+            let key_id_rotate = created.key_id.clone();
+            let key_id_revoke = created.key_id.clone();
+
+            let rotation = tokio::spawn(async move {
+                rotate_start.wait().await;
+                rotate_store
+                    .rotate("racer", "rotate", "org_1", &key_id_rotate)
+                    .await
+                    .unwrap()
+            });
+            let revocation = tokio::spawn(async move {
+                revoke_start.wait().await;
+                revoke_store.revoke("org_1", &key_id_revoke).await.unwrap()
+            });
+            start.wait().await;
+            let rotated = rotation.await.unwrap();
+            assert!(revocation.await.unwrap());
+
+            assert!(
+                !s.introspect(&original).await.unwrap().valid,
+                "race {iteration}: original credential accepted after revocation"
+            );
+            if let Some((ref replacement, _)) = rotated {
+                assert!(
+                    !s.introspect(replacement).await.unwrap().valid,
+                    "race {iteration}: rotated credential accepted after revocation"
+                );
+            }
+            let metadata = s.list("org_1").await.unwrap();
+            assert_eq!(metadata.len(), 1);
+            assert!(metadata[0].revoked);
+            assert!(metadata[0].version == created.version + 1
+                || metadata[0].version == created.version + 2);
+            assert!(s
+                .rotate("racer", "rotate", "org_1", &created.key_id)
+                .await
+                .unwrap()
+                .is_none(), "race {iteration}: stale rotation replay survived");
+        }
+    }
+
 }
