@@ -19,3 +19,5 @@ jobs:
           node-version: '22'
       - name: Exhaustively explore bounded safety model
         run: node formal/check_safety.mjs
+      - name: Reject adversarial safety-model mutations
+        run: node --test formal/adversarial_contract.test.mjs
