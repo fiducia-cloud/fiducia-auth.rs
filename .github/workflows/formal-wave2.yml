@@ -26,3 +26,9 @@ jobs:
       - name: Execute exhaustive model and unsafe-mutation witness
         run: |
           "$RUNNER_TEMP/revocation-generation-model" --nocapture
+
+      - name: Compile actual production revocation cache in bounded refinement harness
+        run: rustc --edition=2024 -D warnings --test conformance/revocation_cache_refinement.rs -o "$RUNNER_TEMP/revocation-cache-refinement"
+      - name: Replay exhaustive oracle schedules against production cache
+        run: |
+          "$RUNNER_TEMP/revocation-cache-refinement" --nocapture
