@@ -355,22 +355,26 @@ async fn revocation_of_equal_jti_in_one_tenant_never_poison_another_on_refresh()
 #[tokio::test]
 async fn expired_revocation_requires_a_fresh_negative_before_reallow() {
     let token = claims("tenant-a", "subject-a", "token-a");
-    let record = RevocationRecord::for_token(
-        &token, "credential compromise", "security-operator", CREATED_AT,
+    // This subject quarantine expires *before* the token's own expiration;
+    // the gate's caller must already have validated the token time window.
+    let revoked_until = CREATED_AT + 5;
+    let record = RevocationRecord::for_subject(
+        "tenant-a", "subject-a", "temporary quarantine",
+        "security-operator", CREATED_AT, revoked_until,
     )
-    .expect("valid record");
+    .expect("valid subject record");
     let gate = RevocationGate::new(
         RevocationCache::new(30, 128),
         RecordAuthority::with_records(vec![record]),
         DEFAULT_REFRESH_TIMEOUT,
     );
-    assert_eq!(gate.authorize(&token, EXPIRES_AT - 1).await, Authorization::Revoked);
-    // The authority record has expired, but an earlier cached Deny may
-    // conservatively remain until the verifier's next scheduled refresh.
-    assert_eq!(gate.authorize(&token, EXPIRES_AT).await, Authorization::Revoked);
+    assert_eq!(gate.authorize(&token, revoked_until - 1).await, Authorization::Revoked);
+    // The authority record expires at revoked_until, but an earlier cached
+    // Deny may conservatively remain until its next scheduled refresh.
+    assert_eq!(gate.authorize(&token, revoked_until).await, Authorization::Revoked);
     assert_eq!(
-        gate.authorize(&token, EXPIRES_AT + 30).await,
+        gate.authorize(&token, revoked_until + 30).await,
         Authorization::Allowed,
-        "the expired record must be re-evaluated only after cache freshness ends"
+        "an expired quarantine may be lifted only after authoritative refresh"
     );
 }
