@@ -20,3 +20,8 @@ jobs:
         run: rustc --edition=2024 -D warnings conformance/independent_proof_model.rs -o "$RUNNER_TEMP/independent-proof-model"
       - name: Execute bounded independent-proof model
         run: "$RUNNER_TEMP/independent-proof-model"
+
+      - name: Compile bounded two-tenant revocation model
+        run: rustc --edition=2024 -D warnings --test conformance/revocation_generation_model.rs -o "$RUNNER_TEMP/revocation-generation-model"
+      - name: Execute exhaustive model and unsafe-mutation witness
+        run: "$RUNNER_TEMP/revocation-generation-model" --nocapture
