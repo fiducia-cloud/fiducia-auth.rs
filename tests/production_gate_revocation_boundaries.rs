@@ -275,3 +275,102 @@ async fn cold_gate_fails_closed_when_authority_is_unavailable() {
     );
     assert_ne!(decision, Authorization::Allowed);
 }
+
+#[tokio::test]
+async fn live_gate_observes_revocation_after_freshness_deadline() {
+    let token = claims("tenant-a", "subject-a", "token-a");
+    let record = RevocationRecord::for_token(
+        &token, "credential compromise", "security-operator", CREATED_AT,
+    )
+    .expect("valid record");
+    let authority = RecordAuthority::with_records(vec![]);
+    let records = authority.records.clone();
+    let gate = RevocationGate::new(
+        RevocationCache::new(30, 128), authority, DEFAULT_REFRESH_TIMEOUT,
+    );
+
+    assert_eq!(gate.authorize(&token, CREATED_AT).await, Authorization::Allowed);
+    records.lock().expect("records").push(record);
+    // This gate's documented contract permits a cached negative until its
+    // inclusive logical-time freshness boundary, not immediate propagation.
+    assert_eq!(
+        gate.authorize(&token, CREATED_AT + 30).await,
+        Authorization::Allowed
+    );
+    assert_eq!(
+        gate.authorize(&token, CREATED_AT + 31).await,
+        Authorization::Revoked,
+        "a stale allow must refresh against the newly revoked authority state"
+    );
+}
+
+#[tokio::test]
+async fn live_gate_fails_closed_when_a_stale_negative_cannot_refresh() {
+    let token = claims("tenant-a", "subject-a", "token-a");
+    let authority = RecordAuthority::with_records(vec![]);
+    let unavailable = authority.unavailable.clone();
+    let gate = RevocationGate::new(
+        RevocationCache::new(30, 128), authority, DEFAULT_REFRESH_TIMEOUT,
+    );
+    assert_eq!(gate.authorize(&token, CREATED_AT).await, Authorization::Allowed);
+    *unavailable.lock().expect("outage flag") = true;
+    assert_eq!(
+        gate.authorize(&token, CREATED_AT + 31).await,
+        Authorization::Unavailable(Unavailable::RefreshFailed)
+    );
+    assert_eq!(
+        gate.authorize(&token, CREATED_AT + 32).await,
+        Authorization::Unavailable(Unavailable::RefreshFailed),
+        "a failed refresh must not resurrect the previously cached allow"
+    );
+}
+
+#[tokio::test]
+async fn revocation_of_equal_jti_in_one_tenant_never_poison_another_on_refresh() {
+    let first = claims("tenant-a", "subject-a", "shared-jti");
+    let second = claims("tenant-b", "subject-b", "shared-jti");
+    let record = RevocationRecord::for_token(
+        &first, "credential compromise", "security-operator", CREATED_AT,
+    )
+    .expect("valid record");
+    let authority = RecordAuthority::with_records(vec![]);
+    let records = authority.records.clone();
+    let gate = RevocationGate::new(
+        RevocationCache::new(30, 128), authority, DEFAULT_REFRESH_TIMEOUT,
+    );
+    assert_eq!(gate.authorize(&first, CREATED_AT).await, Authorization::Allowed);
+    assert_eq!(gate.authorize(&second, CREATED_AT).await, Authorization::Allowed);
+    records.lock().expect("records").push(record);
+    assert_eq!(
+        gate.authorize(&first, CREATED_AT + 31).await,
+        Authorization::Revoked
+    );
+    assert_eq!(
+        gate.authorize(&second, CREATED_AT + 31).await,
+        Authorization::Allowed,
+        "tenant B must refresh independently of tenant A despite equal JTI"
+    );
+}
+
+#[tokio::test]
+async fn expired_revocation_requires_a_fresh_negative_before_reallow() {
+    let token = claims("tenant-a", "subject-a", "token-a");
+    let record = RevocationRecord::for_token(
+        &token, "credential compromise", "security-operator", CREATED_AT,
+    )
+    .expect("valid record");
+    let gate = RevocationGate::new(
+        RevocationCache::new(30, 128),
+        RecordAuthority::with_records(vec![record]),
+        DEFAULT_REFRESH_TIMEOUT,
+    );
+    assert_eq!(gate.authorize(&token, EXPIRES_AT - 1).await, Authorization::Revoked);
+    // The authority record has expired, but an earlier cached Deny may
+    // conservatively remain until the verifier's next scheduled refresh.
+    assert_eq!(gate.authorize(&token, EXPIRES_AT).await, Authorization::Revoked);
+    assert_eq!(
+        gate.authorize(&token, EXPIRES_AT + 30).await,
+        Authorization::Allowed,
+        "the expired record must be re-evaluated only after cache freshness ends"
+    );
+}
