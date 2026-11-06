@@ -287,6 +287,11 @@ impl KeyStore {
                 if rec.org_id != org_id {
                     return Ok(None);
                 }
+                // Revocation dominates even exact idempotency-key replays:
+                // never re-issue a previously minted raw credential afterwards.
+                if rec.revoked {
+                    return Ok(None);
+                }
                 if rec.last_rotation_idempotency_hash.as_deref()
                     == Some(rotation_idempotency_hash.as_str())
                 {
@@ -295,9 +300,6 @@ impl KeyStore {
                     }
                     let raw = format!("fdc_{}_{}.{secret}", rec.env, rec.key_id);
                     return Ok(Some((raw, (&rec).into())));
-                }
-                if rec.revoked {
-                    return Ok(None);
                 }
                 rec.secret_hash = secret_hash.clone();
                 rec.last_rotation_idempotency_hash = Some(rotation_idempotency_hash.clone());
@@ -330,6 +332,10 @@ impl KeyStore {
         else {
             return Ok(None);
         };
+        // Match durable-KV semantics: revocation wins over historical replays.
+        if entry.record.revoked {
+            return Ok(None);
+        }
         if entry.record.last_rotation_idempotency_hash.as_deref()
             == Some(rotation_idempotency_hash.as_str())
         {
@@ -338,9 +344,6 @@ impl KeyStore {
             }
             let raw = format!("fdc_{}_{}.{secret}", entry.record.env, entry.record.key_id);
             return Ok(Some((raw, (&entry.record).into())));
-        }
-        if entry.record.revoked {
-            return Ok(None);
         }
         entry.record.secret_hash = secret_hash;
         entry.record.last_rotation_idempotency_hash = Some(rotation_idempotency_hash);
