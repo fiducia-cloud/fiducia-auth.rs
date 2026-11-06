@@ -1431,11 +1431,13 @@ mod tests {
         assert!(s.revoke("org_1", &created.key_id).await.unwrap());
         assert!(!s.introspect(&original).await.unwrap().valid);
         assert!(!s.introspect(&rotated).await.unwrap().valid);
-        assert!(s
-            .rotate("user-1", "rotate-idempotently", "org_1", &created.key_id)
-            .await
-            .unwrap()
-            .is_none(), "revoked key must not replay previously issued secrets");
+        assert!(
+            s.rotate("user-1", "rotate-idempotently", "org_1", &created.key_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "revoked key must not replay previously issued secrets"
+        );
         assert!(s
             .rotate("user-1", "fresh-rotation", "org_1", &created.key_id)
             .await
@@ -1499,14 +1501,17 @@ mod tests {
             let metadata = s.list("org_1").await.unwrap();
             assert_eq!(metadata.len(), 1);
             assert!(metadata[0].revoked);
-            assert!(metadata[0].version == created.version + 1
-                || metadata[0].version == created.version + 2);
-            assert!(s
-                .rotate("racer", "rotate", "org_1", &created.key_id)
-                .await
-                .unwrap()
-                .is_none(), "race {iteration}: stale rotation replay survived");
+            assert!(
+                metadata[0].version == created.version + 1
+                    || metadata[0].version == created.version + 2
+            );
+            assert!(
+                s.rotate("racer", "rotate", "org_1", &created.key_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "race {iteration}: stale rotation replay survived"
+            );
         }
     }
-
 }
