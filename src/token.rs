@@ -310,7 +310,7 @@ impl Signer {
         };
 
         // Public JWK (uncompressed point -> x/y) for /.well-known/jwks.json.
-        let point = pubkey.to_encoded_point(false); // 0x04 || x || y
+        let point = pubkey.to_sec1_point(false); // 0x04 || x || y
         let x = point.x().expect("P-256 x coordinate");
         let y = point.y().expect("P-256 y coordinate");
         let b64u = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
