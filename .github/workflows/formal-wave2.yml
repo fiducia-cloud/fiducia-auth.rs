@@ -1,7 +1,13 @@
 name: Formal wave 2
 on:
   pull_request:
-    paths: ['conformance/**', '.github/workflows/formal-wave2.yml']
+    paths:
+      - 'conformance/**'
+      - 'src/cache.rs'
+      - 'src/revocation_cache.rs'
+      - 'src/gate.rs'
+      - 'tests/production_gate_revocation_boundaries.rs'
+      - '.github/workflows/formal-wave2.yml'
   workflow_dispatch:
 permissions:
   contents: read
@@ -43,3 +49,38 @@ jobs:
       - name: Replay exhaustive oracle schedules against production cache
         run: |
           "$RUNNER_TEMP/revocation-cache-refinement" --nocapture
+
+  live-revocation-gate:
+    name: Production revocation gate / authority refinement
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact PR head alongside interfaces
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: repo
+          persist-credentials: false
+      - name: Checkout exact shared interfaces revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: bd718cd72d72aa330534f3688f8fb1ce90c19d10
+          path: fiducia-interfaces
+          persist-credentials: false
+      - name: Verify original source head before execution
+        working-directory: repo
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          echo "LIVE_GATE_SHA=$EXPECTED_SHA"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.98.1
+      - name: Run real gate + bounded-freshness / tenant integration tests
+        working-directory: repo
+        run: |
+          cargo test --locked --test production_gate_revocation_boundaries -- --nocapture
+          echo 'SOURCE_GATE_EXECUTED=true; K8S_PROPAGATION_SLO_UNVERIFIED=true'
