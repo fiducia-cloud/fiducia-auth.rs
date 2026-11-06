@@ -267,3 +267,26 @@ fn conflict_metric_label_never_contains_tenant_identity() {
     assert_eq!(error.metric_kind(), "generation_conflict");
     assert!(!error.to_string().contains("tenant"));
 }
+
+#[test]
+fn invalidation_must_not_launder_a_conflicted_generation_into_an_allow() {
+    let target = key("tenant-a");
+    let mut cache = RevocationCache::new(20).unwrap();
+    authoritative(&mut cache, &target, 12, false, 100).unwrap();
+    assert_eq!(
+        authoritative(&mut cache, &target, 12, true, 101),
+        Err(RevocationCacheError::GenerationConflict { generation: 12 }),
+    );
+    cache.invalidate(&target, 102).unwrap();
+    assert_eq!(
+        cache.lookup(&target, 102),
+        Ok(CacheDecision::Deny(DenyReason::AuthorityGenerationConflict)),
+    );
+    assert_eq!(
+        authoritative(&mut cache, &target, 12, false, 103),
+        Err(RevocationCacheError::GenerationConflict { generation: 12 }),
+    );
+    authoritative(&mut cache, &target, 13, true, 104).unwrap();
+    cache.invalidate(&target, 105).unwrap();
+    assert_eq!(cache.lookup(&target, 105), Ok(CacheDecision::Deny(DenyReason::Cold)));
+}
