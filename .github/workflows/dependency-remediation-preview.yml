@@ -42,7 +42,8 @@ jobs:
           echo 'BEGIN_CARGO_LOCK_PATCH'
           git diff --no-ext-diff -- Cargo.lock
           echo 'END_CARGO_LOCK_PATCH'
-          test "$(git diff --numstat -- Cargo.lock | awk '{print $1+$2}')" -lt 500
+          changed_lines="$(git diff --numstat -- Cargo.lock | awk '{sum += $1 + $2} END {print sum + 0}')"
+          test "$changed_lines" -lt 500
       - name: Verify the temporary lockfile builds and lifecycle regressions pass
         working-directory: repo
         run: |
