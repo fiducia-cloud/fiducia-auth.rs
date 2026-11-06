@@ -25,13 +25,27 @@ function fiducia_auth_model() {
       if(s.activeGen!==gen)ok(!freshAllowed(s),"old generation allowed fresh access");
       for(const [name,n] of next){
         ok(invariant(n),`bad ${name}`);
-        if(name==="introspect_valid")ok(!s.revoked&&s.activeGen===gen,"revoked key renewed");
+        if(name==="introspect_valid"){
+          renewals++;
+          ok(!s.revoked&&s.activeGen===gen,"revoked key renewed");
+          ok(n.cacheUntil===s.now+1 && n.cacheGen===gen,
+            "introspection must bind the presented generation and one-tick TTL");
+        }
+        if(name==="rotate"){
+          rotations++;
+          ok(n.activeGen===2 && n.activeGen!==s.activeGen,"rotation must replace generation");
+        }
+        if(name==="revoke"){
+          revocations++;
+          ok(n.revoked && !s.revoked,"revocation must durably deny a fresh grant");
+        }
         edges++;const k=JSON.stringify(n);if(!seen.has(k)){seen.add(k);q.push(n);}
       }
     }
     states+=q.length;
   }
-  ok(states>=25&&cacheGrants>0&&expiredDenials>0,"vacuous key lifecycle");
+  ok(states>=25&&cacheGrants>0&&expiredDenials>0 &&
+    rotations>0 && revocations>0 && renewals>0,"vacuous key lifecycle");
   ok(!cacheAllowed({...init(1),cacheAllow:true,cacheGen:1,cacheUntil:1,now:1}),"expired cache mutant survived");
   ok(!freshAllowed({...init(1),revoked:true}),"revoked key mutant survived");
   return {model:"Fiducia API-key rotation/revocation cache TTL",states,edges,cacheGrants,expiredDenials,scope:"two key generations, three clock ticks, TTL one tick"};
