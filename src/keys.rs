@@ -1352,8 +1352,7 @@ mod tests {
                         if revoked {
                             assert!(result.is_none(), "revoked key rotated: {seed}/{step}");
                         } else {
-                            let (replacement, metadata) =
-                                result.expect("live key must rotate");
+                            let (replacement, metadata) = result.expect("live key must rotate");
                             assert_ne!(replacement, current);
                             expected_version += 1;
                             assert_eq!(metadata.version, expected_version);
@@ -1402,9 +1401,6 @@ mod tests {
                 }
             }
         }
-        eprintln!(
-            "key lifecycle production refinement: {histories} four-step histories"
-        );
+        eprintln!("key lifecycle production refinement: {histories} four-step histories");
     }
-
 }
