@@ -49,8 +49,9 @@ jobs:
           set -euo pipefail
           cargo check --locked --bins
           cargo test --locked --all-targets --features governance-webauthn
-      - name: Report unresolved crypto-bigint major-version migration
-        if: always()
-        run: |
-          echo 'crypto-bigint 0.5.x requires a separate transitive-dependency major-version migration.'
-          echo 'This is a read-only remediation preview; source Cargo.lock is unchanged.'
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
+        with:
+          tool: cargo-audit@0.22.2
+      - name: Audit the proposed lockfile without ignored advisories
+        working-directory: repo
+        run: cargo audit
