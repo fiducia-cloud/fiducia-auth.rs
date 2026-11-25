@@ -160,15 +160,15 @@ async fn jwks() -> Json<Value> {
 }
 
 /// Require a valid Supabase session; 401 otherwise.
-async fn require_user(headers: &HeaderMap) -> Result<UserCtx, Response> {
+async fn require_user(headers: &HeaderMap) -> Result<UserCtx, Box<Response>> {
     let bearer = single_header_str(headers, "authorization")
         .and_then(|value| value.strip_prefix("Bearer "))
         .filter(|value| !value.is_empty());
     match bearer {
         Some(jwt) => supabase::verify_session(jwt)
             .await
-            .ok_or_else(|| unauthorized("invalid or expired session")),
-        None => Err(unauthorized("missing bearer token")),
+            .ok_or_else(|| Box::new(unauthorized("invalid or expired session"))),
+        None => Err(Box::new(unauthorized("missing bearer token"))),
     }
 }
 
@@ -383,7 +383,7 @@ fn customer_cors_layer(origin: HeaderValue) -> CorsLayer {
 async fn me(headers: HeaderMap) -> Response {
     match require_user(&headers).await {
         Ok(user) => Json(json!({ "user": user })).into_response(),
-        Err(e) => e,
+        Err(e) => *e,
     }
 }
 
@@ -396,7 +396,7 @@ async fn get_org(
 ) -> Response {
     let user = match require_user(&headers).await {
         Ok(u) => u,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     if !user.orgs.iter().any(|o| o == &org_id) {
         return (
@@ -426,7 +426,7 @@ async fn create_key(
 ) -> Response {
     let user = match require_user(&headers).await {
         Ok(u) => u,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let idempotency_key = match require_idempotency_key(&headers) {
         Ok(value) => value,
@@ -474,7 +474,7 @@ async fn rotate_key(
 ) -> Response {
     let user = match require_user(&headers).await {
         Ok(u) => u,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let idempotency_key = match require_idempotency_key(&headers) {
         Ok(value) => value,
@@ -542,7 +542,7 @@ async fn list_keys(
 ) -> Response {
     let user = match require_user(&headers).await {
         Ok(u) => u,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let org = match select_user_org(&user, query.org_id.as_deref()) {
         Ok(org) => org,
@@ -563,7 +563,7 @@ async fn revoke_key(
 ) -> Response {
     let user = match require_user(&headers).await {
         Ok(u) => u,
-        Err(e) => return e,
+        Err(e) => return *e,
     };
     let org = match select_user_org(&user, query.org_id.as_deref()) {
         Ok(org) => org,

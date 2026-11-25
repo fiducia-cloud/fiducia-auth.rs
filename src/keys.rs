@@ -287,6 +287,11 @@ impl KeyStore {
                 if rec.org_id != org_id {
                     return Ok(None);
                 }
+                // Revocation dominates even exact idempotency-key replays:
+                // never re-issue a previously minted raw credential afterwards.
+                if rec.revoked {
+                    return Ok(None);
+                }
                 if rec.last_rotation_idempotency_hash.as_deref()
                     == Some(rotation_idempotency_hash.as_str())
                 {
@@ -295,9 +300,6 @@ impl KeyStore {
                     }
                     let raw = format!("fdc_{}_{}.{secret}", rec.env, rec.key_id);
                     return Ok(Some((raw, (&rec).into())));
-                }
-                if rec.revoked {
-                    return Ok(None);
                 }
                 rec.secret_hash = secret_hash.clone();
                 rec.last_rotation_idempotency_hash = Some(rotation_idempotency_hash.clone());
@@ -330,6 +332,10 @@ impl KeyStore {
         else {
             return Ok(None);
         };
+        // Match durable-KV semantics: revocation wins over historical replays.
+        if entry.record.revoked {
+            return Ok(None);
+        }
         if entry.record.last_rotation_idempotency_hash.as_deref()
             == Some(rotation_idempotency_hash.as_str())
         {
@@ -338,9 +344,6 @@ impl KeyStore {
             }
             let raw = format!("fdc_{}_{}.{secret}", entry.record.env, entry.record.key_id);
             return Ok(Some((raw, (&entry.record).into())));
-        }
-        if entry.record.revoked {
-            return Ok(None);
         }
         entry.record.secret_hash = secret_hash;
         entry.record.last_rotation_idempotency_hash = Some(rotation_idempotency_hash);
@@ -1307,5 +1310,208 @@ mod tests {
             serde_json::from_str(writes[1]["value"].as_str().unwrap()).unwrap();
         assert_eq!(merged, vec!["existing", "concurrent", "ours"]);
         server.abort();
+    }
+    /// Model-based refinement: enumerate every four-step lifecycle history over
+    /// rotation, revocation, observation and wrong-org revocation. The reference
+    /// is deliberately independent of KeyStore's transition implementation.
+    /// This tests the in-memory production API only; durable multi-replica KV
+    /// behavior requires a separate fault-injection gate.
+    #[tokio::test]
+    async fn bounded_lifecycle_histories_refine_production_api() {
+        const HISTORY_LENGTH: usize = 4;
+        const ACTIONS: usize = 4;
+        let histories = ACTIONS.pow(HISTORY_LENGTH as u32);
+
+        for seed in 0..histories {
+            let s = store();
+            let (raw, created) = s
+                .create(
+                    MutationIdentity::new("refinement-user", "refinement-create"),
+                    "org_1".into(),
+                    "worker".into(),
+                    vec!["requests:write".into()],
+                    "test".into(),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let mut sequence = seed;
+            let mut credentials = vec![raw.clone()];
+            let mut current = raw;
+            let mut revoked = false;
+            let mut expected_version = created.version;
+
+            for step in 0..HISTORY_LENGTH {
+                let action = sequence % ACTIONS;
+                sequence /= ACTIONS;
+                match action {
+                    0 => {
+                        let token = format!("refinement-rotate-{step}");
+                        let result = s
+                            .rotate("refinement-user", &token, "org_1", &created.key_id)
+                            .await
+                            .unwrap();
+                        if revoked {
+                            assert!(result.is_none(), "revoked key rotated: {seed}/{step}");
+                        } else {
+                            let (replacement, metadata) = result.expect("live key must rotate");
+                            assert_ne!(replacement, current);
+                            expected_version += 1;
+                            assert_eq!(metadata.version, expected_version);
+                            current = replacement.clone();
+                            credentials.push(replacement);
+                        }
+                    }
+                    1 => {
+                        assert!(
+                            s.revoke("org_1", &created.key_id).await.unwrap(),
+                            "owner revoke failed: {seed}/{step}"
+                        );
+                        if !revoked {
+                            expected_version += 1;
+                            revoked = true;
+                        }
+                    }
+                    2 => {
+                        // Introspection itself must not change lifecycle state.
+                        let _ = s.introspect(&current).await.unwrap();
+                    }
+                    3 => {
+                        assert!(
+                            !s.revoke("org_2", &created.key_id).await.unwrap(),
+                            "cross-organization revoke succeeded: {seed}/{step}"
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+
+                let meta = s.list("org_1").await.unwrap();
+                assert_eq!(meta.len(), 1, "lost key: {seed}/{step}");
+                assert_eq!(
+                    meta[0].version, expected_version,
+                    "version disagreement: {seed}/{step}"
+                );
+                assert_eq!(meta[0].revoked, revoked, "revoke disagreement");
+                assert!(meta[0].require_idempotency);
+                for credential in &credentials {
+                    let observed = s.introspect(credential).await.unwrap().valid;
+                    let expected = !revoked && *credential == current;
+                    assert_eq!(
+                        observed, expected,
+                        "old or revoked credential admitted: {seed}/{step}"
+                    );
+                }
+            }
+        }
+        eprintln!("key lifecycle production refinement: {histories} four-step histories");
+    }
+    #[tokio::test]
+    async fn revoked_rotation_replay_never_reissues_the_secret() {
+        let s = store();
+        let (original, created) = s
+            .create(
+                MutationIdentity::new("user-1", "make-key"),
+                "org_1".into(),
+                "worker".into(),
+                vec!["requests:write".into()],
+                "test".into(),
+                true,
+            )
+            .await
+            .unwrap();
+        let (rotated, prior) = s
+            .rotate("user-1", "rotate-idempotently", "org_1", &created.key_id)
+            .await
+            .unwrap()
+            .expect("first rotation allowed");
+        assert_ne!(rotated, original);
+        assert!(s.introspect(&rotated).await.unwrap().valid);
+
+        assert!(s.revoke("org_1", &created.key_id).await.unwrap());
+        assert!(!s.introspect(&original).await.unwrap().valid);
+        assert!(!s.introspect(&rotated).await.unwrap().valid);
+        assert!(
+            s.rotate("user-1", "rotate-idempotently", "org_1", &created.key_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "revoked key must not replay previously issued secrets"
+        );
+        assert!(s
+            .rotate("user-1", "fresh-rotation", "org_1", &created.key_id)
+            .await
+            .unwrap()
+            .is_none());
+        let final_metadata = s.list("org_1").await.unwrap();
+        assert_eq!(final_metadata.len(), 1);
+        assert!(final_metadata[0].revoked);
+        assert_eq!(final_metadata[0].version, prior.version + 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_rotate_and_revoke_cannot_resurrect_credential() {
+        for iteration in 0..32 {
+            let s = Arc::new(store());
+            let (original, created) = s
+                .create(
+                    MutationIdentity::new("racer", "create"),
+                    "org_1".into(),
+                    "worker".into(),
+                    vec!["requests:write".into()],
+                    "test".into(),
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let start = Arc::new(tokio::sync::Barrier::new(3));
+            let rotate_store = Arc::clone(&s);
+            let revoke_store = Arc::clone(&s);
+            let rotate_start = Arc::clone(&start);
+            let revoke_start = Arc::clone(&start);
+            let key_id_rotate = created.key_id.clone();
+            let key_id_revoke = created.key_id.clone();
+
+            let rotation = tokio::spawn(async move {
+                rotate_start.wait().await;
+                rotate_store
+                    .rotate("racer", "rotate", "org_1", &key_id_rotate)
+                    .await
+                    .unwrap()
+            });
+            let revocation = tokio::spawn(async move {
+                revoke_start.wait().await;
+                revoke_store.revoke("org_1", &key_id_revoke).await.unwrap()
+            });
+            start.wait().await;
+            let rotated = rotation.await.unwrap();
+            assert!(revocation.await.unwrap());
+
+            assert!(
+                !s.introspect(&original).await.unwrap().valid,
+                "race {iteration}: original credential accepted after revocation"
+            );
+            if let Some((ref replacement, _)) = rotated {
+                assert!(
+                    !s.introspect(replacement).await.unwrap().valid,
+                    "race {iteration}: rotated credential accepted after revocation"
+                );
+            }
+            let metadata = s.list("org_1").await.unwrap();
+            assert_eq!(metadata.len(), 1);
+            assert!(metadata[0].revoked);
+            assert!(
+                metadata[0].version == created.version + 1
+                    || metadata[0].version == created.version + 2
+            );
+            assert!(
+                s.rotate("racer", "rotate", "org_1", &created.key_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "race {iteration}: stale rotation replay survived"
+            );
+        }
     }
 }
