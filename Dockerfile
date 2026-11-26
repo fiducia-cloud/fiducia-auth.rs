@@ -2,7 +2,7 @@
 # Multi-stage build for the customer auth server and the separately deployed
 # least-privilege revocation authority. The final default target remains `auth`
 # so existing `docker build .` callers preserve their current image contract.
-FROM rust:1.98.1-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730 AS build
+FROM rust:1.100.0-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
